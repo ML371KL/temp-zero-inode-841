@@ -1,0 +1,50 @@
+name: Запись котировок Dual Assets
+
+on:
+  schedule:
+    # Раз в четверть часа. Расписание GitHub ненадёжно и часто задерживается —
+    # для плотной сетки наблюдений стоит продублировать внешним планировщиком,
+    # дёргающим workflow_dispatch (см. docs/ПРОЕКТ.md).
+    - cron: "3,18,33,48 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Две записи одновременно затёрли бы друг друга при форс-пуше ветки data.
+concurrency:
+  group: dual-assets-record
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Забрать текущее состояние ветки data
+        run: |
+          git clone --depth 1 --branch data "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data-branch 2>/dev/null || {
+            echo "ветки data ещё нет, создаём с нуля"
+            mkdir -p data-branch
+          }
+
+      - name: Снять снимок и пересобрать сводку
+        run: node scripts/record.mjs --out data-branch
+
+      - name: Опубликовать одиночным коммитом
+        run: |
+          cd data-branch
+          rm -rf .git
+          git init -q
+          git config user.name "dual-assets-recorder"
+          git config user.email "actions@github.com"
+          git add -A
+          git commit -q -m "Снимок котировок $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push -q --force "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:data
+          echo "опубликовано: $(du -sh . | cut -f1)"

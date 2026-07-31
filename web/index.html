@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dual Assets BTC/USDT — радар</title>
+    <link rel="stylesheet" href="style.css" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>₿</text></svg>" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <span class="mark">₿</span>
+        <div>
+          <h1>Dual Assets BTC/USDT</h1>
+          <div class="sub">эффективная доходность и риск конвертации в реальном времени</div>
+        </div>
+      </div>
+      <div class="live">
+        <div class="spot">
+          <span class="label">BTC/USDT</span>
+          <span class="value" id="spot">—</span>
+        </div>
+        <div class="stream">
+          <span class="dot" id="ws-dot"></span>
+          <span id="ws-text">подключение…</span>
+        </div>
+        <button id="tz-toggle" class="ghost" title="Часовой пояс отображения">местное</button>
+        <button id="theme-toggle" class="ghost" title="Тема">◐</button>
+      </div>
+    </header>
+
+    <section class="controls">
+      <label class="ctl check">
+        <input type="checkbox" id="vip" />
+        <span>VIP-продукты</span>
+      </label>
+
+      <label class="ctl">
+        <span class="ctl-label">Сумма, USDT</span>
+        <input type="number" id="amount" value="10000" min="0" step="100" />
+      </label>
+
+      <label class="ctl wide">
+        <span class="ctl-label">Порог вероятности конвертации: <b id="maxp-view">5%</b></span>
+        <input type="range" id="maxp" min="0.5" max="50" step="0.5" value="5" />
+      </label>
+
+      <label class="ctl">
+        <span class="ctl-label">Мера вероятности</span>
+        <select id="measure">
+          <option value="max">худшая из двух</option>
+          <option value="rn">рыночная (опционы)</option>
+          <option value="hist">историческая</option>
+        </select>
+      </label>
+
+      <label class="ctl">
+        <span class="ctl-label">Сортировка</span>
+        <select id="sort">
+          <option value="aprEff">эффективный APR</option>
+          <option value="aprPerRisk">APR на единицу риска</option>
+          <option value="edgeApr">премия к рынку опционов</option>
+          <option value="expNetApr">ожидаемый чистый APR</option>
+          <option value="pConv">вероятность конвертации</option>
+          <option value="settle">дата сеттлмента</option>
+        </select>
+      </label>
+
+      <div class="ctl wide">
+        <span class="ctl-label">Сроки</span>
+        <div class="chips" id="durations"></div>
+      </div>
+    </section>
+
+    <section class="panel highlight" id="best-panel">
+      <div class="panel-head">
+        <h2>Оптимальные Buy Low</h2>
+        <div class="hint">
+          фронт Парето внутри вашего порога риска: каждую из этих оферт нельзя улучшить
+          по доходности, не увеличив вероятность конвертации
+        </div>
+      </div>
+      <div class="cards" id="best"></div>
+    </section>
+
+    <section class="grid2">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Доходность против риска</h2>
+          <div class="hint">эффективный APR и вероятность конвертации; линией — фронт Парето</div>
+        </div>
+        <div class="chart" id="scatter"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Оферта против рынка опционов</h2>
+          <div class="hint">
+            сплошная — ставка Bybit, пунктир — ставка, эквивалентная цене опциона с той же
+            датой экспирации; разрыв вверх означает премию
+          </div>
+        </div>
+        <div class="chart" id="ladder"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Все оферты Buy Low</h2>
+        <div class="hint" id="buy-count"></div>
+      </div>
+      <div class="table-wrap">
+        <table id="buy-table">
+          <thead></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="panel converted">
+      <div class="panel-head">
+        <h2>Конвертация произошла: подбор Sell High</h2>
+        <div class="hint">
+          введите параметры покупки BTC — система найдёт оферты, которые выводят обратно
+          в USDT не ниже себестоимости и не дают биткоину лежать мёртвым грузом
+        </div>
+      </div>
+      <div class="conv-inputs">
+        <label class="ctl">
+          <span class="ctl-label">Цена покупки BTC, USDT</span>
+          <input type="number" id="conv-price" placeholder="напр. 62000" step="0.01" min="0" />
+        </label>
+        <label class="ctl">
+          <span class="ctl-label">Количество BTC</span>
+          <input type="number" id="conv-qty" placeholder="напр. 0.16" step="0.00000001" min="0" />
+        </label>
+        <label class="ctl check tall">
+          <input type="checkbox" id="conv-was-dual" checked />
+          <span>покупка была конвертацией Buy Low (учесть начисленный процент)</span>
+        </label>
+        <label class="ctl" id="conv-apy-wrap">
+          <span class="ctl-label">APR той оферты, %</span>
+          <input type="number" id="conv-apy" placeholder="напр. 40" step="0.01" min="0" />
+        </label>
+        <label class="ctl">
+          <span class="ctl-label">Срок той оферты</span>
+          <select id="conv-duration">
+            <option value="0.3333333333333333">8h</option>
+            <option value="1" selected>1d</option>
+            <option value="3">3d</option>
+            <option value="5">5d</option>
+            <option value="6">6d</option>
+            <option value="13">13d</option>
+            <option value="27">27d</option>
+            <option value="55">55d</option>
+            <option value="146">146d</option>
+            <option value="237">237d</option>
+          </select>
+        </label>
+      </div>
+      <div class="basis-line" id="basis-line"></div>
+      <div class="best-sell-head" id="best-sell-head"></div>
+      <div class="cards" id="best-sell"></div>
+      <div class="table-wrap">
+        <table id="sell-table">
+          <thead></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer class="foot">
+      <div id="diag"></div>
+      <div class="src">
+        Источники: <code>/v5/earn/advance/product</code>, <code>/v5/earn/advance/product-extra-info</code>,
+        WebSocket <code>earn.dualassets.offers</code>, <code>/v5/market/tickers?category=option</code>,
+        <code>/v5/market/kline</code>. Данные публичные, ключи не используются.
+        Панель ничего не покупает — только считает.
+      </div>
+    </footer>
+
+    <div class="tip" id="tip" hidden></div>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

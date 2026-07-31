@@ -1,0 +1,362 @@
+// Сборка строк таблицы: из сырых котировок, опционной поверхности и истории
+// цен получаются готовые к показу оферты со всеми метриками риска и доходности.
+// Модуль без DOM — его же используют скрипты записи истории.
+
+import {
+  productTiming,
+  interestRate,
+  effectiveApr,
+  chainedApr,
+  valueOffer,
+  moneynessZ,
+  twapEffectiveT,
+  logReturns,
+  empiricalCdf,
+  empiricalShortfall,
+  empiricalMeanGross,
+  percentileFromQuantiles,
+  paretoFront,
+  apyFromE8,
+  basisFromConversion,
+  breakevenStrike,
+  cyclesToRecover,
+  YEAR_DAYS,
+} from './quant.js';
+import { volAt, forwardAt, hasExactExpiry } from './surface.js';
+
+/**
+ * Историческое распределение доходностей.
+ *
+ * Ряды разной частоты покрывают разную глубину: часовой — месяцы,
+ * четырёхчасовой — год-полтора, дневной — пять лет. Перекрывающиеся окна
+ * создают иллюзию большой выборки: тысяча часовых окон по шесть дней внутри
+ * трёхмесячного ряда — это порядка десятка независимых наблюдений и, по сути,
+ * замер тренда последних месяцев. Поэтому ряд выбирается по максимальной
+ * глубине истории при достаточном разрешении горизонта (не менее четырёх шагов),
+ * а не по числу окон.
+ */
+export class History {
+  constructor(series) {
+    // series: { '60': {stepMs, series:[[ts,close]]}, '240': {...}, 'D': {...} }
+    this.raw = series;
+    this.cache = new Map();
+  }
+
+  pick(tauDays) {
+    const candidates = [];
+    for (const key of ['60', '240', 'D']) {
+      const s = this.raw[key];
+      if (!s || !s.series?.length || !s.stepMs) continue;
+      const bars = Math.round((tauDays * 86_400_000) / s.stepMs);
+      if (bars < 1) continue;
+      const spanDays = (s.series.length * s.stepMs) / 86_400_000;
+      candidates.push({ key, bars, spanDays, windows: s.series.length - bars, stepMs: s.stepMs });
+    }
+    if (!candidates.length) return null;
+    // Разрешение: горизонт должен укладываться хотя бы в четыре шага ряда,
+    // иначе округление до целых баров искажает сам горизонт.
+    const resolved = candidates.filter((c) => c.bars >= 4 && c.windows > 30);
+    const pool = resolved.length ? resolved : candidates.filter((c) => c.windows > 30);
+    if (!pool.length) return null;
+    return pool.sort((a, b) => b.spanDays - a.spanDays)[0];
+  }
+
+  /** Отсортированные логарифмические доходности на горизонте tauDays. */
+  returns(tauDays) {
+    const p = this.pick(tauDays);
+    if (!p) return null;
+    const id = `${p.key}:${p.bars}`;
+    let hit = this.cache.get(id);
+    if (!hit) {
+      const closes = this.raw[p.key].series.map((r) => r[1]);
+      hit = {
+        sorted: logReturns(closes, p.bars),
+        key: p.key,
+        bars: p.bars,
+        spanDays: p.spanDays,
+        // Сколько в выборке непересекающихся окон — честная мера её веса.
+        independent: tauDays > 0 ? p.spanDays / tauDays : null,
+      };
+      this.cache.set(id, hit);
+    }
+    return hit;
+  }
+}
+
+const SERIES_LABEL = { 60: '1ч', 240: '4ч', D: '1д' };
+
+/**
+ * Ключ корзины сводки перцентилей. Должен побайтово совпадать с
+ * bucketKey из scripts/record.mjs — иначе сводка молча не найдётся.
+ */
+export function statsBucketKey(duration, isVip, direction, moneyness) {
+  const half = Math.max(-60, Math.min(60, Math.round(moneyness * 200)));
+  return `${duration}|${isVip ? 1 : 0}|${direction === 'BuyLow' ? 'B' : 'S'}|${half}`;
+}
+
+/**
+ * Полный расчёт одной оферты (страйк + направление внутри продукта).
+ */
+export function buildRow({ product, level, direction, now, spot, surface, history, riskFree, amount, stats }) {
+  const timing = productTiming(product, now);
+  const strike = Number(level.selectPrice);
+  const apy = apyFromE8(level.apyE8);
+  const i = interestRate(apy, timing.yieldDays);
+  const aprEff = effectiveApr(apy, timing.yieldDays, timing.lockDays);
+  const aprChained = chainedApr(apy, timing.yieldDays, timing.cycleDays);
+
+  const T = Math.max(timing.tauDays, 0) / YEAR_DAYS;
+  const Teff = twapEffectiveT(T);
+  const sigma = surface ? volAt(surface, spot, strike, T) : null;
+  const forward = surface ? forwardAt(surface, spot, T) : spot;
+
+  const valued =
+    sigma > 0
+      ? valueOffer({ direction, strike, apy, timing, forward, sigma, riskFree })
+      : { pTriggerRN: null, offerVol: null, volEdge: null, edgeApr: null, fairValue: null, optionPrice: null };
+
+  // Историческая частота срабатывания на том же горизонте.
+  const hist = history ? history.returns(timing.tauDays) : null;
+  let pHist = null;
+  let shortfall = null;
+  if (hist && hist.sorted.length) {
+    const x = Math.log(strike / spot);
+    const below = empiricalCdf(hist.sorted, x);
+    pHist = direction === 'BuyLow' ? below : 1 - below;
+    shortfall = empiricalShortfall(hist.sorted, spot, strike, direction);
+  }
+
+  // Ставка, которую платил бы рынок опционов за тот же риск, в тех же единицах
+  // (эффективный APR). Разница с фактической офертой — это и есть премия Bybit.
+  let fairAprEff = null;
+  if (valued.optionPrice != null && timing.lockDays > 0) {
+    const ratio = direction === 'BuyLow' ? valued.optionPrice / strike : valued.optionPrice / forward;
+    if (ratio < 1) fairAprEff = ((ratio / (1 - ratio)) * YEAR_DAYS) / timing.lockDays;
+  }
+
+  // Ожидаемая чистая доходность по историческому распределению:
+  // процент минус ожидаемая потеря на конвертации, приведённые к годовым.
+  let expNetApr = null;
+  if (shortfall != null && timing.lockDays > 0) {
+    const value = (1 + i) * (1 - shortfall);
+    expNetApr = ((value - 1) * YEAR_DAYS) / timing.lockDays;
+  }
+
+  // Где текущая ставка стоит относительно того, что предлагалось за последний
+  // месяц на таком же сроке и таком же расстоянии от спота.
+  const moneyness = strike / spot - 1;
+  let aprPercentile = null;
+  let aprBucketN = null;
+  if (stats?.buckets) {
+    const bucket = stats.buckets[statsBucketKey(product.duration, product.isVipProduct, direction, moneyness)];
+    if (bucket) {
+      aprPercentile = percentileFromQuantiles(stats.quantileLevels, bucket.q, apy);
+      aprBucketN = bucket.n;
+    }
+  }
+
+  return {
+    productId: product.productId,
+    duration: product.duration,
+    isVip: !!product.isVipProduct,
+    direction,
+    strike,
+    apy,
+    i,
+    aprEff,
+    aprChained,
+    timing,
+    maxInvest: Number(level.maxInvestmentAmount),
+    quoteExpiresAt: Number(level.expiredAt),
+    spot,
+    forward,
+    sigma,
+    Teff,
+    exactExpiry: surface ? hasExactExpiry(surface, timing.settle) : false,
+    pRN: valued.pTriggerRN,
+    pHist,
+    histInfo: hist
+      ? {
+          series: SERIES_LABEL[hist.key] || hist.key,
+          n: hist.sorted.length,
+          spanDays: hist.spanDays,
+          independent: hist.independent,
+        }
+      : null,
+    z: moneynessZ(spot, strike, sigma, Teff),
+    moneyness,
+    aprPercentile,
+    aprBucketN,
+    offerVol: valued.offerVol,
+    volEdge: valued.volEdge,
+    edgeApr: valued.edgeApr,
+    fairValue: valued.fairValue,
+    fairAprEff,
+    shortfall,
+    expNetApr,
+    // Деньги на введённую сумму.
+    money: computeMoney({ direction, amount, strike, i, spot }),
+  };
+}
+
+function computeMoney({ direction, amount, strike, i, spot }) {
+  if (!(amount > 0)) return null;
+  if (direction === 'BuyLow') {
+    const payout = amount * (1 + i);
+    return {
+      interest: payout - amount,
+      payoutUsdt: payout,
+      btcIfConverted: payout / strike,
+      // Сколько стоит полученный BTC по сегодняшней цене — мера «бумажного» убытка,
+      // если бы конвертация случилась прямо сейчас по этому страйку.
+      btcValueAtSpot: (payout / strike) * spot,
+    };
+  }
+  // Sell High: сумма задаётся в BTC.
+  const payoutBtc = amount * (1 + i);
+  return {
+    interest: payoutBtc - amount,
+    payoutBtc,
+    usdtIfSold: payoutBtc * strike,
+    btcValueAtSpot: payoutBtc * spot,
+  };
+}
+
+/** Какую вероятность считать рабочей: рыночную, историческую или худшую из двух. */
+export function pickProbability(row, measure) {
+  const a = row.pRN;
+  const b = row.pHist;
+  if (measure === 'rn') return a;
+  if (measure === 'hist') return b;
+  if (a == null) return b;
+  if (b == null) return a;
+  return Math.max(a, b); // консервативный режим по умолчанию
+}
+
+/**
+ * Сборка всех строк по направлению с учётом фильтров интерфейса.
+ */
+export function buildRows({ products, quotes, direction, now, spot, surface, history, riskFree, amount, vip, measure, stats }) {
+  const rows = [];
+  for (const product of products) {
+    if (product.status !== 'Available') continue;
+    if (product.isVipProduct && !vip) continue;
+    const timing = productTiming(product, now);
+    if (!timing.open) continue;
+    // Расхождение метки срока и окна начисления означает, что модель тайминга
+    // не описывает продукт. Показывать по нему доходность нельзя.
+    if (!timing.labelMatches) continue;
+
+    const quote = quotes.get(String(product.productId));
+    if (!quote) continue;
+    const levels = direction === 'BuyLow' ? quote.buyLowPrice : quote.sellHighPrice;
+    for (const level of levels || []) {
+      const row = buildRow({ product, level, direction, now, spot, surface, history, riskFree, amount, stats });
+      row.pConv = pickProbability(row, measure);
+      // Доходность на единицу риска: сколько эффективного APR приходится
+      // на процент вероятности конвертации.
+      row.aprPerRisk = row.pConv > 1e-6 && row.aprEff != null ? row.aprEff / row.pConv : null;
+      row.excess = row.aprEff != null && riskFree != null ? row.aprEff - riskFree : null;
+      rows.push(row);
+    }
+  }
+  const front = paretoFront(rows, 'aprEff', 'pConv');
+  for (const r of rows) r.pareto = front.has(r);
+  return rows;
+}
+
+/**
+ * Отбор в блок «оптимальные варианты».
+ * Порог риска задаёт пользователь; внутри порога берём фронт Парето —
+ * набор, который нельзя улучшить по доходности, не увеличив риск.
+ */
+export function pickBest({ rows, maxP, limit = 6 }) {
+  const eligible = rows.filter((r) => r.pConv != null && r.pConv <= maxP && r.aprEff != null);
+  const front = paretoFront(eligible, 'aprEff', 'pConv');
+  const inFront = eligible.filter((r) => front.has(r)).sort((a, b) => b.aprEff - a.aprEff);
+  if (inFront.length >= limit) return inFront.slice(0, limit);
+  // Добираем ближайших претендентов по доходности, помечая их вне фронта.
+  const rest = eligible.filter((r) => !front.has(r)).sort((a, b) => b.aprEff - a.aprEff);
+  return [...inFront, ...rest].slice(0, limit);
+}
+
+/**
+ * Подбор Sell High под конкретную позицию в BTC.
+ * basis — фактическая цена, по которой BTC попал на баланс. Порог безубытка
+ * ниже себестоимости на величину начисляемого процента.
+ */
+export function analyzeSellHigh({ rows, basis, qty, spot, history }) {
+  const out = rows.map((r) => {
+    const be = breakevenStrike(basis, r.apy, r.timing.yieldDays);
+    const payoutBtc = qty > 0 ? qty * (1 + r.i) : null;
+    const usdtIfSold = payoutBtc != null ? payoutBtc * r.strike : null;
+    const spent = qty > 0 ? qty * basis : null;
+    const rec = cyclesToRecover(basis, spot, r.apy, r.timing.yieldDays, r.timing.lockDays);
+
+    // Ожидаемая выручка в USDT по историческому распределению:
+    // E[(1+i)·min(S_T, K)] = (1+i)·(E[S_T] − E[(S_T − K)⁺]).
+    let expReturnVsBasis = null;
+    const hist = history ? history.returns(r.timing.tauDays) : null;
+    if (hist?.sorted.length && r.shortfall != null && basis > 0 && r.timing.lockDays > 0) {
+      const meanGross = empiricalMeanGross(hist.sorted);
+      if (meanGross != null) {
+        const expPerBtc = (1 + r.i) * spot * (meanGross - r.shortfall);
+        expReturnVsBasis = ((expPerBtc / basis - 1) * YEAR_DAYS) / r.timing.lockDays;
+      }
+    }
+
+    return {
+      ...r,
+      breakeven: be,
+      profitable: r.strike >= be,
+      // Запас над порогом безубытка в процентах цены.
+      cushion: be > 0 ? r.strike / be - 1 : null,
+      payoutBtc,
+      usdtIfSold,
+      profitUsdt: usdtIfSold != null && spent != null ? usdtIfSold - spent : null,
+      profitPct: usdtIfSold != null && spent > 0 ? usdtIfSold / spent - 1 : null,
+      recovery: rec,
+      expReturnVsBasis,
+    };
+  });
+
+  // Среди безубыточных оферт срабатывание — это желанный выход в USDT,
+  // поэтому фронт строится по максимуму и доходности, и вероятности продажи.
+  const profitable = out.filter((r) => r.profitable);
+  const front = paretoFront(profitable, 'aprEff', 'pConv', false);
+  for (const r of out) r.sellPareto = front.has(r);
+
+  // Убыточные уходят вниз: они не решают задачу выхода, даже если ставка выше.
+  return out.sort(
+    (a, b) => Number(b.profitable) - Number(a.profitable) || (b.aprEff ?? -1) - (a.aprEff ?? -1),
+  );
+}
+
+/**
+ * Отбор в блок «оптимальные Sell High».
+ *
+ * Если безубыточные оферты есть — берём их фронт Парето: там срабатывание
+ * желанно, значит максимизируем и ставку, и вероятность продажи.
+ *
+ * Если рынок ушёл ниже себестоимости и безубыточного выхода нет, знак риска
+ * переворачивается обратно: сработавший страйк означает принудительную продажу
+ * BTC дешевле, чем он был куплен. Поэтому здесь нужен фронт по максимуму ставки
+ * при минимуме вероятности срабатывания — заработок в BTC без фиксации убытка.
+ */
+export function pickBestSell({ rows, limit = 6 }) {
+  const profitable = rows.filter((r) => r.profitable && Number.isFinite(r.aprEff));
+  if (profitable.length) {
+    const front = profitable.filter((r) => r.sellPareto).sort((a, b) => b.aprEff - a.aprEff);
+    const rest = profitable.filter((r) => !r.sellPareto).sort((a, b) => b.aprEff - a.aprEff);
+    return { mode: 'exit', rows: [...front, ...rest].slice(0, limit) };
+  }
+
+  const usable = rows.filter((r) => Number.isFinite(r.aprEff) && Number.isFinite(r.pConv));
+  const front = paretoFront(usable, 'aprEff', 'pConv', true);
+  const waiting = usable
+    .filter((r) => front.has(r))
+    .sort((a, b) => a.pConv - b.pConv)
+    .slice(0, limit);
+  for (const r of waiting) r.waitPareto = true;
+  return { mode: 'wait', rows: waiting.length ? waiting : usable.sort((a, b) => a.pConv - b.pConv).slice(0, limit) };
+}

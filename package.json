@@ -1,0 +1,17 @@
+{
+  "name": "dual-assets-radar",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Радар котировок Bybit Dual Assets BTC/USDT: эффективный APR, вероятность конвертации, подбор Sell High",
+  "scripts": {
+    "test": "node scripts/selftest.mjs",
+    "test:offline": "node scripts/selftest.mjs --offline",
+    "record": "node scripts/record.mjs --out data-branch",
+    "backtest": "node scripts/backtest.mjs",
+    "serve": "python -m http.server 8642 --directory web"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
