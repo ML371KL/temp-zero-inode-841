@@ -46,8 +46,8 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
   }
 
   const W = 560;
-  const H = 300;
-  const M = { top: 12, right: 14, bottom: 34, left: 48 };
+  const H = 340;
+  const M = { top: 16, right: 18, bottom: 34, left: 48 };
   const iw = W - M.left - M.right;
   const ih = H - M.top - M.bottom;
 
@@ -105,23 +105,62 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
     );
   }
 
+  // Доминируемые оферты — это фон: они нужны, чтобы видеть облако целиком, но
+  // не должны конкурировать за внимание с фронтом. Раньше 130 одинаково ярких
+  // кружков делали график нечитаемым, а сам фронт в них терялся.
   for (const r of usable) {
-    const c = durationColor(r.duration, durations);
+    if (r.pareto) continue;
     const node = el('circle', {
       class: 'pt',
       cx: x(r.pConv),
       cy: y(r.aprEff),
-      r: r.pareto ? 5.5 : 3.6,
-      fill: r.pareto ? c : 'transparent',
-      stroke: c,
-      'stroke-width': r.isVip ? 2.2 : 1.3,
-      'fill-opacity': 0.85,
+      r: 2.6,
+      fill: 'var(--ink-3)',
+      'fill-opacity': 0.28,
+      stroke: 'none',
     });
     if (onHover) {
       node.addEventListener('mouseenter', (e) => onHover(r, e));
       node.addEventListener('mouseleave', () => onHover(null));
     }
     g.append(node);
+  }
+
+  // Точки фронта: цвет по сроку, обводка потолще у VIP, подпись со страйком.
+  for (const r of front) {
+    const c = durationColor(r.duration, durations);
+    const node = el('circle', {
+      class: 'pt',
+      cx: x(r.pConv),
+      cy: y(r.aprEff),
+      r: 5.5,
+      fill: c,
+      stroke: 'var(--panel)',
+      'stroke-width': r.isVip ? 2 : 1,
+    });
+    if (onHover) {
+      node.addEventListener('mouseenter', (e) => onHover(r, e));
+      node.addEventListener('mouseleave', () => onHover(null));
+    }
+    g.append(node);
+  }
+
+  // Подписываем только те точки фронта, что не налезают друг на друга.
+  let lastLabelX = -1e9;
+  let lastLabelY = -1e9;
+  for (const r of front) {
+    const px = x(r.pConv);
+    const py = y(r.aprEff);
+    if (Math.abs(px - lastLabelX) < 42 && Math.abs(py - lastLabelY) < 16) continue;
+    lastLabelX = px;
+    lastLabelY = py;
+    const label = el(
+      'text',
+      { x: px + 8, y: py - 7, 'font-size': 9.5, 'font-family': 'ui-monospace, monospace' },
+      `${Math.round(r.strike / 100) / 10}k · ${r.duration}`,
+    );
+    label.setAttribute('fill', 'var(--ink-2)');
+    g.append(label);
   }
 
   const xl = el('text', { x: iw / 2, y: ih + 31, 'text-anchor': 'middle', 'font-size': 11 }, 'вероятность конвертации');

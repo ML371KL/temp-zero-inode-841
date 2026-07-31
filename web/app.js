@@ -14,7 +14,15 @@ import {
 } from './feeds.js';
 import { buildSurface } from './surface.js';
 import { Archive } from './archive.js';
-import { History, buildRows, pickBest, pickBestSell, analyzeSellHigh } from './model.js';
+import {
+  History,
+  buildRows,
+  pickBest,
+  pickBestSell,
+  analyzeSellHigh,
+  frontierWithMargins,
+  pickAnchors,
+} from './model.js';
 import { basisFromConversion, interestRate, MS_DAY } from './quant.js';
 import { scatterChart, ladderChart, durationColor } from './charts.js';
 
@@ -352,6 +360,31 @@ const BUY_COLUMNS = [
   ['Сеттлмент', (r) => fmtTime(r.timing.settle)],
 ];
 
+const FRONTIER_COLUMNS = [
+  ['Срок', (r) => `${r.isVip ? '<span class="vip-badge">★</span> ' : ''}${r.duration}`, 'left'],
+  ['Страйк', (r) => fmtUsd(r.strike, 2)],
+  ['От спота', (r) => `<span class="muted">${fmtSigned(r.moneyness, 2)}</span>`],
+  ['P(конв)', (r) => `<b>${fmtPct(r.pConv, 2)}</b>`],
+  ['APR эфф.', (r) => `<b>${fmtPct(r.aprEff, 2)}</b>`],
+  ['APR в цикле', (r) => `<span class="muted">${fmtPct(r.aprChained, 2)}</span>`],
+  ['Прибавка APR', (r) => `<span class="${cls(r.gainApr)}">${fmtSigned(r.gainApr, 2)}</span>`],
+  ['Ценой риска', (r) => `<span class="muted">${fmtSigned(r.gainP, 2)}</span>`],
+  ['Цена шага', (r) => fmtMarginal(r.marginal)],
+  ['Премия σ', (r) => `<span class="${cls(r.volEdge)}">${fmtSigned(r.volEdge, 2)}</span>`],
+  ['Доход, USDT', (r) => (r.money ? fmtUsd(r.money.interest, 2) : '—')],
+  ['Сеттлмент', (r) => fmtTime(r.timing.settle)],
+];
+
+/**
+ * Предельная цена риска. Значение выше единицы означает, что шаг добавляет
+ * больше процентных пунктов доходности, чем процентных пунктов риска.
+ */
+function fmtMarginal(x) {
+  if (x == null || !Number.isFinite(x)) return '<span class="muted">—</span>';
+  const tone = x >= 2 ? 'pos' : x < 0.5 ? 'neg' : '';
+  return `<b class="${tone}">${x >= 100 ? '≫' : x.toFixed(2)}</b>`;
+}
+
 const SELL_COLUMNS = [
   ['Срок', (r) => `${r.isVip ? '<span class="vip-badge">★</span> ' : ''}${r.duration}`, 'left'],
   ['Страйк', (r) => fmtUsd(r.strike, 2)],
@@ -412,6 +445,8 @@ function renderBuy(rows) {
     `${rows.length} оферт${rows.length ? '' : ''} · ${new Set(rows.map((r) => r.productId)).size} продуктов` +
     (ui.vip ? ' · VIP включены' : ' · только общедоступные');
   renderTable($('buy-table'), BUY_COLUMNS, sorted, (r) => (r.pareto ? 'pareto' : ''));
+  renderAnchors(rows);
+  renderFrontier(rows);
 
   scatterChart($('scatter'), rows, {
     durations: [...new Set(state.products.map((p) => p.duration))].sort((a, b) => durationDays(a) - durationDays(b)),
@@ -457,6 +492,90 @@ function sellCardFor(row, mode) {
         }
       </dl>
     </article>`;
+}
+
+const ANCHOR_META = {
+  market: {
+    title: 'Лучшая цена риска',
+    key: 'volEdge',
+    hint: 'премия оферты против цены опциона на тот же риск с той же датой экспирации. Единственный критерий, которому не нужны ваши предпочтения',
+  },
+  expected: {
+    title: 'Лучшее матожидание',
+    key: 'expNetApr',
+    hint: 'процент минус ожидаемая потеря на конвертации по историческому распределению цены',
+  },
+  yield: {
+    title: 'Максимум доходности',
+    key: 'aprEff',
+    hint: 'осмысленно, если конвертация вас устраивает: страйк — цена, по которой вы и так готовы купить BTC',
+  },
+};
+
+function renderAnchors(rows) {
+  const anchors = pickAnchors(rows);
+  const box = $('anchors');
+  const cards = [];
+  for (const [id, meta] of Object.entries(ANCHOR_META)) {
+    const r = anchors[id];
+    if (!r) continue;
+    const value = r[meta.key];
+    cards.push(`
+      <article class="anchor" data-product="${r.productId}">
+        <div class="anchor-title">${meta.title}</div>
+        <div class="anchor-value">${meta.key === 'volEdge' ? fmtSigned(value, 2) : fmtPct(value, 1)}</div>
+        <div class="anchor-line">
+          ${r.duration}${r.isVip ? ' · VIP' : ''} · страйк <b>${fmtUsd(r.strike, 2)}</b> (${fmtSigned(r.moneyness, 2)})
+        </div>
+        <div class="anchor-line muted">
+          APR эфф. ${fmtPct(r.aprEff, 1)} · в цикле ${fmtPct(r.aprChained, 1)} · P(конв) ${fmtPct(r.pConv, 2)}
+        </div>
+        <div class="anchor-hint">${meta.hint}</div>
+      </article>`);
+  }
+  box.innerHTML = cards.join('') || '<div class="empty">нет данных для оценки</div>';
+}
+
+function renderFrontier(rows) {
+  const rf = state.riskFree ?? 0;
+  const steps = frontierWithMargins(rows, rf);
+  // Оферта ниже безрисковой ставки формально на фронте, но экономически
+  // бессмысленна: тот же результат даёт гибкий депозит без всякого риска.
+  renderTable($('frontier-table'), FRONTIER_COLUMNS, steps, (r) =>
+    [r.aprEff < rf ? 'dim' : '', r.pConv <= ui.maxP ? 'within' : ''].filter(Boolean).join(' '),
+  );
+
+  const note = $('frontier-note');
+  if (steps.length < 2) {
+    note.textContent = '';
+    return;
+  }
+  // Выпуклость фронта — не косметика, а причина, по которой «оптимума вообще»
+  // не существует: при растущей отдаче на риск любое линейное предпочтение
+  // выбирает край, а не середину.
+  // Выпуклость проверяем по половинам фронта, а не по крайним шагам:
+  // отдельные шаги сильно скачут, когда на фронт входит продукт другого срока.
+  const mid = Math.floor(steps.length / 2);
+  const slope = (from, to) => {
+    const dP = to.pConv - from.pConv;
+    return dP > 1e-9 ? (to.aprEff - from.aprEff) / dP : null;
+  };
+  const lower = slope(steps[0], steps[mid]);
+  const upper = slope(steps[mid], steps[steps.length - 1]);
+  const rising = lower != null && upper != null && upper > lower;
+  const withinCount = steps.filter((r) => r.pConv <= ui.maxP).length;
+  const belowRf = steps.filter((r) => r.aprEff < (state.riskFree ?? 0)).length;
+  note.innerHTML =
+    `Строк на фронте: <b>${steps.length}</b>, внутри вашего порога ${fmtPct(ui.maxP, 1)} — <b>${withinCount}</b> (подсвечены)` +
+    (belowRf
+      ? `, из них <b>${belowRf}</b> платят меньше гибкого депозита ${fmtPct(state.riskFree ?? 0, 2)} и приглушены: риск там есть, а смысла нет. `
+      : '. ') +
+    (rising
+      ? 'Фронт сейчас выпуклый: отдача на риск с ростом вероятности не падает, а растёт. ' +
+        'Это значит, что «оптимальной середины» не существует — любое постоянное отношение к риску ' +
+        'выбирает один из краёв, и порог остаётся честным способом сказать, где ваш край.'
+      : 'Отдача на риск убывает с ростом вероятности: шаги в правой части фронта дают всё меньше ' +
+        'доходности за тот же прирост риска, и останавливаться разумно там, где «цена шага» падает.');
 }
 
 function renderSell(rows) {

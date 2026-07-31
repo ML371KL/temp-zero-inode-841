@@ -492,6 +492,75 @@ tr.dim td {
   line-height: 1.6;
 }
 
+/* ───────────────────────────────────────── якоря и фронт */
+
+.panel.frontier {
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--line));
+}
+
+.anchors {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.anchor {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-2);
+  padding: 11px 13px;
+}
+
+.anchor-title {
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.anchor-value {
+  font-family: var(--mono);
+  font-size: 22px;
+  font-weight: 640;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  margin: 2px 0 6px;
+  line-height: 1;
+}
+
+.anchor-line {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.anchor-line b {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.anchor-line.muted {
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.anchor-hint {
+  font-size: 11px;
+  color: var(--ink-2);
+  margin-top: 7px;
+  line-height: 1.45;
+}
+
+tr.within td {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+#frontier-note {
+  margin-top: 12px;
+  max-width: 92ch;
+}
+
 .best-sell-head {
   margin: 4px 0 10px;
 }
