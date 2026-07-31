@@ -29,9 +29,14 @@ const WANT_DURATIONS = String(arg('durations', '1d,3d,6d,13d,27d')).split(',');
 // Удаления страйка от спота, по которым строится сетка результатов.
 const BUY_LEVELS = [-0.01, -0.02, -0.03, -0.05, -0.08];
 const SELL_LEVEL = 0.02;
-// breakeven — не продавать BTC дешевле себестоимости; fixed — продавать всегда
-// на фиксированном удалении от текущей цены.
-const POLICY = arg('policy', 'breakeven');
+// Политики выхода из BTC после конвертации:
+//   hold      — подписываться на Sell High только со страйком не ниже порога
+//               безубытка; если такого нет, BTC просто лежит. Убыток никогда
+//               не реализуется. Это стратегия «купится BTC — не страшно».
+//   breakeven — то же, но при отсутствии безубыточного страйка берётся самый
+//               дальний из лестницы: процент капает, но продажа в убыток возможна.
+//   fixed     — продавать всегда на фиксированном удалении от текущей цены.
+const POLICY = arg('policy', 'hold');
 
 /** Часовой ряд как можно глубже: он даёт цену ровно в 08:00 UTC. */
 async function loadHourly(years) {
@@ -115,6 +120,13 @@ function simulate({
   let idleCycles = 0; // циклы, в которых безубыточного страйка не нашлось
   let stuckSince = null;
   let maxStuckDays = 0;
+  let btcIdleMs = 0;
+  let usdtMs = 0;
+  let btcMs = 0;
+  // Множитель роста только по ноге USDT: он показывает ставку, реально
+  // полученную в долларах, отдельно от переоценки биткоина.
+  let usdtGrowth = 1;
+  let realizedLoss = 0;
 
   // Первое закрытие окна подписки не раньше начала истории.
   let t = Date.UTC(
@@ -151,8 +163,11 @@ function simulate({
         stuckSince = t + yieldMs;
       } else {
         usdt = payout;
+        usdtGrowth *= 1 + iBuy;
       }
+      usdtMs += cycleMs;
     } else {
+      btcMs += cycleMs;
       // Выбор страйка Sell High.
       //
       // Политика fixed продаёт на фиксированном удалении от текущей цены —
@@ -163,20 +178,39 @@ function simulate({
       // цикле не происходит, и BTC просто накапливает процент.
       const wanted = s0 * (1 + sellM);
       let K = wanted;
-      if (policy === 'breakeven' && basis != null) {
-        // Порог безубытка с поправкой на процент, который начислится за срок.
-        const guessApy = sellCurve(Math.min(Math.max(wanted / s0 - 1, sellCurve.min), sellCurve.max)) ?? 0;
-        const be = basis / (1 + interestRate(guessApy, yieldDays));
-        K = Math.max(wanted, be);
+      if (policy !== 'fixed' && basis != null) {
+        // Порог безубытка зависит от ставки, а ставка — от страйка, поэтому
+        // точку ищем итеративно: оценили ставку, сдвинули страйк, пересчитали.
+        // Одной оценкой по соседнему уровню обойтись нельзя — дальний страйк
+        // платит меньше, порог из-за этого уезжает вверх, и продажа уходит в минус.
+        for (let k = 0; k < 4; k++) {
+          const m0 = Math.min(Math.max(K / s0 - 1, sellCurve.min), sellCurve.max);
+          const be = basis / (1 + interestRate(sellCurve(m0) ?? 0, yieldDays));
+          const next = Math.max(wanted, be);
+          if (Math.abs(next - K) < 1e-6) break;
+          K = next;
+        }
       }
       const m = K / s0 - 1;
       let apy = m >= sellCurve.min && m <= sellCurve.max ? sellCurve(m) : null;
 
+      // Итоговая проверка на самой выбранной ставке: выручка обязана покрыть
+      // затраты. Итерация могла не сойтись на изломе кривой.
+      if (apy != null && policy === 'hold' && basis != null && (1 + interestRate(apy, yieldDays)) * K < basis) {
+        apy = null;
+      }
+
       if (apy == null) {
-        // Безубыточного страйка биржа не котирует. Повторяем поведение панели
-        // в режиме ожидания: берём самый дальний страйк лестницы — он даёт
-        // процент в BTC при наименьшем риске принудительной продажи в убыток.
         idleCycles++;
+        if (policy === 'hold') {
+          // Безубыточного страйка нет — не подписываемся вовсе. BTC лежит без
+          // начисления, но и продать его себе в убыток никто не заставит.
+          btcIdleMs += cycleMs;
+          t += cycleMs;
+          continue;
+        }
+        // Иначе берём самый дальний страйк лестницы: процент капает, но
+        // срабатывание зафиксирует убыток.
         K = s0 * (1 + sellCurve.max);
         apy = sellCurve(sellCurve.max);
       }
@@ -185,6 +219,10 @@ function simulate({
         const payoutBtc = btc * (1 + iCycle);
         if (sT >= K) {
           usdt = payoutBtc * K;
+          // Убыток считается по выручке против затрат, а не по страйку против
+          // себестоимости: начисленный процент делает часть продаж ниже
+          // себестоимости всё равно прибыльными.
+          if (basis != null && payoutBtc * K < btc * basis) realizedLoss += 1;
           btc = 0;
           basis = null;
           sales++;
@@ -212,6 +250,11 @@ function simulate({
     conversions,
     sales,
     idleCycles,
+    realizedLoss,
+    shareInBtc: usdtMs + btcMs > 0 ? btcMs / (usdtMs + btcMs) : 0,
+    idleShare: btcMs > 0 ? btcIdleMs / btcMs : 0,
+    // Годовая ставка, полученная в USDT, приведённая ко времени в USDT.
+    usdtApr: usdtMs > 0 ? usdtGrowth ** ((YEAR_DAYS * MS_DAY) / usdtMs) - 1 : null,
     endedInBtc: btc > 0,
     maxStuckDays,
     finalUsdt,
@@ -277,11 +320,20 @@ async function main() {
 
   const pct = (x, d = 2) => (x == null ? '—' : `${(x * 100).toFixed(d)}%`);
   console.log(
-    `\nКонфигурация: ${WANT_VIP ? 'VIP' : 'общедоступные'} продукты, Sell High на +${(SELL_LEVEL * 100).toFixed(0)}%.`,
+    `\nКонфигурация: ${WANT_VIP ? 'VIP' : 'общедоступные'} продукты, Sell High на +${(SELL_LEVEL * 100).toFixed(0)}%, ` +
+      `политика — ${
+        POLICY === 'hold'
+          ? 'никогда не продавать BTC дешевле себестоимости'
+          : POLICY === 'breakeven'
+            ? 'не ниже себестоимости, иначе самый дальний страйк'
+            : 'фиксированное удаление от цены'
+      }.`,
   );
   console.log('Ставки взяты сегодняшние и приняты постоянными на всю историю — см. оговорку в шапке файла.\n');
   console.log(
-    ['срок', 'страйк', 'APY', 'цикл', 'циклов', 'конв.', 'продаж', 'CAGR', 'в BTC макс.', 'финал'].join('\t'),
+    ['срок', 'страйк', 'APY', 'ставка USDT', 'конв.', 'продаж', 'в убыток', 'доля в BTC', 'макс. в BTC', 'итог', 'CAGR'].join(
+      '\t',
+    ),
   );
   for (const r of rows) {
     console.log(
@@ -289,14 +341,14 @@ async function main() {
         r.duration,
         pct(r.buyM, 0),
         pct(r.apy, 1),
-        `${r.cycleDays.toFixed(2)}д`,
-        r.cycles,
+        pct(r.usdtApr),
         r.conversions,
         r.sales,
-        r.idleCycles,
-        pct(r.cagr),
+        r.realizedLoss,
+        pct(r.shareInBtc, 0),
         `${r.maxStuckDays.toFixed(0)}д`,
-        r.finalUsdt.toFixed(3),
+        r.endedInBtc ? 'в BTC' : 'в USDT',
+        pct(r.cagr),
       ].join('\t'),
     );
   }
