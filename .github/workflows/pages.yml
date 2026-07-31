@@ -28,10 +28,12 @@ jobs:
         with:
           node-version: 24
 
-      # Публикуем только то, что прошло проверку формул. Сеть в CI доступна,
-      # поэтому гоняем и живые инварианты расписания продуктов.
+      # Только офлайн-часть набора. Bybit блокирует диапазоны дата-центров
+      # через CloudFront: с раннеров GitHub все эндпоинты и все зеркала биржи
+      # отдают 403 (проверено scripts/probe.mjs). Живые инварианты расписания
+      # продуктов гоняются локально: `node scripts/selftest.mjs`.
       - name: Самопроверка расчётов
-        run: node scripts/selftest.mjs
+        run: node scripts/selftest.mjs --offline
 
       - uses: actions/configure-pages@v5
 

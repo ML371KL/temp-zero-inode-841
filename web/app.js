@@ -13,6 +13,7 @@ import {
   normalizeWsOffer,
 } from './feeds.js';
 import { buildSurface } from './surface.js';
+import { Archive } from './archive.js';
 import { History, buildRows, pickBest, pickBestSell, analyzeSellHigh } from './model.js';
 import { basisFromConversion, interestRate, MS_DAY } from './quant.js';
 import { scatterChart, ladderChart, durationColor } from './charts.js';
@@ -28,6 +29,7 @@ const state = {
   history: null,
   riskFree: null,
   stats: null,
+  archive: null,
   wsStatus: 'connecting',
   lastQuoteAt: 0,
   lastOptionsAt: 0,
@@ -519,11 +521,15 @@ function renderDiag() {
     parts.push('история: загружается');
   }
   if (state.riskFree != null) parts.push(`безрисковая USDT: ${fmtPct(state.riskFree, 2)}`);
-  parts.push(
-    state.stats
-      ? `архив ставок: ${state.stats.spanDays.toFixed(1)} сут, ${state.stats.snapshots} снимков`
-      : 'архив ставок: пока пуст',
-  );
+  if (state.stats) {
+    const where = state.stats.source === 'local' ? 'в браузере' : 'на ветке data';
+    parts.push(
+      `архив ставок ${where}: ${state.stats.spanDays.toFixed(1)} сут, ` +
+        `${state.stats.snapshots} снимков, корзин ${Object.keys(state.stats.buckets).length}`,
+    );
+  } else {
+    parts.push(state.archive ? 'архив ставок: копится в браузере' : 'архив ставок: недоступен');
+  }
   if (state.lastOptionsAt) parts.push(`опционы обновлены ${fmtTime(state.lastOptionsAt)}`);
   parts.push(ui.tz === 'utc' ? 'время UTC' : 'время местное');
   const diag = $('diag');
@@ -544,9 +550,17 @@ function render() {
     try {
       renderHead();
       const buy = currentRows('BuyLow');
+      const sell = currentRows('SellHigh');
       renderBuy(buy);
-      renderSell(currentRows('SellHigh'));
+      renderSell(sell);
       renderDiag();
+      // Архив пополняется тем же срезом, который только что показан.
+      // Сама запись не чаще раза в минуту — интервал держит сам архив.
+      if (state.archive && (buy.length || sell.length)) {
+        state.archive.sample([...buy, ...sell]).then((written) => {
+          if (written) state.archive.stats().then((st) => st && !state.statsRemote && (state.stats = st));
+        });
+      }
     } catch (e) {
       pushError(`отрисовка: ${e.message}`);
       console.error(e);
@@ -697,8 +711,22 @@ async function main() {
     loadOptions(),
     bootstrapQuotes(),
     fetchRiskFree().then((r) => (state.riskFree = r)),
-    fetchAprStats().then((s) => (state.stats = s)),
+    fetchAprStats().then((s) => {
+      // Сводка с ветки data появляется только если архив кто-то наполняет
+      // извне; с раннеров GitHub биржа недоступна, поэтому обычно её нет.
+      if (s) {
+        state.stats = s;
+        state.statsRemote = true;
+      }
+    }),
   ]);
+
+  const archive = new Archive();
+  if (await archive.init()) {
+    state.archive = archive;
+    const local = await archive.stats();
+    if (local && !state.statsRemote) state.stats = local;
+  }
   render();
 
   loadHistory().then(render);
