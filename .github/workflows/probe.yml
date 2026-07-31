@@ -1,0 +1,17 @@
+name: Диагностика доступа к Bybit
+
+# Запускается вручную. Нужен, чтобы понимать, какие эндпоинты и домены биржи
+# доступны с раннеров GitHub: фильтрация со стороны Bybit меняется со временем.
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: node scripts/probe.mjs
