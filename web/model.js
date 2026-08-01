@@ -134,12 +134,27 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
     if (ratio < 1) fairAprEff = ((ratio / (1 - ratio)) * YEAR_DAYS) / timing.lockDays;
   }
 
-  // Ожидаемая чистая доходность по историческому распределению:
-  // процент минус ожидаемая потеря на конвертации, приведённые к годовым.
+  // Ожидаемая чистая доходность по историческому распределению.
+  //
+  // Buy Low: выплата на вложенный доллар равна (1+i)·min(1, S/K), а её
+  // ожидание — (1+i)(1 − E[(K−S)⁺]/K). Здесь единица берётся из того, что
+  // вложен ровно доллар, и это точно.
+  //
+  // Sell High считается относительно другой базы: вложен BTC, стоящий сегодня
+  // spot, а выплата равна (1+i)·min(S, K). Ожидание в долях сегодняшней
+  // стоимости — (1+i)(E[S]/spot − E[(S−K)⁺]/spot). Подставлять сюда единицу
+  // вместо E[S]/spot нельзя: это молча приравнивает ожидаемую цену BTC к
+  // текущей и на длинных сроках занижает результат на весь исторический дрейф.
   let expNetApr = null;
   if (shortfall != null && timing.lockDays > 0) {
-    const value = (1 + i) * (1 - shortfall);
-    expNetApr = ((value - 1) * YEAR_DAYS) / timing.lockDays;
+    let value = null;
+    if (direction === 'BuyLow') {
+      value = (1 + i) * (1 - shortfall);
+    } else if (hist?.sorted.length) {
+      const meanGross = empiricalMeanGross(hist.sorted);
+      if (meanGross != null) value = (1 + i) * (meanGross - shortfall);
+    }
+    if (value != null) expNetApr = ((value - 1) * YEAR_DAYS) / timing.lockDays;
   }
 
   // Где текущая ставка стоит относительно того, что предлагалось за последний
@@ -319,13 +334,20 @@ export function pickBest({ rows, maxP, limit = 6 }) {
  * basis — фактическая цена, по которой BTC попал на баланс. Порог безубытка
  * ниже себестоимости на величину начисляемого процента.
  */
-export function analyzeSellHigh({ rows, basis, qty, spot, history }) {
+export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'max' }) {
   const out = rows.map((r) => {
     const be = breakevenStrike(basis, r.apy, r.timing.yieldDays);
     const payoutBtc = qty > 0 ? qty * (1 + r.i) : null;
     const usdtIfSold = payoutBtc != null ? payoutBtc * r.strike : null;
     const spent = qty > 0 ? qty * basis : null;
-    const rec = cyclesToRecover(basis, spot, r.apy, r.timing.yieldDays, r.timing.lockDays);
+    const rec = cyclesToRecover(
+      basis,
+      spot,
+      r.apy,
+      r.timing.yieldDays,
+      r.timing.lockDays,
+      r.timing.cycleDays,
+    );
 
     // Ожидаемая выручка в USDT по историческому распределению:
     // E[(1+i)·min(S_T, K)] = (1+i)·(E[S_T] − E[(S_T − K)⁺]).
@@ -354,9 +376,24 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history }) {
     };
   });
 
+  const profitable = out.filter((r) => r.profitable);
+  const exitMode = profitable.length > 0;
+
+  // Осторожная оценка вероятности меняет направление вместе со смыслом
+  // срабатывания. Пока выход безубыточен, продажа — желанный исход, и
+  // осторожно предполагать меньшую из двух вероятностей. Как только выхода
+  // нет, срабатывание означает продажу в убыток, и осторожно предполагать
+  // большую. Режим «худшая из двух» брал максимум всегда и в первом случае
+  // выдавал желаемое за действительное.
+  if (measure === 'max') {
+    for (const r of out) {
+      if (r.pRN == null || r.pHist == null) continue;
+      r.pConv = exitMode ? Math.min(r.pRN, r.pHist) : Math.max(r.pRN, r.pHist);
+    }
+  }
+
   // Среди безубыточных оферт срабатывание — это желанный выход в USDT,
   // поэтому фронт строится по максимуму и доходности, и вероятности продажи.
-  const profitable = out.filter((r) => r.profitable);
   const front = paretoFront(profitable, 'aprEff', 'pConv', false);
   for (const r of out) r.sellPareto = front.has(r);
 

@@ -16,10 +16,19 @@ import {
   fetchKlines,
 } from '../web/feeds.js';
 import { buildSurface, volAt, forwardAt } from '../web/surface.js';
-import { History, buildRows, pickBest, frontierWithMargins, pickAnchors } from '../web/model.js';
+import {
+  History,
+  buildRows,
+  pickBest,
+  pickBestSell,
+  analyzeSellHigh,
+  frontierWithMargins,
+  pickAnchors,
+} from '../web/model.js';
 import {
   productTiming,
   interestRate,
+  basisFromConversion,
   effectiveApr,
   chainedApr,
   black76Put,
@@ -495,6 +504,161 @@ console.log('\n── 9. Историческая мера');
     if (r.pHist != null && r.shortfall > r.pHist + 1e-9) shortfallBad++;
   }
   ok('ожидаемая потеря не превышает вероятность конвертации', shortfallBad === 0, `нарушений ${shortfallBad}`);
+}
+
+// ─────────────────────────────────────────── 10. Блок Sell High
+
+console.log('\n── 10. Sell High: себестоимость, безубыток, отбор');
+{
+  // Сценарий, который реально бывает: конвертация случилась выше рынка.
+  const convStrike = spot * 1.06;
+  const convApy = 0.4;
+  const convDays = 1;
+  const basis = basisFromConversion(convStrike, convApy, convDays);
+  const qty = 0.2;
+
+  // Себестоимость: за A долларов пришло A(1+i)/K монет, значит цена монеты K/(1+i).
+  const iConv = interestRate(convApy, convDays);
+  const spent = 10000;
+  const gotBtc = (spent * (1 + iConv)) / convStrike;
+  ok(
+    'себестоимость = потрачено / получено',
+    Math.abs(basis - spent / gotBtc) < 1e-9,
+    `${basis.toFixed(2)} против ${(spent / gotBtc).toFixed(2)}`,
+  );
+  ok('себестоимость ниже страйка конвертации', basis < convStrike);
+
+  const analyzed = analyzeSellHigh({ rows: sell, basis, qty, spot, history, measure: 'max' });
+
+  // Признак безубыточности обязан совпадать с прямым сравнением денег.
+  let flagBad = [];
+  for (const r of analyzed) {
+    const revenue = qty * (1 + r.i) * r.strike;
+    const cost = qty * basis;
+    const byMoney = revenue >= cost - 1e-9;
+    if (byMoney !== r.profitable) flagBad.push(`${r.duration}/${r.strike}`);
+  }
+  ok('признак безубытка совпадает с прямым счётом денег', flagBad.length === 0, flagBad.slice(0, 3).join(', ') || 'ок');
+
+  // Порог безубытка обязан быть ровно той точкой, где прибыль обращается в ноль.
+  let beBad = 0;
+  for (const r of analyzed) {
+    const atBreakeven = qty * (1 + r.i) * r.breakeven - qty * basis;
+    if (Math.abs(atBreakeven) > 1e-6) beBad++;
+  }
+  ok('на пороге безубытка прибыль равна нулю', beBad === 0, `нарушений ${beBad}`);
+
+  ok(
+    'выручка и прибыль согласованы',
+    analyzed.every(
+      (r) => Math.abs(r.usdtIfSold - qty * (1 + r.i) * r.strike) < 1e-9 && Math.abs(r.profitUsdt - (r.usdtIfSold - qty * basis)) < 1e-9,
+    ),
+  );
+  ok(
+    'запас над порогом согласован с прибылью по знаку',
+    analyzed.every((r) => Math.sign(r.cushion) === Math.sign(r.profitUsdt) || Math.abs(r.profitUsdt) < 1e-6),
+  );
+
+  // Выплата Sell High: проданный колл. Сверяем оценку с Монте-Карло.
+  const s = analyzed.find((r) => r.sigma > 0 && r.i > 0);
+  if (s) {
+    const mc = monteCarlo({ F: s.forward, K: s.strike, sigma: s.sigma, T: s.Teff, direction: 'SellHigh', i: s.i });
+    const df = Math.exp((-(riskFree ?? 0) * s.timing.lockDays) / YEAR_DAYS);
+    ok(
+      'справедливая стоимость Sell High против Монте-Карло',
+      Math.abs(mc.value * df - s.fairValue) < 1e-3,
+      `аналитика ${s.fairValue.toFixed(6)}, Монте-Карло ${(mc.value * df).toFixed(6)}`,
+    );
+  }
+
+  // Ожидаемая доходность Sell High обязана считаться от стоимости биткоина,
+  // а не от единицы: иначе теряется весь исторический дрейф цены.
+  const withHist = analyzed.filter((r) => r.expNetApr != null && r.shortfall != null);
+  let driftBad = 0;
+  for (const r of withHist.slice(0, 40)) {
+    const h = history.returns(r.timing.tauDays);
+    const meanGross = h ? h.sorted.reduce((a, x) => a + Math.exp(x), 0) / h.sorted.length : null;
+    if (meanGross == null) continue;
+    const expected = (((1 + r.i) * (meanGross - r.shortfall) - 1) * YEAR_DAYS) / r.timing.lockDays;
+    if (Math.abs(expected - r.expNetApr) > 1e-9) driftBad++;
+  }
+  ok('ожидаемая доходность Sell High учитывает дрейф цены', driftBad === 0, `нарушений ${driftBad}`);
+
+  // Циклы до безубытка: рост количества монет обязан закрывать разрыв.
+  let recBad = [];
+  for (const r of analyzed) {
+    const rec = r.recovery;
+    if (rec.cycles == null || rec.cycles === 0) continue;
+    const grown = (1 + r.i) ** rec.cycles;
+    if (grown < basis / spot - 1e-9) recBad.push(`${r.duration}/${r.strike}`);
+    // Длительность обязана учитывать простой между окнами подписки.
+    const expectedDays = r.timing.lockDays + (rec.cycles - 1) * r.timing.cycleDays;
+    if (Math.abs(rec.days - expectedDays) > 1e-9) recBad.push(`срок ${r.duration}`);
+  }
+  ok('циклы до безубытка закрывают разрыв и учитывают простой', recBad.length === 0, recBad.slice(0, 3).join(', ') || 'ок');
+
+  // Отбор в режиме выхода: фронт по максимуму обеих величин.
+  const best = pickBestSell({ rows: analyzed });
+  ok('режим определён верно', best.mode === (analyzed.some((r) => r.profitable) ? 'exit' : 'wait'), best.mode);
+  if (best.mode === 'exit') {
+    ok('в режиме выхода показаны только безубыточные', best.rows.every((r) => r.profitable));
+    const pool = analyzed.filter((r) => r.profitable && Number.isFinite(r.aprEff) && Number.isFinite(r.pConv));
+    const dominated = (a) =>
+      pool.some((b) => b !== a && b.aprEff >= a.aprEff && b.pConv >= a.pConv && (b.aprEff > a.aprEff || b.pConv > a.pConv));
+    const brute = pool.filter((r) => !dominated(r));
+    const model = pool.filter((r) => r.sellPareto);
+    ok(
+      'фронт выхода совпадает с полным перебором',
+      brute.length === model.length && brute.every((r) => r.sellPareto),
+      `перебор ${brute.length}, модель ${model.length}`,
+    );
+  }
+
+  // Тот же набор, но при недостижимой себестоимости: должен включиться режим ожидания.
+  const deep = analyzeSellHigh({ rows: sell, basis: spot * 4, qty, spot, history, measure: 'max' });
+  const waiting = pickBestSell({ rows: deep });
+  ok('при недостижимой себестоимости включается режим ожидания', waiting.mode === 'wait');
+  ok('в режиме ожидания риск минимален среди показанных', waiting.rows.every((r, k) => k === 0 || r.pConv >= waiting.rows[k - 1].pConv));
+  const deepPool = deep.filter((r) => Number.isFinite(r.aprEff) && Number.isFinite(r.pConv));
+  const waitDominated = (a) =>
+    deepPool.some((b) => b !== a && b.aprEff >= a.aprEff && b.pConv <= a.pConv && (b.aprEff > a.aprEff || b.pConv < a.pConv));
+  ok('в режиме ожидания показаны только недоминируемые', waiting.rows.every((r) => !waitDominated(r)));
+
+  // Направление осторожной оценки вероятности.
+  const exitRows = analyzed.filter((r) => r.pRN != null && r.pHist != null);
+  const waitRows = deep.filter((r) => r.pRN != null && r.pHist != null);
+  ok(
+    'в режиме выхода осторожная вероятность — меньшая из двух',
+    exitRows.every((r) => Math.abs(r.pConv - Math.min(r.pRN, r.pHist)) < 1e-12),
+    `проверено ${exitRows.length}`,
+  );
+  ok(
+    'в режиме ожидания осторожная вероятность — большая из двух',
+    waitRows.every((r) => Math.abs(r.pConv - Math.max(r.pRN, r.pHist)) < 1e-12),
+    `проверено ${waitRows.length}`,
+  );
+
+  // Перекосы лестницы на стороне Sell High: безопаснее — страйк выше.
+  let ladderBad = [];
+  const byProduct = new Map();
+  for (const r of sell) {
+    if (!byProduct.has(r.productId)) byProduct.set(r.productId, []);
+    byProduct.get(r.productId).push(r);
+  }
+  for (const list of byProduct.values()) {
+    const s2 = [...list].sort((a, b) => b.strike - a.strike);
+    for (let k = 1; k < s2.length; k++) if (s2[k].apy < s2[k - 1].apy - 1e-9) ladderBad.push(`${s2[k].duration}/${s2[k].strike}`);
+  }
+  const flaggedSell = sell.filter((r) => r.laddered).length;
+  ok(
+    'перекосы лестницы Sell High помечены',
+    flaggedSell >= ladderBad.length,
+    `нарушений ${ladderBad.length}, помечено ${flaggedSell}`,
+  );
+
+  console.log(
+    `       себестоимость ${basis.toFixed(2)} при споте ${spot.toFixed(2)} · безубыточных ${analyzed.filter((r) => r.profitable).length} из ${analyzed.length} · режим ${best.mode}`,
+  );
 }
 
 console.log(`\nИтого: ${passed} успешно, ${failed} провалено`);

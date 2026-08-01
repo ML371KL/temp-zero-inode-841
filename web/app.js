@@ -23,7 +23,7 @@ import {
   frontierWithMargins,
   pickAnchors,
 } from './model.js';
-import { basisFromConversion, interestRate, MS_DAY } from './quant.js';
+import { basisFromConversion, interestRate, cyclesToRecover, MS_DAY } from './quant.js';
 import { scatterChart, ladderChart, durationColor } from './charts.js';
 
 // ───────────────────────────────────────────────────────── состояние
@@ -418,6 +418,7 @@ const SELL_COLUMNS = [
   ['Выручка, USDT', (r) => fmtUsd(r.usdtIfSold, 2)],
   ['Прибыль', (r) => `<span class="${cls(r.profitUsdt)}">${r.profitUsdt == null ? '—' : fmtUsd(r.profitUsdt, 2)}</span>`],
   ['Прибыль, %', (r) => `<span class="${cls(r.profitPct)}">${fmtSigned(r.profitPct, 2)}</span>`],
+  ['Ожид. к себест.', (r) => `<span class="${cls(r.expReturnVsBasis)}">${fmtSigned(r.expReturnVsBasis, 1)}</span>`],
   ['Премия σ', (r) => `<span class="${cls(r.volEdge)}">${fmtSigned(r.volEdge, 1)}</span>`],
   ['Циклов до б/у', (r) => fmtRecovery(r.recovery)],
   ['Сеттлмент', (r) => fmtTime(r.timing.settle)],
@@ -649,7 +650,14 @@ function renderSell(rows) {
     return;
   }
 
-  const analyzed = analyzeSellHigh({ rows, basis: info.basis, qty, spot: state.spot, history: state.history });
+  const analyzed = analyzeSellHigh({
+    rows,
+    basis: info.basis,
+    qty,
+    spot: state.spot,
+    history: state.history,
+    measure: ui.measure,
+  });
   const profitable = analyzed.filter((r) => r.profitable);
   // Разрыв считаем относительно себестоимости, а не наоборот: «рынок на 68%
   // ниже себестоимости» — это утверждение о том, сколько недостаёт до выхода,
@@ -914,9 +922,42 @@ function bindControls() {
 
 // ───────────────────────────────────────────────────────── запуск
 
+/**
+ * Проверка, что модули приехали одной версией.
+ *
+ * Браузер кэширует каждый файл отдельно, и после выката ничто не мешает ему
+ * подставить свежий app.js к старому quant.js. Числа при этом останутся
+ * правдоподобными, а формулы — вчерашними, и заметить это по виду страницы
+ * невозможно. Поэтому проверяем несколько признаков, которые менялись вместе
+ * с формулами, и громко жалуемся, если набор рассогласован.
+ */
+function checkModuleConsistency() {
+  const problems = [];
+  // Возврат к безубытку учитывает простой между окнами подписки, поэтому при
+  // длинном цикле обязан занимать больше времени, чем при коротком. Проверяем
+  // поведением, а не числом аргументов: у функции с умолчаниями length их не
+  // считает, и такой признак давал бы ложную тревогу всегда.
+  const short = cyclesToRecover(2, 1, 1, 1, 1, 1);
+  const long = cyclesToRecover(2, 1, 1, 1, 1, 10);
+  if (!(long.days > short.days)) problems.push('quant.js');
+  // Якоря отдают объект с полями row и dominator, а не голую строку.
+  const probe = pickAnchors([
+    { volEdge: -0.01, expNetApr: -0.02, aprEff: 0.05, pConv: 0.1, productId: 'x', duration: '6d', strike: 1, moneyness: -0.1 },
+  ]);
+  if (!probe.market || !('row' in probe.market)) problems.push('model.js');
+
+  if (problems.length) {
+    pushError(`несогласованные модули (${problems.join(', ')}) — обновите страницу с очисткой кэша`);
+    console.error('Несогласованные модули:', problems);
+    return false;
+  }
+  return true;
+}
+
 async function main() {
   loadPrefs();
   bindControls();
+  checkModuleConsistency();
 
   state.spot = await fetchSpot().catch(() => null);
   render();

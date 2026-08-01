@@ -402,13 +402,17 @@ export function breakevenStrike(basis, apy, yieldDays) {
  * Считаем консервативно: цена стоит на месте, продажа не срабатывает,
  * растёт только количество BTC.
  */
-export function cyclesToRecover(basis, spot, apy, yieldDays, lockDays, maxCycles = 400) {
+export function cyclesToRecover(basis, spot, apy, yieldDays, lockDays, cycleDays = lockDays, maxCycles = 400) {
   const i = interestRate(apy, yieldDays);
   if (!(i > 0) || !(spot > 0) || !(basis > spot)) return { cycles: 0, days: 0 };
   const n = Math.log(basis / spot) / Math.log(1 + i);
   const cycles = Math.ceil(n);
   if (!Number.isFinite(cycles) || cycles > maxCycles) return { cycles: null, days: null };
-  return { cycles, days: cycles * lockDays };
+  // Первый цикл идёт от сегодняшнего дня до зачисления, а каждый следующий —
+  // полный оборот с простоем между окнами подписки. Считать все циклы по
+  // сроку блокировки значило бы выбросить этот простой и обещать возврат
+  // к безубытку заметно раньше, чем он наступит.
+  return { cycles, days: lockDays + (cycles - 1) * cycleDays };
 }
 
 // ─────────────────────────────────────────────────────────────── утилиты
