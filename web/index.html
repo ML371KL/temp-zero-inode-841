@@ -60,11 +60,20 @@
         <span class="ctl-label">Сортировка</span>
         <select id="sort">
           <option value="aprEff">эффективный APR</option>
-          <option value="aprPerRisk">APR на единицу риска</option>
           <option value="edgeApr">премия к рынку опционов</option>
-          <option value="expNetApr">ожидаемый чистый APR</option>
+          <option value="expNet">ожидаемый чистый APR</option>
           <option value="pConv">вероятность конвертации</option>
+          <option value="pHorizon">риск за горизонт</option>
           <option value="settle">дата сеттлмента</option>
+        </select>
+      </label>
+
+      <label class="ctl">
+        <span class="ctl-label">Горизонт</span>
+        <select id="horizon">
+          <option value="90">90 дней</option>
+          <option value="180">180 дней</option>
+          <option value="365">365 дней</option>
         </select>
       </label>
 
@@ -74,23 +83,55 @@
       </div>
     </section>
 
+    <section class="modes">
+      <div class="mode-switch">
+        <button class="mode" data-mode="single">Текущая подписка</button>
+        <button class="mode" data-mode="strategy">Стратегия до даты</button>
+      </div>
+      <div class="mode-note" id="mode-note"></div>
+    </section>
+
     <section class="panel highlight" id="best-panel">
       <div class="panel-head">
-        <h2>Оптимальные Buy Low</h2>
+        <h2>Текущая подписка: доходность против риска на сеттлменте</h2>
         <div class="hint">
-          фронт Парето внутри вашего порога риска: каждую из этих оферт нельзя улучшить
-          по доходности, не увеличив вероятность конвертации
+          фронт Парето внутри вашего порога риска. Обе оси относятся к одной сегодняшней
+          покупке: эффективный APR — годовая ставка на срок её блокировки, вероятность —
+          шанс конвертации на её собственном сеттлменте. Для сравнения оферт одного срока
+          это точный ответ; между сроками помните, что доходность здесь поделена на время,
+          а вероятность нет — соседний режим считает обе оси на общем горизонте
         </div>
       </div>
       <div class="cards" id="best"></div>
     </section>
 
+    <section class="panel highlight" id="strategy-panel" hidden>
+      <div class="panel-head">
+        <h2>Стратегия до выбранной даты</h2>
+        <div class="hint" id="strategy-hint"></div>
+      </div>
+      <div class="basis-line" id="strategy-note"></div>
+      <div class="cards" id="strategy-best"></div>
+      <div class="head-row sell-table-head">
+        <h3>Весь фронт стратегии</h3>
+        <button class="collapse" data-collapse="strategy"></button>
+      </div>
+      <div class="panel-body" data-body="strategy">
+        <div class="table-wrap">
+          <table id="strategy-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <button class="more" data-more="strategy"></button>
+      </div>
+    </section>
 
     <section class="grid2">
       <div class="panel">
         <div class="panel-head">
-          <h2>Доходность против риска</h2>
-          <div class="hint">эффективный APR и вероятность конвертации; линией — фронт Парето</div>
+          <h2 id="scatter-title">Доходность против риска</h2>
+          <div class="hint" id="scatter-hint">эффективный APR и вероятность конвертации; линией — фронт Парето</div>
         </div>
         <div class="chart" id="scatter"></div>
       </div>
@@ -106,7 +147,7 @@
       </div>
     </section>
 
-    <section class="panel frontier">
+    <section class="panel frontier" id="frontier-panel">
       <div class="panel-head">
         <div class="head-row">
           <h2>Весь фронт Парето, без порога</h2>
@@ -193,14 +234,6 @@
           </select>
         </label>
       </div>
-      <label class="ctl">
-        <span class="ctl-label">Горизонт выхода</span>
-        <select id="horizon">
-          <option value="90">90 дней</option>
-          <option value="180">180 дней</option>
-          <option value="365">365 дней</option>
-        </select>
-      </label>
       <div class="basis-line" id="basis-line"></div>
       <div class="best-sell-head" id="best-sell-head"></div>
       <div class="cards" id="best-sell"></div>

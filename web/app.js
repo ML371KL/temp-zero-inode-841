@@ -23,9 +23,10 @@ import {
   exitFrontier,
   frontierWithMargins,
   pickAnchors,
+  computeStrategy,
   MIN_INDEPENDENT_WINDOWS,
 } from './model.js';
-import { basisFromConversion, interestRate, cyclesToRecover, MS_DAY } from './quant.js';
+import { basisFromConversion, interestRate, cyclesToRecover, rnLossProfile, STRESS_LEVEL, MS_DAY } from './quant.js';
 import { scatterChart, ladderChart, durationColor } from './charts.js';
 
 // ───────────────────────────────────────────────────────── состояние
@@ -38,6 +39,9 @@ const state = {
   surface: null,
   history: null,
   riskFree: null,
+  // Ставка по BTC нужна отдельно: Sell High запирает монету, и стоимость этого
+  // простоя измеряется ставкой по монете, а не по доллару.
+  riskFreeBtc: null,
   stats: null,
   archive: null,
   wsStatus: 'connecting',
@@ -53,6 +57,10 @@ const ui = {
   amount: 10000,
   maxP: 0.15,
   measure: 'max',
+  // Две постановки задачи, а не одна: «эта покупка сейчас» и «стратегия до даты».
+  // Панель обязана всегда показывать, в какой она находится, — ответы у них
+  // расходятся почти полностью.
+  mode: 'single',
   sort: 'aprEff',
   durations: [],
   tz: 'local',
@@ -72,12 +80,19 @@ const ui = {
 // Сколько строк показывать в длинной таблице до нажатия «показать все».
 const ROW_PREVIEW = 8;
 
+const SORT_KEYS = new Set(['aprEff', 'edgeApr', 'expNet', 'pConv', 'pHorizon', 'settle']);
+
 function loadPrefs() {
   try {
     Object.assign(ui, JSON.parse(localStorage.getItem(PREF_KEY) || '{}'));
   } catch {
     /* повреждённые настройки не должны мешать запуску */
   }
+  // Сохранённая сортировка могла остаться от снятого варианта: «APR на единицу
+  // риска» делил годовую ставку на вероятность за одну сделку, то есть множил
+  // перекос осей, а «ожидаемый чистый APR» переехал на согласованную серию.
+  if (!SORT_KEYS.has(ui.sort)) ui.sort = 'aprEff';
+  if (ui.mode !== 'single' && ui.mode !== 'strategy') ui.mode = 'single';
 }
 
 function savePrefs() {
@@ -189,6 +204,36 @@ function fmtPercentile(row) {
 
 const cls = (x) => (x == null || !Number.isFinite(x) ? 'muted' : x > 0 ? 'pos' : x < 0 ? 'neg' : '');
 
+/**
+ * Глубина конвертации. Вероятность отвечает «как часто», глубина — «сколько»,
+ * и без второго числа порог вероятности не ограничивает деньги: при одинаковых
+ * 7% восьмичасовая оферта теряет 0.04% капитала, а 236-дневная 1.6%.
+ */
+function fmtDepth(row, field, digits = 2) {
+  const v = row.depth?.[field];
+  if (v == null || !Number.isFinite(v)) return '<span class="muted">—</span>';
+  return `${(v * 100).toFixed(digits)}%`;
+}
+
+/** Лимит на сумму по этому страйку — жёсткое ограничение биржи, не оценка. */
+function fmtLimit(row) {
+  if (!Number.isFinite(row.maxInvest) || row.maxInvest <= 0) return '<span class="muted">—</span>';
+  const amount = Number(ui.amount) || 0;
+  const tight = amount > 0 && row.maxInvest < amount;
+  return `<span class="${tight ? 'neg' : 'muted'}"${tight ? ' title="введённая сумма больше лимита этой оферты"' : ''}>${fmtUsd(row.maxInvest)}</span>`;
+}
+
+/**
+ * Сколько живёт котировка. Ставки Bybit протухают за 8–20 секунд, и строка со
+ * сработавшим сроком — это уже не то, что подтвердит биржа.
+ */
+function fmtQuoteAge(row) {
+  if (!Number.isFinite(row.quoteExpiresAt) || row.quoteExpiresAt <= 0) return '<span class="muted">—</span>';
+  const left = (row.quoteExpiresAt - Date.now()) / 1000;
+  if (left < 0) return `<span class="neg" title="биржа пересчитает ставку">истекла</span>`;
+  return `<span class="${left < 5 ? 'warn-text' : 'muted'}">${left.toFixed(0)} с</span>`;
+}
+
 // ───────────────────────────────────────────────────────── загрузка данных
 
 async function loadProducts() {
@@ -237,6 +282,8 @@ function pushError(msg) {
 
 // ───────────────────────────────────────────────────────── расчёт
 
+const horizonDays = () => Number(ui.horizon) || 90;
+
 function currentRows(direction) {
   if (!state.spot || !state.products.length) return [];
   const rows = buildRows({
@@ -248,10 +295,12 @@ function currentRows(direction) {
     surface: state.surface,
     history: state.history,
     riskFree: state.riskFree,
+    riskFreeBtc: state.riskFreeBtc,
     amount: direction === 'BuyLow' ? Number(ui.amount) || 0 : Number(ui.convQty) || 0,
     vip: ui.vip,
     measure: ui.measure,
     stats: state.stats,
+    horizonDays: horizonDays(),
   });
   const allowed = new Set(ui.durations);
   return allowed.size ? rows.filter((r) => allowed.has(r.duration)) : rows;
@@ -261,7 +310,8 @@ function sortRows(rows) {
   const key = ui.sort;
   const copy = [...rows];
   if (key === 'settle') return copy.sort((a, b) => a.timing.settle - b.timing.settle || b.aprEff - a.aprEff);
-  if (key === 'pConv') return copy.sort((a, b) => (a.pConv ?? 9) - (b.pConv ?? 9));
+  // Риск сортируем по возрастанию: сверху самое осторожное.
+  if (key === 'pConv' || key === 'pHorizon') return copy.sort((a, b) => (a[key] ?? 9) - (b[key] ?? 9));
   return copy.sort((a, b) => (b[key] ?? -Infinity) - (a[key] ?? -Infinity));
 }
 
@@ -349,6 +399,10 @@ function cardFor(row) {
   const closeIn = (t.subEnd - Date.now()) / MS_DAY;
   const tags = [];
   if (row.isVip) tags.push('<span class="tag vip">VIP</span>');
+  // Почему именно эта карточка попала в блок. Раньше все шесть были подряд с
+  // верхнего края фронта, и подпись была не нужна — но и осторожных вариантов
+  // там не было вовсе.
+  if (row.bestTag) tags.push(`<span class="tag pick">${row.bestTag}</span>`);
   if (row.pareto) tags.push('<span class="tag good">Парето</span>');
   if (row.volEdge > 0) tags.push(`<span class="tag good">σ +${(row.volEdge * 100).toFixed(1)}</span>`);
   else if (row.volEdge < 0) tags.push(`<span class="tag warn">σ ${(row.volEdge * 100).toFixed(1)}</span>`);
@@ -370,6 +424,9 @@ function cardFor(row) {
         <dt>Мёртвое время</dt><dd>${fmtSpan(t.idleDays)}</dd>
         <dt>APR в непрерывном цикле</dt><dd>${fmtPct(row.aprChained, 2)}</dd>
         <dt>P(конвертации)</dt><dd class="${row.pConv > 0.15 ? 'neg' : ''}">${fmtPct(row.pConv, 2)}</dd>
+        <dt>Потеря при конвертации</dt><dd>${fmtDepth(row, 'conditional')} <span class="muted">в среднем ${fmtDepth(row, 'expected', 3)}</span></dd>
+        <dt>Стресс ${Math.round(STRESS_LEVEL * 100)}%</dt><dd class="${row.depth?.stress > 0 ? 'neg' : ''}">${fmtDepth(row, 'stress')}</dd>
+        <dt>Риск за ${ui.horizon} дней</dt><dd>${fmtPct(row.pHorizon, 1)}</dd>
         <dt>Премия к опционам</dt><dd class="${cls(row.edgeApr)}">${fmtSigned(row.edgeApr, 1)}</dd>
         <dt>Доход на сумму</dt><dd>${row.money ? fmtUsd(row.money.interest, 2) : '—'} USDT</dd>
         <dt>Окно закроется</dt><dd>${fmtSpan(closeIn)}</dd>
@@ -390,14 +447,41 @@ const BUY_COLUMNS = [
   ['P рын.', (r) => fmtPct(r.pRN, 2)],
   ['P ист. норм.', (r) => fmtHist(r)],
   ['P раб.', (r) => `<b class="${r.pConv > 0.15 ? 'neg' : ''}">${fmtPct(r.pConv, 2)}</b>`],
+  ['P за гориз.', (r) => `<span class="muted">${fmtPct(r.pHorizon, 1)}</span>`],
+  ['Ожид. потеря', (r) => fmtDepth(r, 'expected', 3)],
+  ['Потеря при конв.', (r) => fmtDepth(r, 'conditional')],
+  [`Стресс ${Math.round(STRESS_LEVEL * 100)}%`, (r) => `<span class="${r.depth?.stress > 0 ? 'neg' : 'muted'}">${fmtDepth(r, 'stress')}</span>`],
   ['σ рынок', (r) => fmtPct(r.sigma, 1)],
   ['σ оферты', (r) => fmtPct(r.offerVol, 1)],
   ['Премия σ', (r) => `<span class="${cls(r.volEdge)}">${fmtSigned(r.volEdge, 1)}</span>`],
   ['Премия APR', (r) => `<span class="${cls(r.edgeApr)}">${fmtSigned(r.edgeApr, 1)}</span>`],
-  ['Ожид. чистый', (r) => `<span class="${cls(r.expNetApr)}">${fmtSigned(r.expNetApr, 1)}</span>`],
+  ['Ожид. чистый', (r) => `<span class="${cls(r.expNet)}">${fmtSigned(r.expNet, 1)}</span>`],
   ['Доход, USDT', (r) => (r.money ? fmtUsd(r.money.interest, 2) : '—')],
   ['BTC при конв.', (r) => (r.money ? fmtBtc(r.money.btcIfConverted) : '—')],
+  ['Лимит, USDT', (r) => fmtLimit(r)],
+  ['Котировка', (r) => fmtQuoteAge(r)],
   ['Сеттлмент', (r) => fmtTime(r.timing.settle)],
+];
+
+/**
+ * Стратегия до выбранной даты: обе оси на одном горизонте и на одних
+ * траекториях. Медиана рядом со средним обязательна — распределение годовых
+ * исходов BTC скошено, и одно среднее читается как обещание.
+ */
+const STRATEGY_COLUMNS = [
+  ['Срок', (r) => `${r.isVip ? '<span class="vip-badge">★</span> ' : ''}${r.duration}`, 'left'],
+  ['Страйк', (r) => `${fmtUsd(r.strike, 2)}${fmtLadderFlag(r)}`],
+  ['От спота', (r) => `<span class="muted">${fmtSigned(r.moneyness, 2)}</span>`],
+  ['Закончить в BTC', (r) => `<b>${fmtPct(r.stratRisk, 1)}</b>`],
+  ['Ожид. годовых', (r) => `<b class="${cls(r.stratAnnual)}">${fmtSigned(r.stratAnnual, 1)}</b>`],
+  ['Медиана годовых', (r) => `<span class="${cls(r.strategy?.annualMedian)}">${fmtSigned(r.strategy?.annualMedian, 1)}</span>`],
+  ['Циклов', (r) => (r.strategy ? String(r.strategy.cycles) : '—')],
+  ['Цикл', (r) => fmtSpan(r.timing.cycleDays)],
+  ['APR в цикле', (r) => `<span class="muted">${fmtPct(r.aprChained, 2)}</span>`],
+  ['P за сделку', (r) => `<span class="muted">${fmtPct(r.pConv, 2)}</span>`],
+  ['Ожид. потеря', (r) => fmtDepth(r, 'expected', 3)],
+  ['Премия σ', (r) => `<span class="${cls(r.volEdge)}">${fmtSigned(r.volEdge, 1)}</span>`],
+  ['Лимит, USDT', (r) => fmtLimit(r)],
 ];
 
 const FRONTIER_COLUMNS = [
@@ -429,11 +513,14 @@ const EXIT_FRONT_COLUMNS = [
   ['Срок', (r) => `${r.isVip ? '<span class="vip-badge">★</span> ' : ''}${r.duration}`, 'left'],
   ['Страйк', (r) => `${fmtUsd(r.strike, 2)}${fmtLadderFlag(r)}`],
   ['От спота', (r) => `<span class="muted">${fmtSigned(r.moneyness, 2)}</span>`],
-  ['Прибыль', (r) => `<b>${fmtSigned(r.profitPct, 2)}</b>`],
+  ['Прибыль к выходу', (r) => `<b>${fmtSigned(r.profitAtExit, 2)}</b>`],
+  ['за один цикл', (r) => `<span class="muted">${fmtSigned(r.profitPct, 2)}</span>`],
   ['Шанс выйти', (r) => `<b>${fmtPct(r.pExitHorizon, 1)}</b>`],
   ['Циклов', (r) => (r.horizonInfo ? String(r.horizonInfo.cycles) : '—')],
   ['Ждать', (r) => fmtSpan(r.expExitDays)],
-  ['Ожид. годовых', (r) => `<span class="${cls(r.expProfitRate)}">${fmtPct(r.expProfitRate, 1)}</span>`],
+  ['Скорость выхода', (r) => `<span class="${cls(r.exitSpeed)}">${fmtPct(r.exitSpeed, 1)}</span>`],
+  ['Полное матожид.', (r) => `<b class="${cls(r.fullRate)}">${fmtSigned(r.fullRate, 1)}</b>`],
+  ['Медиана', (r) => `<span class="${cls(r.fullMedianRate)}">${fmtSigned(r.fullMedianRate, 1)}</span>`],
   ['P за цикл', (r) => `<span class="muted">${fmtPct(r.pConv, 1)}</span>`],
   ['Цикл', (r) => fmtSpan(r.timing.cycleDays)],
   ['Прибавка', (r) => `<span class="${cls(r.gainProfit)}">${fmtSigned(r.gainProfit, 2)}</span>`],
@@ -457,10 +544,11 @@ const SELL_COLUMNS = [
   ['Выручка, USDT', (r) => fmtUsd(r.usdtIfSold, 2)],
   ['Прибыль', (r) => `<span class="${cls(r.profitUsdt)}">${r.profitUsdt == null ? '—' : fmtUsd(r.profitUsdt, 2)}</span>`],
   ['Прибыль, %', (r) => `<span class="${cls(r.profitPct)}">${fmtSigned(r.profitPct, 2)}</span>`],
-  ['Ожид. к себест.', (r) => `<span class="${cls(r.expReturnVsBasis)}">${fmtSigned(r.expReturnVsBasis, 1)}</span>`],
+  ['Прибыль к выходу', (r) => `<span class="${cls(r.profitAtExit)}">${fmtSigned(r.profitAtExit, 2)}</span>`],
   ['Шанс выйти', (r) => fmtPct(r.pExitHorizon, 1)],
   ['Ждать', (r) => fmtSpan(r.expExitDays)],
-  ['Ожид. годовых', (r) => `<span class="${cls(r.expProfitRate)}">${fmtPct(r.expProfitRate, 1)}</span>`],
+  ['Скорость выхода', (r) => `<span class="${cls(r.exitSpeed)}">${fmtPct(r.exitSpeed, 1)}</span>`],
+  ['Полное матожид.', (r) => `<span class="${cls(r.fullRate)}">${fmtSigned(r.fullRate, 1)}</span>`],
   ['Премия σ', (r) => `<span class="${cls(r.volEdge)}">${fmtSigned(r.volEdge, 1)}</span>`],
   ['Циклов до б/у', (r) => fmtRecovery(r.recovery)],
   ['Сеттлмент', (r) => fmtTime(r.timing.settle)],
@@ -494,6 +582,29 @@ function renderLimitedTable(key, table, columns, rows, rowClass) {
   btn.textContent = expanded
     ? `свернуть до ${ROW_PREVIEW} строк`
     : `показать все ${rows.length} — сейчас видно ${Math.min(ROW_PREVIEW, rows.length)}`;
+}
+
+/**
+ * Переключение постановки задачи. Панель обязана всегда показывать, в какой она
+ * сейчас: ответы двух режимов на живых данных расходятся почти полностью, и
+ * молча выбирать один за пользователя нельзя.
+ */
+function applyMode() {
+  const strategy = ui.mode === 'strategy';
+  for (const btn of document.querySelectorAll('[data-mode]')) {
+    btn.classList.toggle('on', btn.dataset.mode === ui.mode);
+  }
+  $('best-panel').hidden = strategy;
+  $('frontier-panel').hidden = strategy;
+  $('strategy-panel').hidden = !strategy;
+  $('mode-note').innerHTML = strategy
+    ? `Считается стратегия целиком: оферта катается до первой конвертации, дальше биткоин держится ` +
+      `до конца горизонта. Доходность и риск измерены на одних и тех же <b>${ui.horizon} днях</b>, ` +
+      `поэтому сроки сравнимы между собой.`
+    : `Считается одна сегодняшняя покупка: годовая ставка на срок её блокировки против вероятности ` +
+      `конвертации на её собственном сеттлменте. Внутри одного срока это точный ответ; между сроками ` +
+      `помните, что доходность здесь поделена на время, а вероятность нет — соседний режим считает обе ` +
+      `оси на общем горизонте.`;
 }
 
 /** Синхронизация кнопок сворачивания с сохранённым состоянием. */
@@ -539,11 +650,27 @@ function renderBuy(rows) {
   renderAnchors(rows);
   renderFrontier(rows);
 
-  scatterChart($('scatter'), rows, {
-    durations: [...new Set(state.products.map((p) => p.duration))].sort((a, b) => durationDays(a) - durationDays(b)),
-    maxP: ui.maxP,
-    onHover: showTip,
-  });
+  const strategy = ui.mode === 'strategy' ? renderStrategy(rows) : null;
+  const durations = [...new Set(state.products.map((p) => p.duration))].sort((a, b) => durationDays(a) - durationDays(b));
+  if (strategy) {
+    $('scatter-title').textContent = 'Стоимость стратегии против риска остаться в BTC';
+    $('scatter-hint').textContent =
+      `обе оси на горизонте ${ui.horizon} дней и на одних траекториях; линией — фронт Парето`;
+    scatterChart($('scatter'), rows, {
+      durations,
+      onHover: showTip,
+      xKey: 'stratRisk',
+      yKey: 'stratAnnual',
+      frontKey: 'stratPareto',
+      xLabel: `шанс закончить ${ui.horizon} дней в биткоине`,
+      yLabel: 'ожидаемая годовая стоимость',
+      showThreshold: false,
+    });
+  } else {
+    $('scatter-title').textContent = 'Доходность против риска на сеттлменте';
+    $('scatter-hint').textContent = 'эффективный APR и вероятность конвертации этой покупки; линией — фронт Парето';
+    scatterChart($('scatter'), rows, { durations, maxP: ui.maxP, onHover: showTip });
+  }
 
   const ladderRows = rows.filter((r) => r.productId === state.ladderProduct);
   const p = state.products.find((x) => x.productId === state.ladderProduct);
@@ -551,6 +678,100 @@ function renderBuy(rows) {
     title: p ? `${p.duration}${p.isVipProduct ? ' · VIP' : ''} · Buy Low` : '',
     onHover: showTip,
   });
+}
+
+/**
+ * Режим «Стратегия до выбранной даты»: обе оси на одном горизонте.
+ *
+ * Возвращает результат расчёта, чтобы вызывающий знал, чем рисовать рассеяние.
+ */
+function renderStrategy(rows) {
+  const H = horizonDays();
+  const res = computeStrategy({ rows, history: state.history, spot: state.spot, horizonDays: H, riskFree: state.riskFree ?? 0 });
+  const note = $('strategy-note');
+  const hint = $('strategy-hint');
+  hint.innerHTML =
+    `капитал катает одну и ту же оферту, пока цена не уйдёт ниже страйка; после конвертации биткоин ` +
+    `просто держится до конца горизонта. Обе оси построены на ${H} днях и на одних исторических ` +
+    `траекториях, поэтому сроки сравнимы между собой — в отличие от режима одной подписки, где ` +
+    `доходность поделена на время, а вероятность нет`;
+
+  if (!res || !res.rows.length) {
+    $('strategy-best').innerHTML =
+      '<div class="empty">история цен ещё не загрузилась или горизонт короче цикла всех оферт</div>';
+    note.textContent = '';
+    renderLimitedTable('strategy', $('strategy-table'), STRATEGY_COLUMNS, []);
+    return res;
+  }
+
+  const info = res.rows.find((r) => r.strategy)?.strategy;
+  note.innerHTML =
+    `Базы сравнения на тех же траекториях: держать USDT — <b>${fmtPct(res.usdtAnnual, 2)}</b> годовых, ` +
+    `держать BTC — <b>${fmtSigned(res.btcAnnual, 1)}</b> в среднем и <b>${fmtSigned(res.btcAnnualMedian, 1)}</b> по медиане. ` +
+    `Расхождение между средним и медианой здесь и есть мера того, насколько распределение исходов ` +
+    `скошено вправо: среднее задаёт бычий хвост пятилетней выборки, и по нему нельзя планировать. ` +
+    (info
+      ? `Оценка построена по ${info.paths} траекториям ряда ${SERIES_NAME[info.series] || info.series}, ` +
+        `около ${Math.round(info.independent ?? 0)} независимых наблюдений на горизонт. `
+      : '') +
+    `Ставка и лестница страйков приняты неизменными на весь горизонт, а обратная нога Sell High после ` +
+    `конвертации консервативно не учитывается — по бэктесту безубыточного страйка нет от 69% до 91% ` +
+    `времени в биткоине.`;
+
+  // Карточки: самый осторожный, самый доходный и лучший по цене риска.
+  const byRisk = [...res.rows].sort((a, b) => a.stratRisk - b.stratRisk);
+  const picks = [];
+  const take = (r, tag) => {
+    if (r && !picks.includes(r)) {
+      r.bestTag = tag;
+      picks.push(r);
+    }
+  };
+  take(byRisk[0], 'минимум риска');
+  take(
+    byRisk.reduce((a, b) => (b.stratAnnual > a.stratAnnual ? b : a)),
+    'максимум стоимости',
+  );
+  const priced = byRisk.filter((r) => Number.isFinite(r.volEdge));
+  if (priced.length) take(priced.reduce((a, b) => (b.volEdge > a.volEdge ? b : a)), 'лучшая цена риска');
+  for (let k = 0; picks.length < 6 && k < byRisk.length; k++) {
+    take(byRisk[Math.round((k * (byRisk.length - 1)) / 5)], null);
+  }
+  $('strategy-best').innerHTML = picks
+    .sort((a, b) => a.stratRisk - b.stratRisk)
+    .map(strategyCardFor)
+    .join('');
+
+  renderLimitedTable('strategy', $('strategy-table'), STRATEGY_COLUMNS, byRisk);
+  return res;
+}
+
+const SERIES_NAME = { 60: '1ч', 240: '4ч', D: '1д' };
+
+function strategyCardFor(row) {
+  const s = row.strategy;
+  const tags = [];
+  if (row.isVip) tags.push('<span class="tag vip">VIP</span>');
+  if (row.bestTag) tags.push(`<span class="tag pick">${row.bestTag}</span>`);
+  if (row.volEdge > 0) tags.push(`<span class="tag good">σ +${(row.volEdge * 100).toFixed(1)}</span>`);
+  else if (row.volEdge < 0) tags.push(`<span class="tag warn">σ ${(row.volEdge * 100).toFixed(1)}</span>`);
+
+  return `
+    <article class="card${row.stratPareto ? ' pareto' : ''}" data-product="${row.productId}">
+      <div class="card-top">
+        <div class="apr">${fmtSigned(row.stratAnnual, 1)}<small>ожидаемых годовых · медиана ${fmtSigned(s?.annualMedian, 1)}</small></div>
+        <div class="tags">${tags.join('')}</div>
+      </div>
+      <dl class="kv">
+        <dt>Страйк</dt><dd>${fmtUsd(row.strike, 2)} <span class="muted">(${fmtSigned(row.moneyness, 2)})</span></dd>
+        <dt>Закончить в BTC</dt><dd class="${row.stratRisk > 0.5 ? 'neg' : ''}">${fmtPct(row.stratRisk, 1)}</dd>
+        <dt>Срок / цикл</dt><dd>${row.duration} → ${fmtSpan(row.timing.cycleDays)}</dd>
+        <dt>Циклов за горизонт</dt><dd>${s ? s.cycles : '—'}${s?.tailDays > 0.5 ? ` <span class="muted">+ ${fmtSpan(s.tailDays)} хвоста</span>` : ''}</dd>
+        <dt>APR в цикле</dt><dd>${fmtPct(row.aprChained, 2)}</dd>
+        <dt>Ожид. потеря на конверсии</dt><dd>${fmtDepth(row, 'expected', 3)}</dd>
+        <dt>Премия к опционам</dt><dd class="${cls(row.edgeApr)}">${fmtSigned(row.edgeApr, 1)}</dd>
+      </dl>
+    </article>`;
 }
 
 function sellCardFor(row, mode) {
@@ -568,7 +789,7 @@ function sellCardFor(row, mode) {
       <div class="card-top">
         <div class="apr">${
           mode === 'exit'
-            ? `${fmtSigned(row.profitPct, 2)}<small>прибыль к себестоимости · APR ${fmtPct(row.aprEff, 1)}</small>`
+            ? `${fmtSigned(row.profitAtExit, 2)}<small>прибыль к моменту выхода · за один цикл ${fmtSigned(row.profitPct, 2)}</small>`
             : `${fmtPct(row.aprEff, 1)}<small>эффективный · заявлен ${fmtPct(row.apy, 1)}</small>`
         }</div>
         <div class="tags">${tags.join('')}</div>
@@ -582,7 +803,8 @@ function sellCardFor(row, mode) {
           mode === 'exit'
             ? `<dt>Шанс выйти</dt><dd>${fmtPct(row.pExitHorizon, 1)} за ${ui.horizon} дней</dd>
                <dt>Ожидание выхода</dt><dd>${fmtSpan(row.expExitDays)}</dd>
-               <dt>Ожид. годовых</dt><dd class="${cls(row.expProfitRate)}">${fmtPct(row.expProfitRate, 1)}</dd>
+               <dt>Скорость выхода</dt><dd class="${cls(row.exitSpeed)}">${fmtPct(row.exitSpeed, 1)} годовых</dd>
+               <dt>Полное матожидание</dt><dd class="${cls(row.fullRate)}">${fmtSigned(row.fullRate, 1)} <span class="muted">медиана ${fmtSigned(row.fullMedianRate, 1)}</span></dd>
                <dt>Прибыль</dt><dd class="${cls(row.profitUsdt)}">${row.profitUsdt == null ? '—' : fmtUsd(row.profitUsdt, 2)}</dd>`
             : `<dt>Циклов до безубытка</dt><dd>${fmtRecovery(row.recovery)}</dd>
                <dt>Прирост BTC за срок</dt><dd>${fmtPct(row.i, 3)}</dd>`
@@ -604,8 +826,8 @@ const ANCHOR_META = {
   },
   expected: {
     title: 'Лучшее матожидание',
-    key: 'expNetApr',
-    hint: 'процент минус ожидаемая потеря на конвертации по историческому распределению цены',
+    key: 'expNet',
+    hint: 'процент минус ожидаемая потеря на конвертации. Считается по той же серии, из которой взята рабочая вероятность: раньше вероятность бралась из нормированного мира, а потеря — из сырого, и одна карточка описывала два разных рынка',
   },
   yield: {
     title: 'Максимум доходности',
@@ -700,7 +922,11 @@ function renderExitFrontier(analyzed) {
     `<b>шанс выйти за ${H} дней</b>, если крутить одну и ту же оферту, а не вероятность за один цикл: ` +
     `47% за 55 дней и 41% за 237 дней — величины несравнимые, и фронт по ним механически вытаскивал бы ` +
     `наверх самые длинные продукты. Частота берётся по историческим траекториям, поэтому зависимость ` +
-    `соседних циклов учтена: формула независимых попыток завышает шанс выхода на 10–22 процентных пункта`;
+    `соседних циклов учтена: формула независимых попыток завышает шанс выхода на 10–22 процентных пункта. ` +
+    `Ось прибыли — <b>накопленная к фактическому циклу выхода</b>: если продажа случилась на пятом цикле, ` +
+    `процент в биткоине начислялся пять раз, а не один. «Скорость выхода» приведена к полному горизонту ` +
+    `${H} дней, а не к длине одного цикла, иначе продукт с единственным сеттлментом внутри горизонта ` +
+    `делился бы на меньшее число и выглядел быстрее остальных`;
 
   const note = $('exit-front-note');
   if (!steps.length) {
@@ -744,7 +970,8 @@ function renderSell(rows) {
     spot: state.spot,
     history: state.history,
     measure: ui.measure,
-    horizonDays: Number(ui.horizon) || 90,
+    horizonDays: horizonDays(),
+    riskFree: state.riskFree ?? 0,
   });
   const profitable = analyzed.filter((r) => r.profitable);
   // Разрыв считаем относительно себестоимости, а не наоборот: «рынок на 68%
@@ -765,13 +992,26 @@ function renderSell(rows) {
       // Сводка обязана называть ту же оферту, что и отбор ниже. Здесь раньше
       // стоял максимум эффективного APR — критерий, от которого блок ушёл,
       // и строка противоречила собственным карточкам.
-      const pool = profitable.filter((r) => Number.isFinite(r.expProfitRate));
+      const pool = profitable.filter((r) => Number.isFinite(r.exitSpeed));
       if (!pool.length) return '';
-      const best = pool.reduce((a, b) => (b.expProfitRate > a.expProfitRate ? b : a));
+      const best = pool.reduce((a, b) => (b.exitSpeed > a.exitSpeed ? b : a));
+      const base = analyzed.baseline;
       return (
-        `Лучшая по ожидаемой годовой доходности выхода: <b>${fmtPct(best.expProfitRate, 1)}</b> ` +
-        `при страйке <b>${fmtUsd(best.strike, 2)}</b> — прибыль <b>${fmtSigned(best.profitPct, 2)}</b> ` +
-        `с шансом <b>${fmtPct(best.pExitHorizon, 1)}</b> за ${ui.horizon} дней, ожидание <b>${fmtSpan(best.expExitDays)}</b>.`
+        `Быстрее всех выводит в безубыток страйк <b>${fmtUsd(best.strike, 2)}</b>: прибыль ` +
+        `<b>${fmtSigned(best.profitAtExit, 2)}</b> к моменту выхода с шансом <b>${fmtPct(best.pExitHorizon, 1)}</b> ` +
+        `за ${ui.horizon} дней, ожидание <b>${fmtSpan(best.expExitDays)}</b> — это <b>${fmtPct(best.exitSpeed, 1)}</b> годовых ` +
+        `по ветви выхода.<br />` +
+        // Скорость выхода считает только желанную ветвь и потому всегда
+        // положительна. Полное матожидание считает обе и отвечает на другой
+        // вопрос: стоило ли вообще продавать колл вместо того, чтобы просто ждать.
+        `Полное матожидание этой же оферты по обеим ветвям — <b class="${cls(best.fullRate)}">${fmtSigned(best.fullRate, 1)}</b> годовых ` +
+        `(медиана ${fmtSigned(best.fullMedianRate, 1)})` +
+        (base
+          ? `, тогда как просто держать биткоин те же ${ui.horizon} дней дало бы ` +
+            `<b class="${cls(base.holdRate)}">${fmtSigned(base.holdRate, 1)}</b> в среднем и ` +
+            `<b class="${cls(base.holdMedianRate)}">${fmtSigned(base.holdMedianRate, 1)}</b> по медиане. ` +
+            `Разница — цена обрезанного верха: она и есть плата за возможность выйти.`
+          : '.')
       );
     })()}`;
 
@@ -807,7 +1047,9 @@ function renderDiag() {
   } else {
     parts.push('история: загружается');
   }
-  if (state.riskFree != null) parts.push(`безрисковая USDT: ${fmtPct(state.riskFree, 2)}`);
+  if (state.riskFree != null) parts.push(`гибкий депозит USDT: ${fmtPct(state.riskFree, 2)}`);
+  if (state.riskFreeBtc != null) parts.push(`BTC: ${fmtPct(state.riskFreeBtc, 2)}`);
+  parts.push(`режим: ${ui.mode === 'strategy' ? `стратегия до ${ui.horizon} дней` : 'текущая подписка'}`);
   if (state.stats) {
     const where = state.stats.source === 'local' ? 'в браузере' : 'на ветке data';
     parts.push(
@@ -939,6 +1181,16 @@ function bindControls() {
     render();
   };
 
+  for (const btn of document.querySelectorAll('[data-mode]')) {
+    btn.onclick = () => {
+      ui.mode = btn.dataset.mode;
+      savePrefs();
+      applyMode();
+      render();
+    };
+  }
+  applyMode();
+
   $('sort').value = ui.sort;
   $('sort').onchange = (e) => {
     ui.sort = e.target.value;
@@ -1048,11 +1300,18 @@ function checkModuleConsistency() {
   const short = cyclesToRecover(2, 1, 1, 1, 1, 1);
   const long = cyclesToRecover(2, 1, 1, 1, 1, 10);
   if (!(long.days > short.days)) problems.push('quant.js');
+  // Профиль глубины появился вместе с новой мерой риска: если его нет, значит
+  // quant.js приехал старый, а колонки потерь молча покажут прочерки.
+  const probeLoss = rnLossProfile({ direction: 'BuyLow', forward: 100, strike: 90, sigma: 0.5, Teff: 0.1, spot: 100 });
+  if (!probeLoss || !(probeLoss.conditional > probeLoss.expected)) problems.push('quant.js');
   // Якоря отдают объект с полями row и dominator, а не голую строку.
   const probe = pickAnchors([
     { volEdge: -0.01, expNetApr: -0.02, aprEff: 0.05, pConv: 0.1, productId: 'x', duration: '6d', strike: 1, moneyness: -0.1 },
   ]);
   if (!probe.market || !('row' in probe.market)) problems.push('model.js');
+  // Стратегический режим — новая точка входа: без неё переключатель молча
+  // показывал бы пустой блок.
+  if (typeof computeStrategy !== 'function') problems.push('model.js');
 
   if (problems.length) {
     pushError(`несогласованные модули (${problems.join(', ')}) — обновите страницу с очисткой кэша`);
@@ -1077,7 +1336,10 @@ async function main() {
   await Promise.all([
     loadOptions(),
     bootstrapQuotes(),
-    fetchRiskFree().then((r) => (state.riskFree = r)),
+    fetchRiskFree('USDT').then((r) => (state.riskFree = r)),
+    // Ставка по монете нужна для Sell High: там заперт биткоин, и стоимость
+    // этого простоя измеряется ставкой по биткоину, а не по доллару.
+    fetchRiskFree('BTC').then((r) => (state.riskFreeBtc = r)),
     fetchAprStats().then((s) => {
       // Сводка с ветки data появляется только если архив кто-то наполняет
       // извне; с раннеров GitHub биржа недоступна, поэтому обычно её нет.

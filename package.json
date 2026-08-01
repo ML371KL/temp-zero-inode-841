@@ -10,6 +10,7 @@
     "audit": "node --use-env-proxy scripts/audit.mjs",
     "record": "node --use-env-proxy scripts/record.mjs --out data-branch",
     "backtest": "node --use-env-proxy scripts/backtest.mjs",
+    "frames": "node scripts/frames.mjs --load docs/snapshot.json.gz",
     "serve": "python -m http.server 8642 --directory web"
   },
   "engines": {

@@ -47,6 +47,44 @@ export function normCdf(x) {
   return x > 0 ? 1 - c : c;
 }
 
+/**
+ * Обратная функция распределения: рациональное приближение Acklam плюс один
+ * шаг уточнения Галлея по normCdf. Нужна для стресс-квантиля под мерой Q —
+ * «насколько глубоко уйдёт цена в худших 5% исходов». Без уточнения Acklam
+ * даёт относительную ошибку 1e-9, с уточнением — машинную точность.
+ */
+const ACK_A = [-3.969683028665376e1, 2.209460984245205e2, -2.759285104469687e2, 1.38357751867269e2, -3.066479806614716e1, 2.506628277459239];
+const ACK_B = [-5.447609879822406e1, 1.615858368580409e2, -1.556989798598866e2, 6.680131188771972e1, -1.328068155288572e1];
+const ACK_C = [-7.784894002430293e-3, -3.223964580411365e-1, -2.400758277161838, -2.549732539343734, 4.374664141464968, 2.938163982698783];
+const ACK_D = [7.784695709041462e-3, 3.224671290700398e-1, 2.445134137142996, 3.754408661907416];
+
+export function normInv(p) {
+  if (!(p > 0) || !(p < 1)) return p <= 0 ? -Infinity : Infinity;
+  const low = 0.02425;
+  let x;
+  if (p < low) {
+    const q = Math.sqrt(-2 * Math.log(p));
+    x =
+      (((((ACK_C[0] * q + ACK_C[1]) * q + ACK_C[2]) * q + ACK_C[3]) * q + ACK_C[4]) * q + ACK_C[5]) /
+      ((((ACK_D[0] * q + ACK_D[1]) * q + ACK_D[2]) * q + ACK_D[3]) * q + 1);
+  } else if (p <= 1 - low) {
+    const q = p - 0.5;
+    const r = q * q;
+    x =
+      ((((((ACK_A[0] * r + ACK_A[1]) * r + ACK_A[2]) * r + ACK_A[3]) * r + ACK_A[4]) * r + ACK_A[5]) * q) /
+      (((((ACK_B[0] * r + ACK_B[1]) * r + ACK_B[2]) * r + ACK_B[3]) * r + ACK_B[4]) * r + 1);
+  } else {
+    const q = Math.sqrt(-2 * Math.log(1 - p));
+    x =
+      -(((((ACK_C[0] * q + ACK_C[1]) * q + ACK_C[2]) * q + ACK_C[3]) * q + ACK_C[4]) * q + ACK_C[5]) /
+      ((((ACK_D[0] * q + ACK_D[1]) * q + ACK_D[2]) * q + ACK_D[3]) * q + 1);
+  }
+  // Шаг Галлея: e — невязка по функции распределения, u — по плотности.
+  const e = normCdf(x) - p;
+  const u = e * Math.sqrt(2 * Math.PI) * Math.exp((x * x) / 2);
+  return x - u / (1 + (x * u) / 2);
+}
+
 // ────────────────────────────────────────────────────────────── Блэк-76
 
 // Цены без дисконтирования: это математическое ожидание выплаты под мерой Q.
@@ -204,15 +242,30 @@ export function chainedApr(apy, yieldDays, cycleDays) {
  *   S_T ≥ K  → возвращают Q(1+i)·K USDT
  * Выплата в USDT = Q(1+i)·min(S_T, K) — проданный колл со страйком K.
  */
-export function valueOffer({ direction, strike, apy, timing, forward, sigma, riskFree = 0 }) {
+export function valueOffer({ direction, strike, apy, timing, forward, sigma, riskFree = 0, riskFreeBtc = 0 }) {
   const i = interestRate(apy, timing.yieldDays);
   const T = Math.max(timing.tauDays, 0) / YEAR_DAYS;
   const Teff = twapEffectiveT(T);
   const K = strike;
   const F = forward;
 
-  // Дисконт применяем на срок реального удержания денег, а не на срок опциона.
-  const df = Math.exp((-riskFree * Math.max(timing.lockDays, 0)) / YEAR_DAYS);
+  // Дисконтирование у двух направлений разное, и это не косметика.
+  //
+  // Buy Low вложен в USDT и в USDT же возвращается: ожидание выплаты надо
+  // привести к сегодняшнему дню по долларовой ставке, причём на срок реального
+  // удержания денег, а не на срок опциона — простой между сеттлментом и
+  // зачислением тоже стоит денег.
+  //
+  // Sell High вложен в BTC, а его выплата нормируется на форвард. Деление на F
+  // уже содержит рыночный дисконт: при нулевой ставке заимствования монеты
+  // DF_T·F = S, то есть (F−C)/F — это и есть стоимость в долях сегодняшнего
+  // биткоина. Умножать это ещё и на долларовый дисконт значит применить его
+  // дважды. Правильная поправка здесь — ставка, под которую можно было бы
+  // отдать сам биткоин, и только на срок, пока он заперт.
+  const df =
+    direction === 'BuyLow'
+      ? Math.exp((-riskFree * Math.max(timing.lockDays, 0)) / YEAR_DAYS)
+      : Math.exp((-riskFreeBtc * Math.max(timing.lockDays, 0)) / YEAR_DAYS);
 
   let fairPerUnit; // ожидание выплаты под Q, в единицах вложенного капитала
   let optionPrice = null;
@@ -317,6 +370,84 @@ export function empiricalShortfall(sorted, spot, strike, direction) {
   }
   const mean = acc / sorted.length;
   return direction === 'BuyLow' ? mean / strike : mean / spot;
+}
+
+// ─────────────────────────────────────────────────── глубина конвертации
+//
+// Вероятность конвертации отвечает только на вопрос «как часто», и этого мало.
+// При одной и той же вероятности 7% восьмичасовая оферта теряет 0.04% капитала,
+// а 236-дневная — 1.6%: у первой страйк в проценте от рынка, у второй в половине.
+// Поэтому рядом с частотой нужна величина: сколько именно теряется в среднем,
+// сколько теряется в тех случаях, когда конвертация всё-таки случилась, и
+// насколько глубоко уходит цена в неудачных пяти процентах исходов.
+//
+// Для Buy Low потеря считается в долях вложенного USDT: конвертация отдаёт BTC
+// по страйку, а рынок оценивает его в S_T, значит теряется (K − S_T)/K.
+// Для Sell High симметрично — упущенный рост (S_T − K) в долях сегодняшней
+// стоимости монеты.
+
+export const STRESS_LEVEL = 0.05;
+
+/** Профиль глубины под мерой Q: аналитически из тех же цен опционов. */
+export function rnLossProfile({ direction, forward, strike, sigma, Teff, spot, level = STRESS_LEVEL }) {
+  if (!(sigma > 0) || !(Teff > 0) || !(strike > 0) || !(forward > 0)) return null;
+  const v = sigma * Math.sqrt(Teff);
+  const d1 = (Math.log(forward / strike) + (v * v) / 2) / v;
+  const d2 = d1 - v;
+  const base = direction === 'BuyLow' ? strike : spot > 0 ? spot : forward;
+  const price = direction === 'BuyLow' ? black76Put(forward, strike, sigma, Teff) : black76Call(forward, strike, sigma, Teff);
+  const p = direction === 'BuyLow' ? normCdf(-d2) : normCdf(d2);
+  // Квантиль цены сеттлмента под Q: S = F·exp(σ√T·z − σ²T/2).
+  // Для Buy Low плохой исход — низкая цена, для Sell High — высокая.
+  const z = normInv(direction === 'BuyLow' ? level : 1 - level);
+  const sq = forward * Math.exp(v * z - (v * v) / 2);
+  const stress = direction === 'BuyLow' ? Math.max(0, (strike - sq) / base) : Math.max(0, (sq - strike) / base);
+  return {
+    expected: price / base,
+    conditional: p > 1e-9 ? price / base / p : null,
+    stress,
+  };
+}
+
+/** Профиль глубины по эмпирической выборке логарифмических доходностей. */
+export function empiricalLossProfile(sorted, spot, strike, direction, level = STRESS_LEVEL) {
+  if (!sorted?.length || !(spot > 0) || !(strike > 0)) return null;
+  const base = direction === 'BuyLow' ? strike : spot;
+  let acc = 0;
+  let hits = 0;
+  for (const r of sorted) {
+    const s = spot * Math.exp(r);
+    const loss = direction === 'BuyLow' ? Math.max(0, strike - s) : Math.max(0, s - strike);
+    acc += loss;
+    if (loss > 0) hits++;
+  }
+  const mean = acc / sorted.length;
+  const p = hits / sorted.length;
+  // Выборка отсортирована по возрастанию, поэтому нижний квантиль лежит слева,
+  // верхний — справа. Индекс зажимаем: на короткой выборке края вырождаются.
+  const idx = clamp(
+    Math.floor((direction === 'BuyLow' ? level : 1 - level) * (sorted.length - 1)),
+    0,
+    sorted.length - 1,
+  );
+  const sq = spot * Math.exp(sorted[idx]);
+  const stress = direction === 'BuyLow' ? Math.max(0, (strike - sq) / base) : Math.max(0, (sq - strike) / base);
+  return { expected: mean / base, conditional: p > 1e-9 ? mean / base / p : null, stress };
+}
+
+/**
+ * Сдвиг, приводящий выборку логарифмических доходностей к мартингалу:
+ * после него E[S_T] = F, а не медиана. Без него центрирование на ln(F/S)
+ * оставляет в распределении положительный снос: из-за выпуклости экспоненты
+ * E[e^r] > e^{E[r]}, и на 236 днях среднее уезжает выше форварда на 5%, то
+ * есть в меру риска молча зашивается прогноз роста BTC на 13% годовых.
+ */
+export function martingaleShift(shifted, targetGross) {
+  if (!shifted?.length || !(targetGross > 0)) return 0;
+  let acc = 0;
+  for (const r of shifted) acc += Math.exp(r);
+  const mean = acc / shifted.length;
+  return mean > 0 ? Math.log(targetGross / mean) : 0;
 }
 
 // Среднее значение множителя цены на горизонте: E[S_T]/S_0 по выборке.
@@ -431,4 +562,21 @@ export function truncate(x, digits) {
 
 export function clamp(x, lo, hi) {
   return Math.min(hi, Math.max(lo, x));
+}
+
+/**
+ * Медиана набора. Рядом со средним она обязательна везде, где считается
+ * стоимость по историческим траекториям BTC: распределение годовых исходов
+ * настолько скошено, что среднее задаёт правый хвост. На пяти годах среднее
+ * годовое удержание биткоина даёт +42%, а медианное — заметно меньше, и
+ * показывать только первое значит обещать типичный исход по нетипичному.
+ */
+export function median(values) {
+  if (!values?.length) return null;
+  // Копия обязательна: сортировка на месте испортила бы попутевый порядок,
+  // из которого стоимость и считалась.
+  const copy = Float64Array.from(values);
+  copy.sort();
+  const mid = copy.length >> 1;
+  return copy.length % 2 ? copy[mid] : (copy[mid - 1] + copy[mid]) / 2;
 }

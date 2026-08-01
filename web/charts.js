@@ -44,9 +44,26 @@ export function durationColor(duration, allDurations) {
  * Точки на фронте Парето соединены линией: всё, что лежит ниже и правее неё,
  * заведомо проигрывает какой-то оферте на самой линии.
  */
-export function scatterChart(container, rows, { durations, onHover, maxP } = {}) {
+export function scatterChart(
+  container,
+  rows,
+  {
+    durations,
+    onHover,
+    maxP,
+    // Оси задаются снаружи: у режима «текущая подписка» это эффективный APR
+    // против вероятности за сделку, у режима стратегии — годовая стоимость
+    // против шанса закончить горизонт в биткоине.
+    xKey = 'pConv',
+    yKey = 'aprEff',
+    frontKey = 'pareto',
+    xLabel = 'вероятность конвертации',
+    yLabel = 'эффективный APR',
+    showThreshold = true,
+  } = {},
+) {
   container.innerHTML = '';
-  const usable = rows.filter((r) => Number.isFinite(r.pConv) && Number.isFinite(r.aprEff));
+  const usable = rows.filter((r) => Number.isFinite(r[xKey]) && Number.isFinite(r[yKey]));
   if (!usable.length) {
     container.innerHTML = '<div class="empty">нет данных для графика</div>';
     return;
@@ -62,8 +79,8 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
   const iw = W - M.left - M.right;
   const ih = H - M.top - M.bottom;
 
-  const xMax = Math.max(...usable.map((r) => r.pConv)) * 1.05 || 0.1;
-  const yVals = usable.map((r) => r.aprEff);
+  const xMax = Math.max(...usable.map((r) => r[xKey])) * 1.05 || 0.1;
+  const yVals = usable.map((r) => r[yKey]);
   const yMax = Math.max(...yVals) * 1.08;
   const yMin = Math.min(0, Math.min(...yVals));
 
@@ -88,7 +105,7 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
   }
 
   // Порог риска пользователя.
-  if (maxP != null && maxP <= xMax) {
+  if (showThreshold && maxP != null && maxP <= xMax) {
     g.append(
       el('line', {
         x1: x(maxP),
@@ -105,12 +122,12 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
     g.append(t);
   }
 
-  const front = usable.filter((r) => r.pareto).sort((a, b) => a.pConv - b.pConv);
+  const front = usable.filter((r) => r[frontKey]).sort((a, b) => a[xKey] - b[xKey]);
   if (front.length > 1) {
     g.append(
       el('path', {
         class: 'front-line',
-        d: front.map((r, k) => `${k ? 'L' : 'M'}${x(r.pConv).toFixed(1)},${y(r.aprEff).toFixed(1)}`).join(' '),
+        d: front.map((r, k) => `${k ? 'L' : 'M'}${x(r[xKey]).toFixed(1)},${y(r[yKey]).toFixed(1)}`).join(' '),
       }),
     );
   }
@@ -119,11 +136,11 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
   // не должны конкурировать за внимание с фронтом. Раньше 130 одинаково ярких
   // кружков делали график нечитаемым, а сам фронт в них терялся.
   for (const r of usable) {
-    if (r.pareto) continue;
+    if (r[frontKey]) continue;
     const node = el('circle', {
       class: 'pt',
-      cx: x(r.pConv),
-      cy: y(r.aprEff),
+      cx: x(r[xKey]),
+      cy: y(r[yKey]),
       r: 3,
       fill: 'var(--ink-3)',
       'fill-opacity': 0.25,
@@ -143,8 +160,8 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
     // точках перелома, то есть там, где смотреть и надо.
     const node = el('circle', {
       class: 'pt',
-      cx: x(r.pConv),
-      cy: y(r.aprEff),
+      cx: x(r[xKey]),
+      cy: y(r[yKey]),
       r: 4,
       fill: c,
       'fill-opacity': 0.55,
@@ -164,8 +181,8 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
   const placed = [];
   let above = true;
   for (const r of front) {
-    const px = x(r.pConv);
-    const py = y(r.aprEff);
+    const px = x(r[xKey]);
+    const py = y(r[yKey]);
     const collides = placed.some((p) => Math.abs(p.x - px) < 54 && Math.abs(p.y - py) < 13);
     if (collides) continue;
     const dy = above ? -9 : 15;
@@ -180,13 +197,13 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
     g.append(label);
   }
 
-  const xl = el('text', { x: iw / 2, y: ih + 38, 'text-anchor': 'middle', 'font-size': FONT_AXIS }, 'вероятность конвертации');
+  const xl = el('text', { x: iw / 2, y: ih + 38, 'text-anchor': 'middle', 'font-size': FONT_AXIS }, xLabel);
   xl.setAttribute('fill', 'var(--ink-2)');
   g.append(xl);
   const yl = el(
     'text',
     { x: -ih / 2, y: -42, 'text-anchor': 'middle', 'font-size': FONT_AXIS, transform: `rotate(-90)` },
-    'эффективный APR',
+    yLabel,
   );
   yl.setAttribute('fill', 'var(--ink-2)');
   g.append(yl);

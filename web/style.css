@@ -449,6 +449,67 @@ h2 {
   border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
 }
 
+/* Почему карточка попала в блок: раньше все шесть были одним краем фронта. */
+.tag.pick {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.warn-text {
+  color: var(--warn);
+}
+
+/* ───────────────────────────────── переключатель постановки задачи */
+
+.modes {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin: 0 0 14px;
+}
+
+.mode-switch {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  padding: 3px;
+  gap: 3px;
+  flex: none;
+}
+
+.mode {
+  border: 0;
+  background: transparent;
+  color: var(--ink-2);
+  border-radius: 999px;
+  padding: 7px 15px;
+  font: 600 13px/1 inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.mode:hover {
+  color: var(--ink);
+}
+
+.mode.on {
+  background: var(--accent);
+  /* Не #fff: в тёмной теме акцент светло-зелёный, и белый текст на нём
+     нечитаем. Фон страницы контрастен акценту в обеих темах. */
+  color: var(--bg);
+}
+
+.mode-note {
+  flex: 1 1 320px;
+  min-width: 240px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
 .kv {
   display: grid;
   grid-template-columns: auto 1fr;

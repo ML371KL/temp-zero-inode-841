@@ -26,6 +26,10 @@ import {
   exitFrontier,
   frontierWithMargins,
   pickAnchors,
+  computeStrategy,
+  markHorizonRisk,
+  annualize,
+  MIN_INDEPENDENT_WINDOWS,
 } from '../web/model.js';
 import {
   productTiming,
@@ -37,6 +41,12 @@ import {
   black76Call,
   twapEffectiveT,
   apyFromE8,
+  rnLossProfile,
+  empiricalLossProfile,
+  empiricalMeanGross,
+  martingaleShift,
+  median,
+  normInv,
   YEAR_DAYS,
   MS_DAY,
 } from '../web/quant.js';
@@ -105,15 +115,44 @@ function monteCarlo({ F, K, sigma, T, direction, i, n = 400_000, seed = 12345 })
   return { p: trigger / n, value: payoff / n, se: 0.5 / Math.sqrt(n) };
 }
 
+
+/**
+ * Монте-Карло для профиля глубины: та же мера Q, но прямым моделированием.
+ * Проверяет и среднюю потерю, и квантиль цены, то есть обе половины профиля.
+ */
+function monteCarloLoss({ F, K, sigma, T, n = 400_000, seed = 777 }) {
+  const rnd = rng(seed);
+  const v = sigma * Math.sqrt(T);
+  const prices = new Float64Array(n);
+  let loss = 0;
+  for (let k = 0; k < n; k++) {
+    const u1 = Math.max(rnd(), 1e-12);
+    const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * rnd());
+    const s = F * Math.exp(v * z - (v * v) / 2);
+    prices[k] = s;
+    loss += Math.max(0, K - s);
+  }
+  prices.sort();
+  return { loss: loss / n / K, quantile: prices[Math.floor(0.05 * (n - 1))] };
+}
+
+const DUR_RE = /^(\d+(?:\.\d+)?)([hd])$/i;
+function durDays(text) {
+  const m = DUR_RE.exec(String(text || ''));
+  if (!m) return 1e9;
+  return m[2].toLowerCase() === 'h' ? Number(m[1]) / 24 : Number(m[1]);
+}
+
 // ─────────────────────────────────────────── сбор живых данных
 
 console.log('Загрузка живых данных…');
 const now = Date.now();
-const [products, options, spot, riskFree] = await Promise.all([
+const [products, options, spot, riskFree, riskFreeBtc] = await Promise.all([
   fetchProducts(),
   fetchOptionTickers(),
   fetchSpot(),
-  fetchRiskFree(),
+  fetchRiskFree('USDT'),
+  fetchRiskFree('BTC'),
 ]);
 const surface = buildSurface(options, now);
 const quotes = new Map();
@@ -132,9 +171,11 @@ const opts = {
   surface,
   history,
   riskFree,
+  riskFreeBtc,
   amount: 10000,
   vip: true,
   measure: 'max',
+  horizonDays: 90,
 };
 const buy = buildRows({ ...opts, direction: 'BuyLow' });
 const sell = buildRows({ ...opts, direction: 'SellHigh' });
@@ -386,7 +427,7 @@ console.log('\n── 6. Якоря: сверка с полным перебор
   for (const [id, key] of [
     ['market', 'volEdge'],
     ['money', 'edgeApr'],
-    ['expected', 'expNetApr'],
+    ['expected', 'expNet'],
     ['yield', 'aprEff'],
   ]) {
     const brute = maxBy(key);
@@ -437,7 +478,7 @@ console.log('\n── 7. Отбор в блок «Оптимальные Buy Low
     const within = buy.filter((r) => Number.isFinite(r.pConv) && r.pConv <= maxP && Number.isFinite(r.aprEff));
     const globalFrontWithin = within.filter((r) => r.pareto);
     const shownFront = best.filter((r) => r.pareto);
-    const missing = globalFrontWithin.filter((r) => !best.includes(r) && shownFront.length < 6);
+    const missing = globalFrontWithin.filter((r) => !best.includes(r) && globalFrontWithin.length <= 6);
     ok(
       `порог ${pc(maxP, 0)}: фронт внутри порога совпадает с глобальным`,
       missing.length === 0,
@@ -445,22 +486,42 @@ console.log('\n── 7. Отбор в блок «Оптимальные Buy Low
     );
     ok(`порог ${pc(maxP, 0)}: в блоке только оферты с фронта`, best.every((r) => r.pareto));
 
-    // Карточки обязаны идти по убыванию доходности.
-    const sorted = best.every((r, k) => k === 0 || best[k - 1].aprEff >= r.aprEff);
-    ok(`порог ${pc(maxP, 0)}: карточки упорядочены по доходности`, sorted);
-  }
+    // Карточки идут от осторожных к доходным.
+    const sorted = best.every((r, k) => k === 0 || best[k - 1].pConv <= r.pConv);
+    ok(`порог ${pc(maxP, 0)}: карточки упорядочены от осторожных к доходным`, sorted);
 
-  // Наивысшая доходность внутри порога обязана быть первой карточкой.
-  const maxP = 0.15;
-  const best = pickBest({ rows: buy, maxP });
-  const bestPossible = buy
-    .filter((r) => Number.isFinite(r.pConv) && r.pConv <= maxP && Number.isFinite(r.aprEff))
-    .reduce((a, b) => (b.aprEff > a.aprEff ? b : a));
-  ok(
-    'первая карточка — максимум доходности внутри порога',
-    best[0] && Math.abs(best[0].aprEff - bestPossible.aprEff) < 1e-12,
-    `${best[0]?.duration}/${best[0]?.strike} ${pc(best[0]?.aprEff)}`,
-  );
+    // Максимум доходности внутри порога обязан присутствовать — но именно как
+    // одна из карточек, а не как весь блок.
+    const onFront = within.filter((r) => r.pareto && Number.isFinite(r.aprEff));
+    if (onFront.length) {
+      const topApr = onFront.reduce((a, b) => (b.aprEff > a.aprEff ? b : a));
+      ok(
+        `порог ${pc(maxP, 0)}: максимум доходности показан и подписан`,
+        best.includes(topApr) && (topApr.bestTag ?? '').includes('максимум доходности'),
+        `${topApr.duration}/${topApr.strike} ${pc(topApr.aprEff)}`,
+      );
+      const priced = onFront.filter((r) => Number.isFinite(r.volEdge));
+      if (priced.length) {
+        const topVol = priced.reduce((a, b) => (b.volEdge > a.volEdge ? b : a));
+        ok(
+          `порог ${pc(maxP, 0)}: лучшая цена риска показана и подписана`,
+          best.includes(topVol) && (topVol.bestTag ?? '').includes('лучшая цена риска'),
+          `${topVol.duration}/${topVol.strike} ${pc(topVol.volEdge)}`,
+        );
+      }
+      // Главная регрессия, ради которой блок и переделан: шесть карточек
+      // подряд с верхнего края прятали всю осторожную часть фронта.
+      if (onFront.length > 6) {
+        const span = Math.max(...best.map((r) => r.pConv)) - Math.min(...best.map((r) => r.pConv));
+        const full = Math.max(...onFront.map((r) => r.pConv)) - Math.min(...onFront.map((r) => r.pConv));
+        ok(
+          `порог ${pc(maxP, 0)}: карточки покрывают размах фронта, а не его край`,
+          span > full * 0.8,
+          `размах карточек ${pc(span)} против ${pc(full)} у фронта из ${onFront.length} точек`,
+        );
+      }
+    }
+  }
 }
 
 // ─────────────────────────────────────────── 8. Согласованность строк
@@ -645,7 +706,9 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
   const s = analyzed.find((r) => r.sigma > 0 && r.i > 0);
   if (s) {
     const mc = monteCarlo({ F: s.forward, K: s.strike, sigma: s.sigma, T: s.Teff, direction: 'SellHigh', i: s.i });
-    const df = Math.exp((-(riskFree ?? 0) * s.timing.lockDays) / YEAR_DAYS);
+    // Дисконт Sell High идёт по ставке заимствования BTC: выплата уже
+    // нормирована на форвард, и долларовая ставка в неё не входит.
+    const df = Math.exp((-(riskFreeBtc ?? 0) * s.timing.lockDays) / YEAR_DAYS);
     ok(
       'справедливая стоимость Sell High против Монте-Карло',
       Math.abs(mc.value * df - s.fairValue) < 1e-3,
@@ -654,17 +717,28 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
   }
 
   // Ожидаемая доходность Sell High обязана считаться от стоимости биткоина,
-  // а не от единицы: иначе теряется весь исторический дрейф цены.
+  // а не от единицы: иначе теряется весь исторический дрейф цены. И считаться
+  // она обязана по ТОЙ ЖЕ серии, из которой взята вероятность: сырая и
+  // нормированная выборки описывают разные рынки.
   const withHist = analyzed.filter((r) => r.expNetApr != null && r.shortfall != null);
   let driftBad = 0;
+  let seriesBad = 0;
   for (const r of withHist.slice(0, 40)) {
     const h = history.returns(r.timing.tauDays);
-    const meanGross = h ? h.sorted.reduce((a, x) => a + Math.exp(x), 0) / h.sorted.length : null;
+    const meanGross = h ? empiricalMeanGross(h.sorted) : null;
     if (meanGross == null) continue;
     const expected = (((1 + r.i) * (meanGross - r.shortfall) - 1) * YEAR_DAYS) / r.timing.lockDays;
     if (Math.abs(expected - r.expNetApr) > 1e-9) driftBad++;
+    // Нормированная серия обязана давать свой собственный shortfall и своё EV.
+    const sc = history.scaled(r.timing.tauDays, r.sigma, r.Teff, r.forward / spot);
+    if (sc) {
+      const mg = empiricalMeanGross(sc);
+      const want = (((1 + r.i) * (mg - r.shortfallScaled) - 1) * YEAR_DAYS) / r.timing.lockDays;
+      if (!(Math.abs(want - r.expNetAprScaled) < 1e-9)) seriesBad++;
+    }
   }
   ok('ожидаемая доходность Sell High учитывает дрейф цены', driftBad === 0, `нарушений ${driftBad}`);
+  ok('нормированная серия даёт своё EV, а не чужое', seriesBad === 0, `нарушений ${seriesBad}`);
 
   // Циклы до безубытка: рост количества монет обязан закрывать разрыв.
   let recBad = [];
@@ -679,21 +753,24 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
   }
   ok('циклы до безубытка закрывают разрыв и учитывают простой', recBad.length === 0, recBad.slice(0, 3).join(', ') || 'ок');
 
+  // Горизонт, на котором построен весь блок выхода.
+  const H = 90;
+
   // Отбор в режиме выхода: фронт по максимуму обеих величин.
   const best = pickBestSell({ rows: analyzed });
   ok('режим определён верно', best.mode === (analyzed.some((r) => r.profitable) ? 'exit' : 'wait'), best.mode);
   if (best.mode === 'exit') {
     ok('в режиме выхода показаны только безубыточные', best.rows.every((r) => r.profitable));
     const pool = analyzed.filter(
-      (r) => r.profitable && Number.isFinite(r.profitPct) && r.pExitHorizon > 0,
+      (r) => r.profitable && Number.isFinite(r.profitAxis) && r.pExitHorizon > 0,
     );
     const dominated = (a) =>
       pool.some(
         (b) =>
           b !== a &&
-          b.profitPct >= a.profitPct &&
+          b.profitAxis >= a.profitAxis &&
           b.pExitHorizon >= a.pExitHorizon &&
-          (b.profitPct > a.profitPct || b.pExitHorizon > a.pExitHorizon),
+          (b.profitAxis > a.profitAxis || b.pExitHorizon > a.pExitHorizon),
       );
     const brute = pool.filter((r) => !dominated(r));
     const model = pool.filter((r) => r.sellPareto);
@@ -724,17 +801,33 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
   ok('в режиме ожидания показаны только недоминируемые', waiting.rows.every((r) => !waitDominated(r)));
 
   // Направление осторожной оценки вероятности.
-  const exitRows = analyzed.filter((r) => r.pRN != null && r.pHist != null);
-  const waitRows = deep.filter((r) => r.pRN != null && r.pHist != null);
+  // Историческая нога здесь — нормированная серия, та же, что и на стороне
+  // Buy Low, и с тем же порогом по весу выборки: сырая описывает рынок
+  // пятилетней давности, и мерить ею сегодняшний выход нельзя.
+  const cautious = (r, exit) => {
+    const b = r.pHistScaled ?? r.pHist;
+    if (r.pRN == null || b == null) return null;
+    const thin = r.histInfo != null && r.histInfo.independent < MIN_INDEPENDENT_WINDOWS;
+    return thin ? r.pRN : exit ? Math.min(r.pRN, b) : Math.max(r.pRN, b);
+  };
+  const exitRows = analyzed.filter((r) => cautious(r, true) != null);
+  const waitRows = deep.filter((r) => cautious(r, false) != null);
   ok(
     'в режиме выхода осторожная вероятность — меньшая из двух',
-    exitRows.every((r) => Math.abs(r.pConv - Math.min(r.pRN, r.pHist)) < 1e-12),
+    exitRows.every((r) => Math.abs(r.pConv - cautious(r, true)) < 1e-12),
     `проверено ${exitRows.length}`,
   );
   ok(
     'в режиме ожидания осторожная вероятность — большая из двух',
-    waitRows.every((r) => Math.abs(r.pConv - Math.max(r.pRN, r.pHist)) < 1e-12),
+    waitRows.every((r) => Math.abs(r.pConv - cautious(r, false)) < 1e-12),
     `проверено ${waitRows.length}`,
+  );
+  ok(
+    'на тонкой выборке осторожная оценка Sell High возвращается к рынку',
+    analyzed
+      .filter((r) => r.histInfo && r.histInfo.independent < MIN_INDEPENDENT_WINDOWS && r.pRN != null)
+      .every((r) => Math.abs(r.pConv - r.pRN) < 1e-12),
+    `тонких строк ${analyzed.filter((r) => r.histInfo && r.histInfo.independent < MIN_INDEPENDENT_WINDOWS).length}`,
   );
 
   // Перекосы лестницы на стороне Sell High: безопаснее — страйк выше.
@@ -763,7 +856,6 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
 
   // Горизонт выхода: приведение вероятностей к общему сроку.
   {
-    const H = 90;
     const withH = analyzed.filter((r) => Number.isFinite(r.pExitHorizon));
     ok('шанс выхода посчитан для всех строк', withH.length === analyzed.length, `${withH.length} из ${analyzed.length}`);
     ok('шанс выхода лежит в [0,1]', withH.every((r) => r.pExitHorizon >= 0 && r.pExitHorizon <= 1));
@@ -831,18 +923,30 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     }
     ok('ожидание выхода растёт со страйком', waitMono === 0, `нарушений ${waitMono}`);
     ok(
-      'ожидаемая годовая доходность = прибыль × шанс / ожидание',
-      withT.every(
-        (r) => Math.abs(r.expProfitRate - (r.profitPct * r.pExitHorizon * 365) / r.expExitDays) < 1e-9,
-      ),
+      'скорость выхода = прибыль к выходу × шанс × 365 / H',
+      withT.every((r) => Math.abs(r.exitSpeed - (r.profitAtExit * r.pExitHorizon * 365) / H) < 1e-9),
+      `знаменатель — полный горизонт ${H} дней, а не длина цикла`,
+    );
+    // Накопление процента: прибыль к выходу не может быть меньше прибыли за
+    // один цикл, и строго больше там, где выход случается не на первом.
+    ok(
+      'прибыль к выходу не меньше прибыли за один цикл',
+      withT.every((r) => r.profitAtExit >= r.profitPct - 1e-12),
+      `строк ${withT.length}`,
+    );
+    const later = withT.filter((r) => r.expExitDays > r.timing.cycleDays * 1.5);
+    ok(
+      'при выходе не на первом цикле накопление строго увеличивает прибыль',
+      later.every((r) => r.profitAtExit > r.profitPct - 1e-12),
+      `таких строк ${later.length}`,
     );
 
     // Карточки берут срез по всему фронту, а не его край.
     const cards = pickBestSell({ rows: analyzed });
     const steps0 = exitFrontier(analyzed);
     if (cards.mode === 'exit' && steps0.length > 6) {
-      const span = Math.max(...cards.rows.map((r) => r.profitPct)) - Math.min(...cards.rows.map((r) => r.profitPct));
-      const full = Math.max(...steps0.map((r) => r.profitPct)) - Math.min(...steps0.map((r) => r.profitPct));
+      const span = Math.max(...cards.rows.map((r) => r.profitAxis)) - Math.min(...cards.rows.map((r) => r.profitAxis));
+      const full = Math.max(...steps0.map((r) => r.profitAxis)) - Math.min(...steps0.map((r) => r.profitAxis));
       ok(
         'карточки покрывают размах фронта, а не его край',
         span > full * 0.8,
@@ -860,10 +964,10 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     // Фронт выхода упорядочен и цена шага пересчитана верно.
     const steps = exitFrontier(analyzed);
     ok('фронт выхода упорядочен по убыванию шанса', steps.every((r, k) => k === 0 || r[r.exitAxis] <= steps[k - 1][r.exitAxis] + 1e-12));
-    ok('прибыль вдоль фронта выхода не убывает', steps.every((r, k) => k === 0 || r.profitPct >= steps[k - 1].profitPct - 1e-12));
+    ok('прибыль вдоль фронта выхода не убывает', steps.every((r, k) => k === 0 || r.profitAxis >= steps[k - 1].profitAxis - 1e-12));
     let margBad = 0;
     for (let k = 1; k < steps.length; k++) {
-      const want = (steps[k].profitPct - steps[k - 1].profitPct) / (steps[k - 1][steps[k].exitAxis] - steps[k][steps[k].exitAxis]);
+      const want = (steps[k].profitAxis - steps[k - 1].profitAxis) / (steps[k - 1][steps[k].exitAxis] - steps[k][steps[k].exitAxis]);
       if (Number.isFinite(want) && Math.abs(steps[k].marginal - want) > 1e-9) margBad++;
     }
     ok('цена шага на фронте выхода пересчитана верно', margBad === 0, `строк ${steps.length}`);
@@ -878,6 +982,288 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
 
   console.log(
     `       себестоимость ${basis.toFixed(2)} при споте ${spot.toFixed(2)} · безубыточных ${analyzed.filter((r) => r.profitable).length} из ${analyzed.length} · режим ${best.mode}`,
+  );
+}
+
+// ─────────────────────────────────────────── 11. Глубина конвертации
+
+console.log('\n── 11. Глубина конвертации: величина потери рядом с частотой');
+{
+  const withDepth = buy.filter((r) => r.depth && r.lossRN);
+  ok(
+    'глубина посчитана для всех строк с волатильностью',
+    withDepth.length === buy.filter((r) => r.sigma > 0).length,
+    `${withDepth.length} из ${buy.length}`,
+  );
+
+  // Тождество меры: условная потеря — это безусловная, делённая на вероятность.
+  let idBad = 0;
+  for (const r of buy) {
+    if (!r.lossRN?.conditional || !(r.pRN > 1e-9)) continue;
+    if (Math.abs(r.lossRN.conditional * r.pRN - r.lossRN.expected) > 1e-12) idBad++;
+  }
+  ok('условная × вероятность = безусловная под мерой Q', idBad === 0, `нарушений ${idBad}`);
+
+  // Монте-Карло по той же мере: и потеря, и её квантиль.
+  const probe = buy.filter((r) => r.sigma > 0 && r.pRN > 0.02 && r.pRN < 0.6).slice(0, 4);
+  let maxLossErr = 0;
+  let maxStressErr = 0;
+  for (const r of probe) {
+    const mc = monteCarloLoss({ F: r.forward, K: r.strike, sigma: r.sigma, T: r.Teff });
+    maxLossErr = Math.max(maxLossErr, Math.abs(mc.loss - r.lossRN.expected));
+    const want = Math.max(0, (r.strike - mc.quantile) / r.strike);
+    maxStressErr = Math.max(maxStressErr, Math.abs(want - r.lossRN.stress));
+  }
+  ok('ожидаемая потеря против Монте-Карло', maxLossErr < 1e-3, `максимум расхождения ${(maxLossErr * 100).toFixed(4)} п.п.`);
+  ok('стресс-квантиль против Монте-Карло', maxStressErr < 5e-3, `максимум расхождения ${(maxStressErr * 100).toFixed(3)} п.п.`);
+
+  // Внутри продукта потеря обязана расти со страйком — как и вероятность.
+  let mono = 0;
+  const grp = new Map();
+  for (const r of buy) {
+    if (!r.depth) continue;
+    if (!grp.has(r.productId)) grp.set(r.productId, []);
+    grp.get(r.productId).push(r);
+  }
+  for (const list of grp.values()) {
+    const srt = [...list].sort((a, b) => a.strike - b.strike);
+    for (let k = 1; k < srt.length; k++) if (srt[k].depth.expected < srt[k - 1].depth.expected - 1e-12) mono++;
+  }
+  ok('ожидаемая потеря растёт со страйком внутри продукта', mono === 0, `нарушений ${mono}`);
+
+  // Осторожный режим берёт худшее по каждому полю, а на тонкой выборке — рынок.
+  let pickBad = 0;
+  for (const r of buy) {
+    if (!r.depth || !r.lossRN) continue;
+    const thin = r.histInfo != null && r.histInfo.independent < MIN_INDEPENDENT_WINDOWS;
+    const h = r.lossHistScaled ?? r.lossHist;
+    const want = thin || !h ? r.lossRN.expected : Math.max(r.lossRN.expected, h.expected);
+    if (Math.abs(r.depth.expected - want) > 1e-12) pickBad++;
+  }
+  ok('осторожная глубина = худшая из двух мер с учётом веса выборки', pickBad === 0, `нарушений ${pickBad}`);
+
+  // Ради чего всё затевалось: при одной вероятности глубина разная.
+  const band = buy.filter((r) => r.pRN > 0.05 && r.pRN < 0.1 && r.depth);
+  if (band.length > 2) {
+    const lo = band.reduce((a, b) => (b.depth.expected < a.depth.expected ? b : a));
+    const hi = band.reduce((a, b) => (b.depth.expected > a.depth.expected ? b : a));
+    ok(
+      'при одной вероятности глубина различается в разы',
+      hi.depth.expected > lo.depth.expected * 3,
+      `${lo.duration} ${pc(lo.depth.expected, 3)} против ${hi.duration} ${pc(hi.depth.expected, 3)} при P около 7%`,
+    );
+  }
+}
+
+// ─────────────────────────────────────────── 12. Согласованность серий
+
+console.log('\n── 12. Две согласованные серии вместо смеси двух миров');
+{
+  let martBad = 0;
+  let cdfBad = 0;
+  let evBad = 0;
+  let checked = 0;
+  for (const r of buy) {
+    const sc = history.scaled(r.timing.tauDays, r.sigma, r.Teff, r.forward / spot);
+    if (!sc?.length) continue;
+    checked++;
+    // Мартингальность: среднее самой цены равно форварду, а не медиана.
+    const mg = empiricalMeanGross(sc);
+    if (Math.abs(mg / (r.forward / spot) - 1) > 1e-9) martBad++;
+    // Вероятность строки взята из этой же серии.
+    const want = empiricalCdf(sc, Math.log(r.strike / spot));
+    if (Math.abs(want - r.pHistScaled) > 1e-12) cdfBad++;
+    // И ожидаемая доходность тоже.
+    const sf = empiricalLossProfile(sc, spot, r.strike, 'BuyLow');
+    const ev = (((1 + r.i) * (1 - sf.expected) - 1) * YEAR_DAYS) / r.timing.lockDays;
+    if (!(Math.abs(ev - r.expNetAprScaled) < 1e-9)) evBad++;
+  }
+  ok('нормированная серия мартингальна: E[S_T] = F', martBad === 0, `проверено ${checked}, нарушений ${martBad}`);
+  ok('вероятность взята из нормированной серии', cdfBad === 0, `нарушений ${cdfBad}`);
+  ok('ожидаемая доходность взята из той же серии, что и вероятность', evBad === 0, `нарушений ${evBad}`);
+
+  // Скрытый дрейф: до поправки среднее уезжало выше форварда тем сильнее, чем
+  // длиннее срок. Проверяем, что поправка действительно что-то делает.
+  const longRow = buy.filter((r) => r.timing.tauDays > 120).sort((a, b) => b.timing.tauDays - a.timing.tauDays)[0];
+  if (longRow) {
+    const h = history.returns(longRow.timing.tauDays);
+    const k = (longRow.sigma * Math.sqrt(longRow.Teff)) / h.sigma;
+    const drift = Math.log(longRow.forward / spot);
+    const naive = h.sorted.map((x) => (x - h.mean) * k + drift);
+    const bias = empiricalMeanGross(naive) / (longRow.forward / spot) - 1;
+    ok(
+      'без мартингальной поправки в меру попадал бы скрытый рост',
+      bias > 0.005,
+      `на ${longRow.duration} смещение цены +${(bias * 100).toFixed(2)}%, то есть ` +
+        `+${((annualize(1 + bias, longRow.timing.tauDays) ?? 0) * 100).toFixed(1)}% годовых молчаливого прогноза`,
+    );
+    ok('поправка это смещение убирает', Math.abs(martingaleShift(naive, longRow.forward / spot)) > 1e-4);
+  }
+
+  // Смена меры обязана менять ВСЮ серию, а не одну величину.
+  const rowsRn = buildRows({ ...opts, direction: 'BuyLow', measure: 'rn' });
+  const rowsHist = buildRows({ ...opts, direction: 'BuyLow', measure: 'hist' });
+  ok('мера rn: вероятность рыночная', rowsRn.every((r) => r.pRN == null || Math.abs(r.pConv - r.pRN) < 1e-15));
+  ok('мера rn: глубина рыночная', rowsRn.every((r) => !r.lossRN || Math.abs(r.depth.expected - r.lossRN.expected) < 1e-15));
+  ok('мера hist: вероятность сырая', rowsHist.every((r) => r.pHist == null || Math.abs(r.pConv - r.pHist) < 1e-15));
+  ok('мера hist: глубина сырая', rowsHist.every((r) => !r.lossHist || Math.abs(r.depth.expected - r.lossHist.expected) < 1e-15));
+  ok('мера hist: ожидаемая доходность сырая', rowsHist.every((r) => r.expNetApr == null || Math.abs(r.expNet - r.expNetApr) < 1e-15));
+}
+
+// ─────────────────────────────────────────── 13. Траекторный слой
+
+console.log('\n── 13. Траектории: попутевые ряды против отсортированных');
+{
+  const cycles = [...new Set(buy.map((r) => r.timing.cycleDays))].sort((a, b) => a - b);
+  let sortBad = 0;
+  let hitBad = 0;
+  let checked = 0;
+  for (const c of cycles) {
+    const paths = history.pathSeries(c, 90);
+    const ext = history.pathExtremes(c, 90);
+    if (!paths || !ext) continue;
+    checked++;
+    const n = paths.cycles;
+    const direct = [];
+    for (let p = 0; p < paths.paths; p++) direct.push(paths.runMax[p * n + n - 1]);
+    direct.sort((a, b) => a - b);
+    const stride = Math.max(1, Math.floor(direct.length / 50));
+    for (let k = 0; k < direct.length; k += stride) {
+      if (Math.abs(direct[k] - ext.maxima[k]) > 1e-12) sortBad++;
+    }
+    for (const target of [0.9, 1.0, 1.05, 1.2]) {
+      const bySorted = 1 - empiricalCdf(ext.maxima, target);
+      let hits = 0;
+      for (let p = 0; p < paths.paths; p++) if (paths.runMax[p * n + n - 1] > target) hits++;
+      if (Math.abs(bySorted - hits / paths.paths) > 1e-12) hitBad++;
+    }
+  }
+  ok('отсортированные ряды согласованы с попутевыми', sortBad === 0, `циклов проверено ${checked}`);
+  ok('вероятность из двоичного поиска совпадает с прямым счётом', hitBad === 0, `нарушений ${hitBad}`);
+
+  ok('риск за горизонт посчитан для всех строк', buy.every((r) => Number.isFinite(r.pHorizon)));
+  ok('риск за горизонт лежит в [0,1]', buy.every((r) => r.pHorizon >= 0 && r.pHorizon <= 1));
+  let hMono = 0;
+  const grp = new Map();
+  for (const r of buy) {
+    if (!grp.has(r.productId)) grp.set(r.productId, []);
+    grp.get(r.productId).push(r);
+  }
+  for (const list of grp.values()) {
+    const srt = [...list].sort((a, b) => a.strike - b.strike);
+    for (let k = 1; k < srt.length; k++) if (srt[k].pHorizon < srt[k - 1].pHorizon - 1e-12) hMono++;
+  }
+  ok('риск за горизонт растёт со страйком', hMono === 0, `нарушений ${hMono}`);
+
+  // Главный смысл горизонтной меры: у коротких продуктов риск за сделку мал, а
+  // за горизонт — нет. Именно эта разница и была невидима.
+  const shortRows = buy.filter((r) => r.timing.cycleDays <= 2 && r.pConv < 0.1 && r.pHorizon > 0);
+  if (shortRows.length) {
+    const worst = shortRows.reduce((a, b) => (b.pHorizon - b.pConv > a.pHorizon - a.pConv ? b : a));
+    ok(
+      'у коротких оферт риск за горизонт кратно выше риска за сделку',
+      worst.pHorizon > worst.pConv * 3,
+      `${worst.duration}/${worst.strike}: за сделку ${pc(worst.pConv)}, за 90 дней ${pc(worst.pHorizon)}`,
+    );
+  }
+
+  const anyInfo = buy.find((r) => r.horizonInfo?.independent)?.horizonInfo;
+  if (anyInfo) {
+    const span = (history.raw.D.series.length * history.raw.D.stepMs) / MS_DAY;
+    ok(
+      'независимых наблюдений считается по горизонту, а не по длине цикла',
+      Math.abs(anyInfo.independent - span / 90) < 1e-6,
+      `${anyInfo.independent.toFixed(1)} при истории ${span.toFixed(0)} дней`,
+    );
+  }
+}
+
+// ─────────────────────────────────────────── 14. Режим стратегии
+
+console.log('\n── 14. Стратегия до выбранной даты');
+{
+  const HS = 90;
+  const rows = buildRows({ ...opts, direction: 'BuyLow', horizonDays: HS });
+  const res = computeStrategy({ rows, history, spot, horizonDays: HS, riskFree });
+  ok('стратегия посчитана', res != null && res.rows.length > 0, `фронт ${res?.rows.length}`);
+  ok('базы сравнения посчитаны', Number.isFinite(res.btcAnnual) && Number.isFinite(res.btcAnnualMedian));
+  ok(
+    'среднее удержание BTC выше медианного: распределение скошено вправо',
+    res.btcAnnual > res.btcAnnualMedian,
+    `среднее ${pc(res.btcAnnual, 1)}, медиана ${pc(res.btcAnnualMedian, 1)}`,
+  );
+
+  // Риск стратегии и риск за горизонт — одна величина, посчитанная двумя
+  // путями: через отсортированные ряды и через попутевые.
+  let riskBad = 0;
+  for (const r of rows) {
+    if (!r.strategy || !Number.isFinite(r.pHorizon)) continue;
+    if (Math.abs(r.strategy.pEndBtc - r.pHorizon) > 1e-12) riskBad++;
+  }
+  ok('шанс закончить в BTC совпадает с риском за горизонт', riskBad === 0, `нарушений ${riskBad}`);
+
+  // Полный перебор стоимости для нескольких строк.
+  let valBad = 0;
+  for (const r of rows.filter((x) => x.strategy).slice(0, 6)) {
+    const paths = history.pathSeries(r.timing.cycleDays, HS);
+    const n = paths.cycles;
+    const target = r.strike / spot;
+    const tail = 1 + (riskFree * paths.tailDays) / YEAR_DAYS;
+    let acc = 0;
+    for (let p = 0; p < paths.paths; p++) {
+      let k = -1;
+      for (let q = 0; q < n; q++) {
+        if (paths.runMin[p * n + q] <= target) {
+          k = q;
+          break;
+        }
+      }
+      acc += k >= 0 ? ((1 + r.i) ** (k + 1) * paths.terminal[p] * spot) / r.strike : (1 + r.i) ** n * tail;
+    }
+    if (Math.abs(acc / paths.paths - r.strategy.value) > 1e-9) valBad++;
+  }
+  ok('стоимость стратегии совпадает с полным перебором', valBad === 0, `нарушений ${valBad}`);
+
+  // Фронт стратегии — полным перебором.
+  const usable = rows.filter((r) => Number.isFinite(r.stratAnnual) && Number.isFinite(r.stratRisk));
+  const dominated = (a) =>
+    usable.some(
+      (b) =>
+        b !== a &&
+        b.stratAnnual >= a.stratAnnual &&
+        b.stratRisk <= a.stratRisk &&
+        (b.stratAnnual > a.stratAnnual || b.stratRisk < a.stratRisk),
+    );
+  const brute = usable.filter((r) => !dominated(r));
+  ok(
+    'фронт стратегии совпадает с полным перебором',
+    brute.length === res.rows.length && brute.every((r) => r.stratPareto),
+    `перебор ${brute.length}, модель ${res.rows.length}`,
+  );
+  ok('фронт стратегии упорядочен по риску', res.rows.every((r, k) => k === 0 || r.stratRisk >= res.rows[k - 1].stratRisk));
+  ok(
+    'доходность вдоль фронта стратегии не убывает',
+    res.rows.every((r, k) => k === 0 || r.stratAnnual >= res.rows[k - 1].stratAnnual - 1e-12),
+  );
+  ok(
+    'медиана стоимости посчитана',
+    res.rows.every((r) => Number.isFinite(r.strategy.annualMedian)),
+    `строк ${res.rows.length}`,
+  );
+
+  // Главный результат: две постановки дают разные ответы, и панель обязана
+  // показывать обе, а не молча выбирать одну.
+  const single = rows.filter((r) => r.pareto);
+  const durOf = (list) => [...new Set(list.map((r) => r.duration))].sort((a, b) => durDays(a) - durDays(b));
+  const same = res.rows.filter((r) => single.includes(r)).length;
+  console.log(
+    `       фронт подписки: ${durOf(single).join(' ')} (${single.length} строк) · ` +
+      `фронт стратегии: ${durOf(res.rows).join(' ')} (${res.rows.length} строк) · общих ${same}`,
+  );
+  ok(
+    'две постановки дают существенно разные ответы',
+    same < Math.min(single.length, res.rows.length) * 0.7,
+    `совпадает ${same} оферт из ${Math.min(single.length, res.rows.length)}`,
   );
 }
 

@@ -6,6 +6,7 @@
 
 import {
   normCdf,
+  normInv,
   black76Put,
   black76Call,
   impliedVol,
@@ -18,6 +19,10 @@ import {
   logReturns,
   empiricalCdf,
   empiricalShortfall,
+  empiricalLossProfile,
+  rnLossProfile,
+  martingaleShift,
+  median,
   paretoFront,
   basisFromConversion,
   breakevenStrike,
@@ -27,6 +32,7 @@ import {
   truncate,
   MS_DAY,
 } from '../web/quant.js';
+import { History, annualize, computeStrategy, analyzeSellHigh, pickBest } from '../web/model.js';
 import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry } from '../web/surface.js';
 import { fetchProducts, fetchQuote, fetchOptionTickers, fetchSpot } from '../web/feeds.js';
 
@@ -65,6 +71,24 @@ near('N(-3)', normCdf(-3), 0.001349898031630095, 1e-16);
   ok('N(-6) хвост', Math.abs(got / want - 1) < 1e-8, `относительная ошибка ${(got / want - 1).toExponential(2)}`);
 }
 ok('N монотонна', normCdf(-0.5) < normCdf(0) && normCdf(0) < normCdf(0.5));
+
+{
+  // Обратная функция нужна для стресс-квантиля: «куда уйдёт цена в худших 5%».
+  // Проверяем не саму формулу, а тождество N(N⁻¹(p)) = p, в том числе в хвостах.
+  let worst = 0;
+  let worstP = null;
+  for (let p = 1e-7; p < 1; p *= 1.3) {
+    const err = Math.abs(normCdf(normInv(p)) / p - 1);
+    if (err > worst) {
+      worst = err;
+      worstP = p;
+    }
+  }
+  ok('N(N⁻¹(p)) = p во всём диапазоне', worst < 1e-10, `максимум ${worst.toExponential(2)} при p=${worstP.toExponential(1)}`);
+  near('N⁻¹(0.5) = 0', normInv(0.5), 0, 1e-12);
+  near('N⁻¹(0.05)', normInv(0.05), -1.6448536269514729, 1e-9);
+  ok('N⁻¹ монотонна', normInv(0.01) < normInv(0.5) && normInv(0.5) < normInv(0.99));
+}
 
 // ────────────────────────────────────────────── 2. Блэк-76
 
@@ -219,6 +243,28 @@ section('Оценка оферты и премия сверх справедли
   const disc = valueOffer({ direction: 'BuyLow', strike: K, apy: apyFair, timing, forward: F, sigma, riskFree: 0.0166 });
   ok('учёт безрисковой ставки уменьшает премию', disc.edgeApr < fair.edgeApr);
   near('премия падает примерно на безрисковую ставку', fair.edgeApr - disc.edgeApr, 0.0166, 5e-4);
+
+  // Дисконтирование у направлений разное, и это принципиально.
+  //
+  // Sell High вложен в биткоин, а его выплата уже нормирована на форвард —
+  // деление на F само по себе содержит долларовый дисконт. Умножать сверху ещё
+  // и на долларовую ставку значит применить её дважды. Здесь проверяется, что
+  // ставка USDT на Sell High больше не влияет вовсе, а влияет ставка по монете.
+  const shArgs = { direction: 'SellHigh', strike: 66000, apy: 0.4, timing, forward: F, sigma };
+  const shPlain = valueOffer({ ...shArgs });
+  const shUsdt = valueOffer({ ...shArgs, riskFree: 0.05 });
+  const shBtc = valueOffer({ ...shArgs, riskFreeBtc: 0.05 });
+  near('ставка USDT не входит в оценку Sell High', shUsdt.fairValue, shPlain.fairValue, 1e-15);
+  ok('ставка по биткоину входит и снижает оценку', shBtc.fairValue < shPlain.fairValue);
+  near(
+    'её вклад равен простою монеты под этой ставкой',
+    shBtc.fairValue / shPlain.fairValue,
+    Math.exp((-0.05 * timing.lockDays) / 365),
+    1e-12,
+  );
+  // А у Buy Low всё наоборот: долларовая ставка входит, ставка по монете — нет.
+  const blBtc = valueOffer({ direction: 'BuyLow', strike: K, apy: apyFair, timing, forward: F, sigma, riskFreeBtc: 0.05 });
+  near('ставка по биткоину не входит в оценку Buy Low', blBtc.fairValue, fair.fairValue, 1e-15);
 }
 
 // ────────────────────────────────────────────── 6. Эмпирика
@@ -289,6 +335,195 @@ section('Себестоимость после конвертации');
   near('длительность = первая блокировка плюс остальные обороты', chained.days, 1.6 + (chained.cycles - 1) * 2, 1e-12, ' сут');
   const none = cyclesToRecover(60000, 62000, 0.4, 1, 1.6);
   ok('рынок выше себестоимости — циклы не нужны', none.cycles === 0);
+}
+
+// ────────────────────────────────────────────── 8a. Глубина конвертации
+
+section('Глубина конвертации');
+{
+  const F = 63000;
+  const K = 58000;
+  const sigma = 0.5;
+  const T = 30 / 365;
+  const p = rnLossProfile({ direction: 'BuyLow', forward: F, strike: K, sigma, Teff: T, spot: 62000 });
+  // Безусловная потеря — это цена пута в долях страйка, условная — она же,
+  // делённая на вероятность конвертации. Тождество обязано выполняться точно.
+  const put = black76Put(F, K, sigma, T);
+  const v = sigma * Math.sqrt(T);
+  const d2 = (Math.log(F / K) + (v * v) / 2) / v - v;
+  near('безусловная потеря = Put/K', p.expected, put / K, 1e-15);
+  near('условная потеря = безусловная / P(конв)', p.conditional, put / K / normCdf(-d2), 1e-12);
+  ok('условная потеря больше безусловной', p.conditional > p.expected);
+  ok('стресс-потеря не меньше условной', p.stress >= p.conditional, `${(p.stress * 100).toFixed(2)}% против ${(p.conditional * 100).toFixed(2)}%`);
+
+  // Далёкий страйк: в худших 5% исходов цена до него всё равно не доходит.
+  const far = rnLossProfile({ direction: 'BuyLow', forward: F, strike: 30000, sigma, Teff: T, spot: 62000 });
+  ok('на далёком страйке стресс-потери нет', far.stress === 0, `${far.stress}`);
+
+  // Чем ближе страйк к рынку, тем больше теряется в среднем.
+  const near_ = rnLossProfile({ direction: 'BuyLow', forward: F, strike: 62000, sigma, Teff: T, spot: 62000 });
+  ok('ближний страйк теряет больше дальнего', near_.expected > p.expected);
+
+  // Sell High: потеря считается от стоимости монеты, а не от страйка.
+  const sh = rnLossProfile({ direction: 'SellHigh', forward: F, strike: 66000, sigma, Teff: T, spot: 62000 });
+  near('Sell High: безусловная потеря = Call/spot', sh.expected, black76Call(F, 66000, sigma, T) / 62000, 1e-15);
+
+  // Эмпирический профиль на ряде с известным поведением.
+  const closes = Array.from({ length: 400 }, (_, k) => 100 * 1.01 ** k);
+  const r5 = logReturns(closes, 5);
+  const emp = empiricalLossProfile(r5, 100, 90, 'BuyLow');
+  ok('на растущем ряду ниже страйка потерь нет', emp.expected === 0 && emp.stress === 0);
+  const emp2 = empiricalLossProfile(r5, 100, 200, 'BuyLow');
+  ok('выше страйка потери есть и условная больше безусловной', emp2.expected > 0 && emp2.conditional >= emp2.expected);
+}
+
+// ────────────────────────────────────────────── 8b. Мартингальное центрирование
+
+section('Приведение истории к рынку');
+{
+  // Выпуклость экспоненты: если центрировать логарифмы на ln(F/S), то среднее
+  // самой цены окажется выше форварда, и в меру риска попадёт скрытый прогноз
+  // роста. Поправка обязана убирать это ровно.
+  const raw = Array.from({ length: 2001 }, (_, k) => (k - 1000) / 1000);
+  const target = 1.03;
+  const shifted = raw.map((r) => r + Math.log(target));
+  const meanBefore = shifted.reduce((a, x) => a + Math.exp(x), 0) / shifted.length;
+  ok('без поправки среднее цены выше форварда', meanBefore > target, `${meanBefore.toFixed(5)} против ${target}`);
+  const fix = martingaleShift(shifted, target);
+  const after = shifted.map((r) => r + fix);
+  const meanAfter = after.reduce((a, x) => a + Math.exp(x), 0) / after.length;
+  near('после поправки E[S_T] = F', meanAfter, target, 1e-12);
+  ok('поправка отрицательна', fix < 0, `${fix.toFixed(6)}`);
+  ok('порядок выборки сохранён', after.every((x, k) => k === 0 || x >= after[k - 1]));
+}
+
+// ────────────────────────────────────────────── 8c. Приведение к году
+
+section('Приведение стоимости к году');
+{
+  near('удвоение за полгода', annualize(2, 182.5), 3, 1e-9);
+  near('горизонт в год не меняет число', annualize(1.25, 365), 0.25, 1e-12);
+  ok('падение даёт отрицательную ставку', annualize(0.9, 90) < 0);
+  ok('нулевая стоимость не считается', annualize(0, 90) === null && annualize(1.1, 0) === null);
+  near('медиана нечётного набора', median([3, 1, 2]), 2, 0);
+  near('медиана чётного набора', median([4, 1, 2, 3]), 2.5, 0);
+}
+
+// ────────────────────────────────────────────── 8d. Траектории и стратегия
+
+section('Траектории, накопление процента и стратегия');
+{
+  // Детерминированный ряд: 0.1% в сутки. На нём известен каждый ответ.
+  const step = MS_DAY;
+  const series = Array.from({ length: 400 }, (_, k) => [k * step, 100 * 1.001 ** k]);
+  const hist = new History({ D: { stepMs: step, series } });
+
+  const paths = hist.pathSeries(2, 20);
+  ok('циклов внутри горизонта', paths.cycles === 10, `${paths.cycles}`);
+  ok('хвост горизонта пуст при кратном цикле', paths.tailDays === 0);
+  near('терминальная цена берётся на горизонте, а не на последнем цикле', paths.terminal[0], 1.001 ** 20, 1e-12);
+  near('нарастающий минимум растущего ряда — первая контрольная точка', paths.runMin[9], 1.001 ** 2, 1e-12);
+  near('нарастающий максимум — последняя', paths.runMax[9], 1.001 ** 20, 1e-12);
+
+  const ext = hist.pathExtremes(2, 20);
+  ok('сортированные ряды согласованы с попутевыми', ext.paths === paths.paths && ext.cycles === paths.cycles);
+  near('вероятность уйти ниже первой точки равна нулю', empiricalCdf(ext.minima, 1.001 ** 2 - 1e-9), 0, 0);
+  near('вероятность дойти до последней точки равна единице', 1 - empiricalCdf(ext.maxima, 1.001 ** 20 - 1e-9), 1, 0);
+
+  // Хвост: горизонт 21 день при цикле 2 оставляет один день незакрытым.
+  const odd = hist.pathSeries(2, 21);
+  ok('хвост горизонта посчитан', odd.cycles === 10 && odd.tailDays === 1, `циклов ${odd.cycles}, хвост ${odd.tailDays}`);
+
+  const timing = { cycleDays: 2, yieldDays: 1, lockDays: 1.5 };
+  const mkRow = (strike, i) => ({ strike, i, apy: (i * 365) / 1, aprEff: 0.1, duration: '1d', productId: 'x', timing });
+
+  // Стратегия: страйк ниже любой контрольной точки — конвертации нет никогда.
+  const safe = mkRow(90, 0.001);
+  computeStrategy({ rows: [safe], history: hist, spot: 100, horizonDays: 20, riskFree: 0 });
+  ok('без конвертации риск нулевой', safe.strategy.pEndBtc === 0);
+  near('без конвертации стоимость = (1+i)^n', safe.strategy.value, 1.001 ** 10, 1e-12);
+  near('среднее и медиана совпадают на детерминированном ряду', safe.strategy.valueMedian, safe.strategy.value, 1e-12);
+
+  // Для конвертации цена обязана уйти ВНИЗ, поэтому падающий ряд: 0.1% в сутки.
+  const down = Array.from({ length: 400 }, (_, k) => [k * step, 100 * 0.999 ** k]);
+  const histDown = new History({ D: { stepMs: step, series: down } });
+  // Страйк 99.9 пробивается уже первой контрольной точкой (0.999² = 0.998001).
+  const hot = mkRow(99.9, 0.001);
+  computeStrategy({ rows: [hot], history: histDown, spot: 100, horizonDays: 20, riskFree: 0 });
+  ok('конвертация случается на каждой траектории', hot.strategy.pEndBtc === 1);
+  near(
+    'после конвертации капитал равен (1+i)·S_H/K',
+    hot.strategy.value,
+    (1.001 * (0.999 ** 20 * 100)) / 99.9,
+    1e-12,
+  );
+  // Более глубокий страйк пробивается позже, значит процент успевает начислиться
+  // больше раз — но и монета достаётся дешевле.
+  const deep = mkRow(99.0, 0.001);
+  computeStrategy({ rows: [deep], history: histDown, spot: 100, horizonDays: 20, riskFree: 0 });
+  const hitCycle = Math.ceil(Math.log(0.99) / Math.log(0.999) / 2);
+  near(
+    'конвертация на более глубоком страйке считает больше циклов процента',
+    deep.strategy.value,
+    (1.001 ** hitCycle * (0.999 ** 20 * 100)) / 99.0,
+    1e-12,
+  );
+
+  // Хвост горизонта приносит безрисковый процент только если конвертации не было.
+  const withTail = mkRow(90, 0.001);
+  computeStrategy({ rows: [withTail], history: hist, spot: 100, horizonDays: 21, riskFree: 0.365 });
+  near('хвост горизонта оплачен по безрисковой ставке', withTail.strategy.value, 1.001 ** 10 * 1.001, 1e-12);
+
+  // Sell High: процент накапливается по числу циклов до выхода.
+  // Страйк 100.3 пробивается второй контрольной точкой (1.004006), а не первой.
+  const sellRow = {
+    strike: 100.3,
+    i: 0.001,
+    apy: 0.365,
+    aprEff: 0.1,
+    duration: '1d',
+    productId: 's',
+    timing,
+    shortfall: null,
+    pRN: 0.5,
+    pHist: 0.5,
+    histInfo: { independent: 999 },
+  };
+  const an = analyzeSellHigh({ rows: [sellRow], basis: 100, qty: 1, spot: 100, history: hist, horizonDays: 20, riskFree: 0 });
+  const s = an[0];
+  ok('выход состоялся на всех траекториях', s.pExitHorizon === 1);
+  near('прибыль за один цикл считает один процент', s.profitPct, (1.001 * 100.3) / 100 - 1, 1e-12);
+  near('прибыль к выходу считает процент за все циклы до него', s.profitAtExit, (1.001 ** 2 * 100.3) / 100 - 1, 1e-12);
+  ok('накопление увеличивает прибыль', s.profitAtExit > s.profitPct);
+  near('скорость выхода = прибыль × шанс × 365 / H', s.exitSpeed, (s.profitAtExit * s.pExitHorizon * 365) / 20, 1e-12);
+  ok('полное матожидание посчитано по обеим ветвям', Number.isFinite(s.fullRate) && Number.isFinite(s.fullMedianRate));
+  ok('база сравнения приложена к результату', an.baseline != null && Number.isFinite(an.baseline.holdRate));
+}
+
+// ────────────────────────────────────────────── 8e. Отбор в блок «оптимальные»
+
+section('Отбор карточек');
+{
+  const mk = (id, aprEff, pConv, volEdge) => ({
+    productId: id,
+    duration: '1d',
+    strike: 1,
+    aprEff,
+    pConv,
+    volEdge,
+    moneyness: -0.01,
+  });
+  // Фронт из семи точек: доходность растёт вместе с риском.
+  const rows = Array.from({ length: 7 }, (_, k) => mk(`p${k}`, 0.02 * (k + 1), 0.02 * (k + 1), -0.1 + 0.01 * (k === 2 ? 9 : k)));
+  const best = pickBest({ rows, maxP: 0.5 });
+  ok('карточек не больше лимита', best.length <= 6, `${best.length}`);
+  ok('максимум доходности показан и подписан', best.some((r) => (r.bestTag ?? '').includes('максимум доходности') && r.aprEff === 0.14));
+  ok('лучшая цена риска показана и подписана', best.some((r) => (r.bestTag ?? '').includes('лучшая цена риска') && r.productId === 'p2'));
+  // Главное: блок больше не состоит из одного края фронта.
+  const span = Math.max(...best.map((r) => r.pConv)) - Math.min(...best.map((r) => r.pConv));
+  const full = Math.max(...rows.map((r) => r.pConv)) - Math.min(...rows.map((r) => r.pConv));
+  ok('срез покрывает размах фронта, а не его край', span >= full * 0.9, `${(span * 100).toFixed(1)} из ${(full * 100).toFixed(1)} п.п.`);
+  ok('карточки упорядочены от осторожных к доходным', best.every((r, k) => k === 0 || r.pConv >= best[k - 1].pConv));
 }
 
 // ────────────────────────────────────────────── 9. Разбор символов опционов

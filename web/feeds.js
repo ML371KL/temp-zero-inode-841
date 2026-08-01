@@ -44,10 +44,15 @@ export async function fetchSpot() {
   return t ? Number(t.lastPrice) : null;
 }
 
-/** Гибкий депозит USDT — безрисковая альтернатива, с которой сравниваем. */
-export async function fetchRiskFree() {
+/**
+ * Гибкий депозит — альтернатива, с которой сравниваем.
+ * USDT задаёт стоимость денег для Buy Low, BTC — стоимость запертой монеты для
+ * Sell High. Ставки разные (по BTC она близка к нулю), и подставлять долларовую
+ * в оценку позиции в биткоине нельзя.
+ */
+export async function fetchRiskFree(coin = 'USDT') {
   try {
-    const r = await get('/v5/earn/product', { category: 'FlexibleSaving', coin: 'USDT' });
+    const r = await get('/v5/earn/product', { category: 'FlexibleSaving', coin });
     const p = (r.list || [])[0];
     if (!p) return null;
     // Верхняя ступень лестницы: базовая ставка на крупные суммы, без промо-траншей.
