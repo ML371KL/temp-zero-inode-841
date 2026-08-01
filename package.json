@@ -5,14 +5,14 @@
   "type": "module",
   "description": "Радар котировок Bybit Dual Assets BTC/USDT: эффективный APR, вероятность конвертации, подбор Sell High",
   "scripts": {
-    "test": "node scripts/selftest.mjs",
+    "test": "node --use-env-proxy scripts/selftest.mjs",
     "test:offline": "node scripts/selftest.mjs --offline",
-    "audit": "node scripts/audit.mjs",
-    "record": "node scripts/record.mjs --out data-branch",
-    "backtest": "node scripts/backtest.mjs",
+    "audit": "node --use-env-proxy scripts/audit.mjs",
+    "record": "node --use-env-proxy scripts/record.mjs --out data-branch",
+    "backtest": "node --use-env-proxy scripts/backtest.mjs",
     "serve": "python -m http.server 8642 --directory web"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=24"
   }
 }

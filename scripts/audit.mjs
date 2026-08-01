@@ -257,6 +257,34 @@ console.log('\n── 3. Волатильность оферты и премия
   }
   ok('знаки премии по волатильности и по доходности согласованы', signBad.length === 0, signBad.slice(0, 3).join('; ') || 'ок');
 
+  // Кривая «эквивалент цены опциона» на графике лестницы. Проверяем, что она
+  // действительно получена из цены опциона, а не из чего-то ещё: обратный
+  // пересчёт ставки в цену пута обязан вернуть исходную цену.
+  let fairBad = 0;
+  let fairWorst = 0;
+  for (const r of buy) {
+    if (!Number.isFinite(r.fairAprEff) || !(r.sigma > 0)) continue;
+    const iFair = (r.fairAprEff * r.timing.lockDays) / YEAR_DAYS;
+    const priceFromRate = (r.strike * iFair) / (1 + iFair);
+    const priceDirect = black76Put(r.forward, r.strike, r.sigma, r.Teff);
+    const rel = Math.abs(priceFromRate - priceDirect) / r.strike;
+    fairWorst = Math.max(fairWorst, rel);
+    if (rel > 1e-9) fairBad++;
+  }
+  ok('кривая справедливой ставки восстанавливает цену опциона', fairBad === 0, `максимальная невязка ${fairWorst.toExponential(2)}`);
+
+  // Взаимное расположение двух кривых обязано совпадать со знаком премии:
+  // ставка Bybit ниже справедливой ровно тогда, когда премия отрицательна.
+  const orderBad = buy.filter(
+    (r) =>
+      Number.isFinite(r.fairAprEff) &&
+      Number.isFinite(r.aprEff) &&
+      Number.isFinite(r.volEdge) &&
+      Math.abs(r.aprEff - r.fairAprEff) > 1e-9 &&
+      Math.sign(r.aprEff - r.fairAprEff) !== Math.sign(r.volEdge),
+  );
+  ok('положение кривых согласовано со знаком премии', orderBad.length === 0, `расхождений ${orderBad.length}`);
+
   const sellSign = sell.filter((r) => {
     if (r.offerVol == null || !(r.i > 0)) return false;
     const target = (r.forward * r.i) / (1 + r.i);

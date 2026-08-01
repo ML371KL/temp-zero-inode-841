@@ -4,8 +4,8 @@
     {
       "name": "dual-assets",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "http.server", "5173", "--directory", "web"],
-      "port": 5173
+      "runtimeArgs": ["-m", "http.server", "8642", "--directory", "web"],
+      "port": 8642
     }
   ]
 }

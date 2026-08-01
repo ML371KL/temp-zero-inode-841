@@ -572,7 +572,11 @@ function renderAnchors(rows) {
     const d = a.dominator;
     cards.push(`
       <article class="anchor" data-product="${r.productId}">
-        <div class="anchor-title">${meta.title}</div>
+        <div class="anchor-title"${
+          d
+            ? ` title="Вне фронта Парето: ${d.duration} со страйком ${fmtUsd(d.strike, 2)} даёт ${fmtPct(d.aprEff, 1)} против ${fmtPct(r.aprEff, 1)} при вероятности ${fmtPct(d.pConv, 2)} против ${fmtPct(r.pConv, 2)}. Якорь всё равно осмыслен: его страйк глубже, и при конвертации BTC достаётся дешевле."`
+            : ''
+        }>${meta.title}${d ? ' <span class="muted">(вне фронта Парето)</span>' : ''}</div>
         <div class="anchor-value">${meta.key === 'volEdge' ? fmtSigned(a.value, 2) : fmtPct(a.value, 1)}</div>
         <div class="anchor-line">
           ${r.duration}${r.isVip ? ' · VIP' : ''} · страйк <b>${fmtUsd(r.strike, 2)}</b> (${fmtSigned(r.moneyness, 2)})
@@ -581,14 +585,6 @@ function renderAnchors(rows) {
           APR эфф. ${fmtPct(r.aprEff, 1)} · в цикле ${fmtPct(r.aprChained, 1)} · P(конв) ${fmtPct(r.pConv, 2)}
         </div>
         <div class="anchor-hint">${meta.hint}</div>
-        ${
-          d
-            ? `<div class="anchor-warn">Вне фронта Парето: ${d.duration} со страйком ${fmtUsd(d.strike, 2)}
-               даёт больше доходности (${fmtPct(d.aprEff, 1)} против ${fmtPct(r.aprEff, 1)}) при меньшем риске
-               (${fmtPct(d.pConv, 2)} против ${fmtPct(r.pConv, 2)}). Этот якорь всё равно осмыслен: его страйк глубже,
-               и при конвертации BTC достаётся дешевле — пара «доходность и вероятность» глубину не измеряет.</div>`
-            : ''
-        }
       </article>`);
   }
   box.innerHTML = cards.join('') || '<div class="empty">нет данных для оценки</div>';

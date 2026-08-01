@@ -359,10 +359,18 @@ h2 {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
   gap: 16px;
+  /* Внутренние панели свой нижний отступ теряют, поэтому его несёт сама
+     секция: без этого следующий блок вплотную упирался в графики. */
+  margin-bottom: 16px;
 }
 
 .grid2 .panel {
   margin-bottom: 0;
+}
+
+/* Подписи графика у самого края полотна не должны вылезать за панель. */
+.chart svg {
+  overflow: hidden;
 }
 
 /* ───────────────────────────────────────── карточки лучших */
@@ -575,6 +583,7 @@ tr.dim td {
 
 .anchor-title {
   font-size: 11px;
+  cursor: help;
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--ink-3);
@@ -604,15 +613,6 @@ tr.dim td {
   color: var(--ink-3);
   font-family: var(--mono);
   font-size: 11px;
-}
-
-.anchor-warn {
-  font-size: 11px;
-  color: var(--warn);
-  margin-top: 7px;
-  line-height: 1.45;
-  border-top: 1px solid color-mix(in srgb, var(--warn) 28%, transparent);
-  padding-top: 6px;
 }
 
 .flag {
