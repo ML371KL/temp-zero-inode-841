@@ -45,9 +45,12 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
     return;
   }
 
-  const W = 560;
-  const H = 340;
-  const M = { top: 16, right: 18, bottom: 34, left: 48 };
+  // Полотно намеренно широкое: SVG растягивается по ширине панели, поэтому
+  // чем больше система координат, тем мельче на экране окажутся точки, подписи
+  // и штрихи. При узком полотне кружки раздувались и закрывали саму линию.
+  const W = 960;
+  const H = 420;
+  const M = { top: 18, right: 22, bottom: 40, left: 56 };
   const iw = W - M.left - M.right;
   const ih = H - M.top - M.bottom;
 
@@ -114,9 +117,9 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
       class: 'pt',
       cx: x(r.pConv),
       cy: y(r.aprEff),
-      r: 2.6,
+      r: 3,
       fill: 'var(--ink-3)',
-      'fill-opacity': 0.28,
+      'fill-opacity': 0.25,
       stroke: 'none',
     });
     if (onHover) {
@@ -133,10 +136,10 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
       class: 'pt',
       cx: x(r.pConv),
       cy: y(r.aprEff),
-      r: 5.5,
+      r: 4,
       fill: c,
       stroke: 'var(--panel)',
-      'stroke-width': r.isVip ? 2 : 1,
+      'stroke-width': r.isVip ? 1.6 : 0.8,
     });
     if (onHover) {
       node.addEventListener('mouseenter', (e) => onHover(r, e));
@@ -145,19 +148,22 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
     g.append(node);
   }
 
-  // Подписываем только те точки фронта, что не налезают друг на друга.
-  let lastLabelX = -1e9;
-  let lastLabelY = -1e9;
+  // Подписи чередуются сверху и снизу от точки: на плотных участках фронта
+  // односторонние подписи налезали друг на друга и на сами кружки.
+  const placed = [];
+  let above = true;
   for (const r of front) {
     const px = x(r.pConv);
     const py = y(r.aprEff);
-    if (Math.abs(px - lastLabelX) < 42 && Math.abs(py - lastLabelY) < 16) continue;
-    lastLabelX = px;
-    lastLabelY = py;
+    const collides = placed.some((p) => Math.abs(p.x - px) < 54 && Math.abs(p.y - py) < 13);
+    if (collides) continue;
+    const dy = above ? -9 : 15;
+    above = !above;
+    placed.push({ x: px, y: py + dy });
     const label = el(
       'text',
-      { x: px + 8, y: py - 7, 'font-size': 9.5, 'font-family': 'ui-monospace, monospace' },
-      `${Math.round(r.strike / 100) / 10}k · ${r.duration}`,
+      { x: px + 7, y: py + dy, 'font-size': 10, 'font-family': 'ui-monospace, monospace' },
+      `${Math.round(r.strike / 100) / 10}k·${r.duration}`,
     );
     label.setAttribute('fill', 'var(--ink-2)');
     g.append(label);

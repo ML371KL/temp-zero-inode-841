@@ -86,7 +86,10 @@
 
     <section class="panel frontier">
       <div class="panel-head">
-        <h2>Весь фронт Парето, без порога</h2>
+        <div class="head-row">
+          <h2>Весь фронт Парето, без порога</h2>
+          <button class="collapse" data-collapse="frontier"></button>
+        </div>
         <div class="hint">
           все неулучшаемые оферты от минимального риска к максимальному. Колонка «цена шага»
           показывает, сколько процентных пунктов APR добавляет один процентный пункт риска
@@ -95,13 +98,16 @@
         </div>
       </div>
       <div class="anchors" id="anchors"></div>
-      <div class="table-wrap">
-        <table id="frontier-table">
-          <thead></thead>
-          <tbody></tbody>
-        </table>
+      <div class="panel-body" data-body="frontier">
+        <div class="table-wrap">
+          <table id="frontier-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <button class="more" data-more="frontier"></button>
+        <div class="hint" id="frontier-note"></div>
       </div>
-      <div class="hint" id="frontier-note"></div>
     </section>
 
     <section class="grid2">
@@ -126,14 +132,20 @@
 
     <section class="panel">
       <div class="panel-head">
-        <h2>Все оферты Buy Low</h2>
+        <div class="head-row">
+          <h2>Все оферты Buy Low</h2>
+          <button class="collapse" data-collapse="buy"></button>
+        </div>
         <div class="hint" id="buy-count"></div>
       </div>
-      <div class="table-wrap">
-        <table id="buy-table">
-          <thead></thead>
-          <tbody></tbody>
-        </table>
+      <div class="panel-body" data-body="buy">
+        <div class="table-wrap">
+          <table id="buy-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <button class="more" data-more="buy"></button>
       </div>
     </section>
 
@@ -181,11 +193,18 @@
       <div class="basis-line" id="basis-line"></div>
       <div class="best-sell-head" id="best-sell-head"></div>
       <div class="cards" id="best-sell"></div>
-      <div class="table-wrap">
-        <table id="sell-table">
-          <thead></thead>
-          <tbody></tbody>
-        </table>
+      <div class="head-row sell-table-head">
+        <h3>Все оферты Sell High</h3>
+        <button class="collapse" data-collapse="sell"></button>
+      </div>
+      <div class="panel-body" data-body="sell">
+        <div class="table-wrap">
+          <table id="sell-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <button class="more" data-more="sell"></button>
       </div>
     </section>
 

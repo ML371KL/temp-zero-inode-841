@@ -60,7 +60,14 @@ const ui = {
   convWasDual: true,
   convApy: '',
   convDuration: '1',
+  // Свёрнутые панели и таблицы, показанные целиком. Длинные списки по
+  // умолчанию обрезаются: страница про решение, а не про перечисление.
+  collapsed: {},
+  expanded: {},
 };
+
+// Сколько строк показывать в длинной таблице до нажатия «показать все».
+const ROW_PREVIEW = 8;
 
 function loadPrefs() {
   try {
@@ -422,6 +429,30 @@ function renderTable(table, columns, rows, rowClass) {
     .join('');
 }
 
+/** Таблица с обрезкой длинного хвоста и кнопкой «показать все». */
+function renderLimitedTable(key, table, columns, rows, rowClass) {
+  const expanded = !!ui.expanded[key];
+  renderTable(table, columns, expanded ? rows : rows.slice(0, ROW_PREVIEW), rowClass);
+  const btn = document.querySelector(`[data-more="${key}"]`);
+  if (!btn) return;
+  btn.hidden = rows.length <= ROW_PREVIEW;
+  btn.textContent = expanded
+    ? `свернуть до ${ROW_PREVIEW} строк`
+    : `показать все ${rows.length} — сейчас видно ${Math.min(ROW_PREVIEW, rows.length)}`;
+}
+
+/** Синхронизация кнопок сворачивания с сохранённым состоянием. */
+function syncCollapse() {
+  for (const btn of document.querySelectorAll('[data-collapse]')) {
+    const key = btn.dataset.collapse;
+    const body = document.querySelector(`[data-body="${key}"]`);
+    if (!body) continue;
+    const off = !!ui.collapsed[key];
+    body.classList.toggle('collapsed', off);
+    btn.textContent = off ? 'развернуть' : 'свернуть';
+  }
+}
+
 function renderBuy(rows) {
   const best = pickBest({ rows, maxP: ui.maxP });
   if (best.length) {
@@ -444,7 +475,7 @@ function renderBuy(rows) {
   $('buy-count').textContent =
     `${rows.length} оферт${rows.length ? '' : ''} · ${new Set(rows.map((r) => r.productId)).size} продуктов` +
     (ui.vip ? ' · VIP включены' : ' · только общедоступные');
-  renderTable($('buy-table'), BUY_COLUMNS, sorted, (r) => (r.pareto ? 'pareto' : ''));
+  renderLimitedTable('buy', $('buy-table'), BUY_COLUMNS, sorted, (r) => (r.pareto ? 'pareto' : ''));
   renderAnchors(rows);
   renderFrontier(rows);
 
@@ -541,7 +572,7 @@ function renderFrontier(rows) {
   const steps = frontierWithMargins(rows, rf);
   // Оферта ниже безрисковой ставки формально на фронте, но экономически
   // бессмысленна: тот же результат даёт гибкий депозит без всякого риска.
-  renderTable($('frontier-table'), FRONTIER_COLUMNS, steps, (r) =>
+  renderLimitedTable('frontier', $('frontier-table'), FRONTIER_COLUMNS, steps, (r) =>
     [r.aprEff < rf ? 'dim' : '', r.pConv <= ui.maxP ? 'within' : ''].filter(Boolean).join(' '),
   );
 
@@ -588,7 +619,7 @@ function renderSell(rows) {
       'Введите цену покупки BTC — появится себестоимость, порог безубытка и подобранные оферты Sell High.';
     $('best-sell').innerHTML = '';
     $('best-sell-head').innerHTML = '';
-    renderTable($('sell-table'), SELL_COLUMNS, []);
+    renderLimitedTable('sell', $('sell-table'), SELL_COLUMNS, []);
     return;
   }
 
@@ -620,7 +651,9 @@ function renderSell(rows) {
     ? best.rows.map((r) => sellCardFor(r, best.mode)).join('')
     : '<div class="empty">нет доступных оферт Sell High при текущих фильтрах</div>';
 
-  renderTable($('sell-table'), SELL_COLUMNS, analyzed, (r) => (r.profitable ? (r.sellPareto ? 'pareto' : '') : 'dim'));
+  renderLimitedTable('sell', $('sell-table'), SELL_COLUMNS, analyzed, (r) =>
+    r.profitable ? (r.sellPareto ? 'pareto' : '') : 'dim',
+  );
 }
 
 function renderDiag() {
@@ -804,13 +837,33 @@ function bindControls() {
     render();
   };
 
-  // Клик по строке или карточке переключает лестницу страйков на этот продукт.
   document.body.addEventListener('click', (e) => {
+    const collapse = e.target.closest('[data-collapse]');
+    if (collapse) {
+      const key = collapse.dataset.collapse;
+      ui.collapsed[key] = !ui.collapsed[key];
+      savePrefs();
+      syncCollapse();
+      return;
+    }
+
+    const more = e.target.closest('[data-more]');
+    if (more) {
+      const key = more.dataset.more;
+      ui.expanded[key] = !ui.expanded[key];
+      savePrefs();
+      render();
+      return;
+    }
+
+    // Клик по строке или карточке переключает лестницу страйков на этот продукт.
     const holder = e.target.closest('[data-product]');
     if (!holder) return;
     state.ladderProduct = holder.dataset.product;
     render();
   });
+
+  syncCollapse();
 }
 
 // ───────────────────────────────────────────────────────── запуск

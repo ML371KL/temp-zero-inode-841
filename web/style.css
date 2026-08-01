@@ -287,11 +287,72 @@ h2 {
   margin-bottom: 12px;
 }
 
+/* Пояснения занимают всю ширину блока: ограничение по ширине раньше сжимало
+   их в узкую колонку и растягивало панели по высоте на ровном месте. */
 .hint {
   color: var(--ink-2);
   font-size: 12px;
   margin-top: 3px;
-  max-width: 78ch;
+}
+
+.head-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.head-row h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 620;
+}
+
+.sell-table-head {
+  margin: 4px 0 8px;
+}
+
+.collapse {
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--ink-2);
+  border-radius: 7px;
+  padding: 4px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+  flex: none;
+}
+
+.collapse:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+
+.panel-body.collapsed {
+  display: none;
+}
+
+.more {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  border: 1px dashed var(--line);
+  background: transparent;
+  color: var(--ink-2);
+  border-radius: 8px;
+  padding: 7px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.more:hover {
+  color: var(--ink);
+  border-color: var(--ink-3);
+}
+
+.more[hidden] {
+  display: none;
 }
 
 .grid2 {
@@ -558,7 +619,6 @@ tr.within td {
 
 #frontier-note {
   margin-top: 12px;
-  max-width: 92ch;
 }
 
 .best-sell-head {
@@ -618,11 +678,13 @@ tr.within td {
   cursor: pointer;
 }
 
+/* Линия фронта сплошная и приглушённая: она держит форму кривой, но не
+   спорит с точками, которые лежат поверх неё. */
 .front-line {
   fill: none;
   stroke: var(--accent);
   stroke-width: 1.6;
-  stroke-dasharray: 4 3;
+  stroke-opacity: 0.65;
 }
 
 .series-offer {
