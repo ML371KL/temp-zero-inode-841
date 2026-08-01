@@ -758,11 +758,22 @@ function renderSell(rows) {
     Рынок сейчас <b>${fmtUsd(state.spot, 2)}</b> —
     ${gap == null ? '' : gap < 0 ? `<span class="neg">на ${fmtPct(-gap, 2)} ниже себестоимости</span>` : `<span class="pos">на ${fmtPct(gap, 2)} выше себестоимости</span>`}.
     Безубыточных оферт: <b>${profitable.length}</b> из ${analyzed.length}.
-    ${
-      profitable.length
-        ? `Лучшая по доходности: <b>${fmtPct(profitable[0].aprEff, 2)}</b> эффективных при страйке <b>${fmtUsd(profitable[0].strike, 2)}</b> и вероятности продажи <b>${fmtPct(profitable[0].pConv, 1)}</b>.`
-        : 'Ни одна оферта не выводит в USDT без убытка — смотрите строку «циклов до безубытка»: процент в BTC постепенно закрывает разрыв.'
-    }`;
+    ${(() => {
+      if (!profitable.length) {
+        return 'Ни одна оферта не выводит в USDT без убытка — смотрите строку «циклов до безубытка»: процент в BTC постепенно закрывает разрыв.';
+      }
+      // Сводка обязана называть ту же оферту, что и отбор ниже. Здесь раньше
+      // стоял максимум эффективного APR — критерий, от которого блок ушёл,
+      // и строка противоречила собственным карточкам.
+      const pool = profitable.filter((r) => Number.isFinite(r.expProfitRate));
+      if (!pool.length) return '';
+      const best = pool.reduce((a, b) => (b.expProfitRate > a.expProfitRate ? b : a));
+      return (
+        `Лучшая по ожидаемой годовой доходности выхода: <b>${fmtPct(best.expProfitRate, 1)}</b> ` +
+        `при страйке <b>${fmtUsd(best.strike, 2)}</b> — прибыль <b>${fmtSigned(best.profitPct, 2)}</b> ` +
+        `с шансом <b>${fmtPct(best.pExitHorizon, 1)}</b> за ${ui.horizon} дней, ожидание <b>${fmtSpan(best.expExitDays)}</b>.`
+      );
+    })()}`;
 
   renderExitFrontier(analyzed);
 

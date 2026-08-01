@@ -551,6 +551,15 @@ tr.dim td {
   margin-bottom: 12px;
 }
 
+/* Селектор горизонта — отдельный орган управления, а не часть сводки под ним. */
+#horizon {
+  min-width: 160px;
+}
+
+.conv-inputs + .ctl {
+  margin-bottom: 14px;
+}
+
 .basis-line {
   font-size: 13px;
   padding: 10px 12px;

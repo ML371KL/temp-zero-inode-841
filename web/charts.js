@@ -139,14 +139,18 @@ export function scatterChart(container, rows, { durations, onHover, maxP } = {})
   // Точки фронта: цвет по сроку, обводка потолще у VIP, подпись со страйком.
   for (const r of front) {
     const c = durationColor(r.duration, durations);
+    // Заливка полупрозрачная: сплошные кружки закрывали линию фронта именно в
+    // точках перелома, то есть там, где смотреть и надо.
     const node = el('circle', {
       class: 'pt',
       cx: x(r.pConv),
       cy: y(r.aprEff),
       r: 4,
       fill: c,
-      stroke: 'var(--panel)',
-      'stroke-width': r.isVip ? 1.6 : 0.8,
+      'fill-opacity': 0.55,
+      stroke: c,
+      'stroke-width': r.isVip ? 1.8 : 1,
+      'stroke-opacity': 0.9,
     });
     if (onHover) {
       node.addEventListener('mouseenter', (e) => onHover(r, e));
@@ -314,9 +318,6 @@ export function ladderChart(container, rows, { title, onHover } = {}) {
   }
   g.append(legend);
 
-  const xl = el('text', { x: iw / 2, y: ih + 38, 'text-anchor': 'middle', 'font-size': FONT_AXIS }, 'страйк');
-  xl.setAttribute('fill', 'var(--ink-2)');
-  g.append(xl);
 
   container.append(svg);
 }
