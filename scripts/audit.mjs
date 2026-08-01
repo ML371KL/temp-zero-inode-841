@@ -16,12 +16,14 @@ import {
   fetchKlines,
 } from '../web/feeds.js';
 import { buildSurface, volAt, forwardAt } from '../web/surface.js';
+import { empiricalCdf } from '../web/quant.js';
 import {
   History,
   buildRows,
   pickBest,
   pickBestSell,
   analyzeSellHigh,
+  exitFrontier,
   frontierWithMargins,
   pickAnchors,
 } from '../web/model.js';
@@ -682,11 +684,16 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
   ok('режим определён верно', best.mode === (analyzed.some((r) => r.profitable) ? 'exit' : 'wait'), best.mode);
   if (best.mode === 'exit') {
     ok('в режиме выхода показаны только безубыточные', best.rows.every((r) => r.profitable));
-    const pool = analyzed.filter((r) => r.profitable && Number.isFinite(r.profitPct) && Number.isFinite(r.pConv));
+    const pool = analyzed.filter(
+      (r) => r.profitable && Number.isFinite(r.profitPct) && Number.isFinite(r.pExitHorizon),
+    );
     const dominated = (a) =>
       pool.some(
         (b) =>
-          b !== a && b.profitPct >= a.profitPct && b.pConv >= a.pConv && (b.profitPct > a.profitPct || b.pConv > a.pConv),
+          b !== a &&
+          b.profitPct >= a.profitPct &&
+          b.pExitHorizon >= a.pExitHorizon &&
+          (b.profitPct > a.profitPct || b.pExitHorizon > a.pExitHorizon),
       );
     const brute = pool.filter((r) => !dominated(r));
     const model = pool.filter((r) => r.sellPareto);
@@ -744,6 +751,68 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     'прибыль выхода = (1+i)K/себестоимость − 1',
     analyzed.every((r) => Math.abs(r.profitPct - (((1 + r.i) * r.strike) / basis - 1)) < 1e-12),
   );
+
+  // Горизонт выхода: приведение вероятностей к общему сроку.
+  {
+    const H = 90;
+    const withH = analyzed.filter((r) => Number.isFinite(r.pExitHorizon));
+    ok('шанс выхода посчитан для всех строк', withH.length === analyzed.length, `${withH.length} из ${analyzed.length}`);
+    ok('шанс выхода лежит в [0,1]', withH.every((r) => r.pExitHorizon >= 0 && r.pExitHorizon <= 1));
+    ok(
+      'оферта длиннее горизонта не даёт шанса выйти',
+      analyzed.filter((r) => r.timing.cycleDays > H).every((r) => r.pExitHorizon === 0),
+      `таких оферт ${analyzed.filter((r) => r.timing.cycleDays > H).length}`,
+    );
+    // Чем выше страйк, тем труднее до него дойти.
+    let mono = 0;
+    const grp = new Map();
+    for (const r of withH) {
+      if (!grp.has(r.productId)) grp.set(r.productId, []);
+      grp.get(r.productId).push(r);
+    }
+    for (const list of grp.values()) {
+      const srt = [...list].sort((a, b) => a.strike - b.strike);
+      for (let k = 1; k < srt.length; k++) if (srt[k].pExitHorizon > srt[k - 1].pExitHorizon + 1e-12) mono++;
+    }
+    ok('шанс выхода убывает со страйком', mono === 0, `нарушений ${mono}`);
+
+    // Зависимость соседних циклов обязана снижать оценку против формулы
+    // независимых попыток. Сравнение должно быть однородным по мере: рабочая
+    // вероятность строки взята из рынка опционов, а траекторная оценка — из
+    // истории, поэтому для формулы берём историческую же частоту за цикл.
+    let cmp = 0;
+    let higher = 0;
+    let worst = 0;
+    for (const r of withH) {
+      const n = r.horizonInfo?.cycles ?? 0;
+      if (n < 2 || !(r.pExitHorizon > 0)) continue;
+      const cycleRet = history.returns(r.timing.cycleDays);
+      if (!cycleRet?.sorted.length) continue;
+      const pCycleHist = 1 - empiricalCdf(cycleRet.sorted, Math.log(r.strike / spot));
+      if (!(pCycleHist > 0)) continue;
+      const indep = 1 - (1 - pCycleHist) ** n;
+      cmp++;
+      const gap = r.pExitHorizon - indep;
+      if (gap > 1e-9) higher++;
+      worst = Math.min(worst, gap);
+    }
+    ok(
+      'оценка по траекториям не выше формулы независимых попыток',
+      higher === 0,
+      `сравнено ${cmp}, выше у ${higher}, максимальное занижение ${(worst * 100).toFixed(1)} п.п.`,
+    );
+
+    // Фронт выхода упорядочен и цена шага пересчитана верно.
+    const steps = exitFrontier(analyzed);
+    ok('фронт выхода упорядочен по убыванию шанса', steps.every((r, k) => k === 0 || r[r.exitAxis] <= steps[k - 1][r.exitAxis] + 1e-12));
+    ok('прибыль вдоль фронта выхода не убывает', steps.every((r, k) => k === 0 || r.profitPct >= steps[k - 1].profitPct - 1e-12));
+    let margBad = 0;
+    for (let k = 1; k < steps.length; k++) {
+      const want = (steps[k].profitPct - steps[k - 1].profitPct) / (steps[k - 1][steps[k].exitAxis] - steps[k][steps[k].exitAxis]);
+      if (Number.isFinite(want) && Math.abs(steps[k].marginal - want) > 1e-9) margBad++;
+    }
+    ok('цена шага на фронте выхода пересчитана верно', margBad === 0, `строк ${steps.length}`);
+  }
 
   const flaggedSell = sell.filter((r) => r.laddered).length;
   ok(

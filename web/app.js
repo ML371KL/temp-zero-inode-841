@@ -20,6 +20,7 @@ import {
   pickBest,
   pickBestSell,
   analyzeSellHigh,
+  exitFrontier,
   frontierWithMargins,
   pickAnchors,
   MIN_INDEPENDENT_WINDOWS,
@@ -61,6 +62,7 @@ const ui = {
   convWasDual: true,
   convApy: '',
   convDuration: '1',
+  horizon: '90',
   // Свёрнутые панели и таблицы, показанные целиком. Длинные списки по
   // умолчанию обрезаются: страница про решение, а не про перечисление.
   collapsed: {},
@@ -423,6 +425,22 @@ function fmtMarginal(x) {
   return `<b class="${tone}">${x >= 100 ? '≫' : x.toFixed(2)}</b>`;
 }
 
+const EXIT_FRONT_COLUMNS = [
+  ['Срок', (r) => `${r.isVip ? '<span class="vip-badge">★</span> ' : ''}${r.duration}`, 'left'],
+  ['Страйк', (r) => `${fmtUsd(r.strike, 2)}${fmtLadderFlag(r)}`],
+  ['От спота', (r) => `<span class="muted">${fmtSigned(r.moneyness, 2)}</span>`],
+  ['Прибыль', (r) => `<b>${fmtSigned(r.profitPct, 2)}</b>`],
+  ['Шанс выйти', (r) => `<b>${fmtPct(r.pExitHorizon, 1)}</b>`],
+  ['Циклов', (r) => (r.horizonInfo ? String(r.horizonInfo.cycles) : '—')],
+  ['P за цикл', (r) => `<span class="muted">${fmtPct(r.pConv, 1)}</span>`],
+  ['Цикл', (r) => fmtSpan(r.timing.cycleDays)],
+  ['Прибавка', (r) => `<span class="${cls(r.gainProfit)}">${fmtSigned(r.gainProfit, 2)}</span>`],
+  ['Ценой шанса', (r) => `<span class="muted">${fmtSigned(r.costP == null ? null : -r.costP, 1)}</span>`],
+  ['Цена шага', (r) => fmtMarginal(r.marginal)],
+  ['APR в BTC', (r) => `<span class="muted">${fmtPct(r.aprEff, 1)}</span>`],
+  ['Сеттлмент', (r) => fmtTime(r.timing.settle)],
+];
+
 const SELL_COLUMNS = [
   ['Срок', (r) => `${r.isVip ? '<span class="vip-badge">★</span> ' : ''}${r.duration}`, 'left'],
   ['Страйк', (r) => `${fmtUsd(r.strike, 2)}${fmtLadderFlag(r)}`],
@@ -662,6 +680,42 @@ function renderFrontier(rows) {
         'доходности за тот же прирост риска, и останавливаться разумно там, где «цена шага» падает.');
 }
 
+/** Полный фронт выхода: все неулучшаемые оферты и цена каждого шага по нему. */
+function renderExitFrontier(analyzed) {
+  const steps = exitFrontier(analyzed);
+  const H = Number(ui.horizon) || 90;
+  renderLimitedTable('exitfront', $('exit-front-table'), EXIT_FRONT_COLUMNS, steps, (r) =>
+    r.laddered ? 'dim' : '',
+  );
+
+  $('exit-front-hint').innerHTML =
+    `все неулучшаемые оферты выхода от самого вероятного к самому дорогому. Ось риска здесь — ` +
+    `<b>шанс выйти за ${H} дней</b>, если крутить одну и ту же оферту, а не вероятность за один цикл: ` +
+    `47% за 55 дней и 41% за 237 дней — величины несравнимые, и фронт по ним механически вытаскивал бы ` +
+    `наверх самые длинные продукты. Частота берётся по историческим траекториям, поэтому зависимость ` +
+    `соседних циклов учтена: формула независимых попыток завышает шанс выхода на 10–22 процентных пункта`;
+
+  const note = $('exit-front-note');
+  if (!steps.length) {
+    note.textContent = '';
+    return;
+  }
+  const info = steps.find((r) => r.horizonInfo)?.horizonInfo;
+  const locked = analyzed.filter((r) => r.profitable && r.pExitHorizon === 0).length;
+  note.innerHTML =
+    `Строк на фронте: <b>${steps.length}</b>.` +
+    (locked
+      ? ` Ещё <b>${locked}</b> безубыточных оферт не попали в него вовсе: их цикл длиннее ${H} дней,
+         то есть за горизонт они не рассчитываются ни разу.`
+      : '') +
+    (info
+      ? ` Оценка построена по ${info.n} историческим траекториям, около ${Math.round(info.independent ?? 0)}
+         независимых наблюдений на горизонт.`
+      : '') +
+    ` Колонка «цена шага» показывает, сколько процентных пунктов прибыли добавляет отказ от одного
+      процентного пункта шанса выйти.`;
+}
+
 function renderSell(rows) {
   const info = conversionBasis();
   const line = $('basis-line');
@@ -683,6 +737,7 @@ function renderSell(rows) {
     spot: state.spot,
     history: state.history,
     measure: ui.measure,
+    horizonDays: Number(ui.horizon) || 90,
   });
   const profitable = analyzed.filter((r) => r.profitable);
   // Разрыв считаем относительно себестоимости, а не наоборот: «рынок на 68%
@@ -701,6 +756,8 @@ function renderSell(rows) {
         ? `Лучшая по доходности: <b>${fmtPct(profitable[0].aprEff, 2)}</b> эффективных при страйке <b>${fmtUsd(profitable[0].strike, 2)}</b> и вероятности продажи <b>${fmtPct(profitable[0].pConv, 1)}</b>.`
         : 'Ни одна оферта не выводит в USDT без убытка — смотрите строку «циклов до безубытка»: процент в BTC постепенно закрывает разрыв.'
     }`;
+
+  renderExitFrontier(analyzed);
 
   const best = pickBestSell({ rows: analyzed });
   $('best-sell-head').innerHTML =
@@ -906,6 +963,13 @@ function bindControls() {
   $('conv-was-dual').checked = ui.convWasDual;
   $('conv-was-dual').onchange = (e) => {
     ui.convWasDual = e.target.checked;
+    savePrefs();
+    render();
+  };
+
+  $('horizon').value = ui.horizon;
+  $('horizon').onchange = (e) => {
+    ui.horizon = e.target.value;
     savePrefs();
     render();
   };

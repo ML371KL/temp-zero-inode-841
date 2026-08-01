@@ -191,9 +191,33 @@
           </select>
         </label>
       </div>
+      <label class="ctl">
+        <span class="ctl-label">Горизонт выхода</span>
+        <select id="horizon">
+          <option value="90">90 дней</option>
+          <option value="180">180 дней</option>
+          <option value="365">365 дней</option>
+        </select>
+      </label>
       <div class="basis-line" id="basis-line"></div>
       <div class="best-sell-head" id="best-sell-head"></div>
       <div class="cards" id="best-sell"></div>
+
+      <div class="head-row sell-table-head">
+        <h3>Весь фронт выхода, без порога</h3>
+        <button class="collapse" data-collapse="exitfront"></button>
+      </div>
+      <div class="hint" id="exit-front-hint"></div>
+      <div class="panel-body" data-body="exitfront">
+        <div class="table-wrap">
+          <table id="exit-front-table">
+            <thead></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <button class="more" data-more="exitfront"></button>
+        <div class="hint" id="exit-front-note"></div>
+      </div>
       <div class="head-row sell-table-head">
         <h3>Все оферты Sell High</h3>
         <button class="collapse" data-collapse="sell"></button>

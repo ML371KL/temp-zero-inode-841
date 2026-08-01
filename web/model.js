@@ -61,6 +61,71 @@ export class History {
     return pool.sort((a, b) => b.spanDays - a.spanDays)[0];
   }
 
+  /**
+   * Экстремумы цены по контрольным точкам внутри горизонта.
+   *
+   * Отвечает на вопрос «если крутить одну и ту же оферту, дойдёт ли цена до
+   * страйка хотя бы на одном из сеттлментов за горизонт H». Контрольные точки —
+   * концы циклов: t + c, t + 2c, … пока укладываются в H.
+   *
+   * Считать это как 1 − (1 − p)^n нельзя: соседние циклы сильно зависимы, и
+   * если рынок ушёл вниз и там остался, промахи идут подряд. Замер на пяти
+   * годах BTC: формула независимости завышает шанс выхода на 10–22 процентных
+   * пункта. Поэтому частота берётся прямо по историческим траекториям.
+   *
+   * Для каждого старта запоминается максимум и минимум отношения цены к
+   * стартовой по всем контрольным точкам, ряды сортируются и кэшируются —
+   * дальше вероятность для любого страйка это один двоичный поиск.
+   */
+  pathExtremes(cycleDays, horizonDays) {
+    const n = Math.floor(horizonDays / cycleDays);
+    if (!(n >= 1)) return null;
+    const id = `path:${cycleDays.toFixed(4)}:${horizonDays}`;
+    const cached = this.cache.get(id);
+    if (cached) return cached;
+
+    // Берём самый глубокий ряд, в котором цикл разрешается хотя бы одним баром.
+    let best = null;
+    for (const key of ['60', '240', 'D']) {
+      const s = this.raw[key];
+      if (!s?.series?.length || !s.stepMs) continue;
+      const cycleBars = Math.round((cycleDays * 86_400_000) / s.stepMs);
+      if (cycleBars < 1) continue;
+      const spanDays = (s.series.length * s.stepMs) / 86_400_000;
+      if (!best || spanDays > best.spanDays) best = { key, cycleBars, spanDays, series: s.series };
+    }
+    if (!best || best.series.length <= n * best.cycleBars) return null;
+
+    const closes = best.series.map((r) => r[1]);
+    const maxima = [];
+    const minima = [];
+    for (let i = 0; i + n * best.cycleBars < closes.length; i++) {
+      const s0 = closes[i];
+      if (!(s0 > 0)) continue;
+      let hi = -Infinity;
+      let lo = Infinity;
+      for (let k = 1; k <= n; k++) {
+        const v = closes[i + k * best.cycleBars] / s0;
+        if (v > hi) hi = v;
+        if (v < lo) lo = v;
+      }
+      maxima.push(hi);
+      minima.push(lo);
+    }
+    maxima.sort((a, b) => a - b);
+    minima.sort((a, b) => a - b);
+    const hit = {
+      maxima,
+      minima,
+      cycles: n,
+      spanDays: best.spanDays,
+      series: best.key,
+      independent: cycleDays > 0 ? best.spanDays / (n * cycleDays) : null,
+    };
+    this.cache.set(id, hit);
+    return hit;
+  }
+
   /** Отсортированные логарифмические доходности на горизонте tauDays. */
   returns(tauDays) {
     const p = this.pick(tauDays);
@@ -378,7 +443,7 @@ export function pickBest({ rows, maxP, limit = 6 }) {
  * basis — фактическая цена, по которой BTC попал на баланс. Порог безубытка
  * ниже себестоимости на величину начисляемого процента.
  */
-export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'max' }) {
+export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'max', horizonDays = 90 }) {
   const out = rows.map((r) => {
     const be = breakevenStrike(basis, r.apy, r.timing.yieldDays);
     const payoutBtc = qty > 0 ? qty * (1 + r.i) : null;
@@ -405,10 +470,35 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
       }
     }
 
+    // Шанс выйти за общий горизонт, если крутить именно эту оферту.
+    //
+    // Без приведения к общему горизонту вероятности несравнимы: 47% за цикл в
+    // 55 дней и 41% за цикл в 237 дней — это совершенно разные вещи, а фронт,
+    // построенный по такой оси, механически вытаскивает наверх самые длинные
+    // продукты. Здесь считается частота по историческим траекториям, поэтому
+    // зависимость соседних циклов учтена.
+    let pExitHorizon = null;
+    let horizonInfo = null;
+    if (history && basis > 0) {
+      const ext = history.pathExtremes(r.timing.cycleDays, horizonDays);
+      if (ext && ext.maxima.length) {
+        const ratio = r.strike / spot;
+        pExitHorizon = 1 - empiricalCdf(ext.maxima, ratio);
+        horizonInfo = { cycles: ext.cycles, n: ext.maxima.length, independent: ext.independent, series: ext.series };
+      } else {
+        // Цикл длиннее горизонта: за это время оферта просто не успевает
+        // рассчитаться ни разу, и шанс выхода равен нулю.
+        pExitHorizon = 0;
+        horizonInfo = { cycles: 0, n: 0, independent: 0, series: null };
+      }
+    }
+
     return {
       ...r,
       breakeven: be,
       profitable: r.strike >= be,
+      pExitHorizon,
+      horizonInfo,
       // Запас над порогом безубытка в процентах цены.
       cushion: be > 0 ? r.strike / be - 1 : null,
       payoutBtc,
@@ -452,7 +542,10 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
   // меньше шанс, что продажа состоится. Прибыль и вероятность действительно
   // тянут в разные стороны, и фронт по ним содержателен: те же данные дают 16
   // недоминируемых оферт с выручкой от долей процента до 36%.
-  const front = paretoFront(profitable, 'profitPct', 'pConv', false);
+  // Фронт строится по шансу выйти за общий горизонт, а не по вероятности за
+  // цикл: только так оферты разных сроков сравнимы между собой.
+  const axis = profitable.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
+  const front = paretoFront(profitable, 'profitPct', axis, false);
   for (const r of out) r.sellPareto = front.has(r);
 
   // Убыточные уходят вниз: они не решают задачу выхода, даже если ставка выше.
@@ -539,6 +632,29 @@ export function pickAnchors(rows) {
 }
 
 /**
+ * Фронт выхода целиком, от самого вероятного к самому дорогому, с ценой шага.
+ *
+ * Цена шага здесь — сколько процентных пунктов прибыли добавляет отказ от
+ * одного процентного пункта шанса выйти за горизонт. Зеркальный аналог цены
+ * шага на стороне Buy Low, только платят здесь не риском, а вероятностью
+ * того, что сделка вообще состоится.
+ */
+export function exitFrontier(rows, { limit = 0 } = {}) {
+  const front = rows.filter((r) => r.profitable && r.sellPareto && Number.isFinite(r.profitPct));
+  const key = front.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
+  const sorted = [...front].sort((a, b) => b[key] - a[key]);
+  let prev = null;
+  const out = sorted.map((r) => {
+    const dP = prev ? prev[key] - r[key] : null;
+    const dProfit = prev ? r.profitPct - prev.profitPct : null;
+    const step = { ...r, exitAxis: key, gainProfit: dProfit, costP: dP, marginal: dP > 1e-9 ? dProfit / dP : null };
+    prev = r;
+    return step;
+  });
+  return limit > 0 ? out.slice(0, limit) : out;
+}
+
+/**
  * Отбор в блок «оптимальные Sell High».
  *
  * Если безубыточные оферты есть — берём их фронт Парето: там срабатывание
@@ -554,7 +670,8 @@ export function pickBestSell({ rows, limit = 6 }) {
   if (profitable.length) {
     // Сортируем по вероятности продажи от большей к меньшей: сверху самый
     // реалистичный выход, ниже — всё более дорогие, но всё менее вероятные.
-    const front = profitable.filter((r) => r.sellPareto).sort((a, b) => b.pConv - a.pConv);
+    const key = profitable.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
+    const front = profitable.filter((r) => r.sellPareto).sort((a, b) => b[key] - a[key]);
     return { mode: 'exit', rows: front.slice(0, limit) };
   }
 
