@@ -7,6 +7,7 @@
   "scripts": {
     "test": "node scripts/selftest.mjs",
     "test:offline": "node scripts/selftest.mjs --offline",
+    "audit": "node scripts/audit.mjs",
     "record": "node scripts/record.mjs --out data-branch",
     "backtest": "node scripts/backtest.mjs",
     "serve": "python -m http.server 8642 --directory web"

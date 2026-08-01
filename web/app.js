@@ -146,6 +146,18 @@ function fmtRecovery(rec) {
   return `${rec.cycles} · ${fmtSpan(rec.days)}`;
 }
 
+/**
+ * Пометка перекоса лестницы: соседний страйк того же продукта одновременно
+ * безопаснее и платит не меньше, значит эта оферта бессмысленна.
+ */
+function fmtLadderFlag(row) {
+  if (!row.laddered) return '';
+  return (
+    ` <span class="flag" title="страйк ${fmtUsd(row.laddered.strike, 2)} того же продукта ` +
+    `платит ${fmtPct(row.laddered.apy, 2)} против ${fmtPct(row.apy, 2)} и при этом безопаснее">⚠</span>`
+  );
+}
+
 /** Перцентиль текущей ставки относительно собранного архива. */
 function fmtPercentile(row) {
   if (row.aprPercentile == null) return '<span class="muted">—</span>';
@@ -346,7 +358,7 @@ function cardFor(row) {
 
 const BUY_COLUMNS = [
   ['Срок', (r) => `${r.isVip ? '<span class="vip-badge">★</span> ' : ''}${r.duration}`, 'left'],
-  ['Страйк', (r) => fmtUsd(r.strike, 2)],
+  ['Страйк', (r) => `${fmtUsd(r.strike, 2)}${fmtLadderFlag(r)}`],
   ['От спота', (r) => `<span class="muted">${fmtSigned(r.moneyness, 2)}</span>`],
   ['APR заявл.', (r) => fmtPct(r.apy, 2)],
   ['APR эфф.', (r) => `<b>${fmtPct(r.aprEff, 2)}</b>`],
@@ -369,7 +381,7 @@ const BUY_COLUMNS = [
 
 const FRONTIER_COLUMNS = [
   ['Срок', (r) => `${r.isVip ? '<span class="vip-badge">★</span> ' : ''}${r.duration}`, 'left'],
-  ['Страйк', (r) => fmtUsd(r.strike, 2)],
+  ['Страйк', (r) => `${fmtUsd(r.strike, 2)}${fmtLadderFlag(r)}`],
   ['От спота', (r) => `<span class="muted">${fmtSigned(r.moneyness, 2)}</span>`],
   ['P(конв)', (r) => `<b>${fmtPct(r.pConv, 2)}</b>`],
   ['APR эфф.', (r) => `<b>${fmtPct(r.aprEff, 2)}</b>`],
@@ -394,7 +406,7 @@ function fmtMarginal(x) {
 
 const SELL_COLUMNS = [
   ['Срок', (r) => `${r.isVip ? '<span class="vip-badge">★</span> ' : ''}${r.duration}`, 'left'],
-  ['Страйк', (r) => fmtUsd(r.strike, 2)],
+  ['Страйк', (r) => `${fmtUsd(r.strike, 2)}${fmtLadderFlag(r)}`],
   ['От спота', (r) => `<span class="muted">${fmtSigned(r.moneyness, 2)}</span>`],
   ['APR заявл.', (r) => fmtPct(r.apy, 2)],
   ['APR эфф.', (r) => `<b>${fmtPct(r.aprEff, 2)}</b>`],
@@ -472,9 +484,14 @@ function renderBuy(rows) {
   if (!state.ladderProduct && best.length) state.ladderProduct = best[0].productId;
 
   const sorted = sortRows(rows);
-  $('buy-count').textContent =
-    `${rows.length} оферт${rows.length ? '' : ''} · ${new Set(rows.map((r) => r.productId)).size} продуктов` +
-    (ui.vip ? ' · VIP включены' : ' · только общедоступные');
+  const laddered = rows.filter((r) => r.laddered).length;
+  $('buy-count').innerHTML =
+    `${rows.length} оферт · ${new Set(rows.map((r) => r.productId)).size} продуктов` +
+    (ui.vip ? ' · VIP включены' : ' · только общедоступные') +
+    (laddered
+      ? ` · <span class="flag">⚠</span> ${laddered}: у этих оферт в той же лестнице есть страйк дальше от рынка, ` +
+        'который платит не меньше — то есть строго безопаснее и не хуже по доходности'
+      : '');
   renderLimitedTable('buy', $('buy-table'), BUY_COLUMNS, sorted, (r) => (r.pareto ? 'pareto' : ''));
   renderAnchors(rows);
   renderFrontier(rows);
@@ -548,13 +565,14 @@ function renderAnchors(rows) {
   const box = $('anchors');
   const cards = [];
   for (const [id, meta] of Object.entries(ANCHOR_META)) {
-    const r = anchors[id];
-    if (!r) continue;
-    const value = r[meta.key];
+    const a = anchors[id];
+    if (!a) continue;
+    const r = a.row;
+    const d = a.dominator;
     cards.push(`
       <article class="anchor" data-product="${r.productId}">
         <div class="anchor-title">${meta.title}</div>
-        <div class="anchor-value">${meta.key === 'volEdge' ? fmtSigned(value, 2) : fmtPct(value, 1)}</div>
+        <div class="anchor-value">${meta.key === 'volEdge' ? fmtSigned(a.value, 2) : fmtPct(a.value, 1)}</div>
         <div class="anchor-line">
           ${r.duration}${r.isVip ? ' · VIP' : ''} · страйк <b>${fmtUsd(r.strike, 2)}</b> (${fmtSigned(r.moneyness, 2)})
         </div>
@@ -562,6 +580,14 @@ function renderAnchors(rows) {
           APR эфф. ${fmtPct(r.aprEff, 1)} · в цикле ${fmtPct(r.aprChained, 1)} · P(конв) ${fmtPct(r.pConv, 2)}
         </div>
         <div class="anchor-hint">${meta.hint}</div>
+        ${
+          d
+            ? `<div class="anchor-warn">Вне фронта Парето: ${d.duration} со страйком ${fmtUsd(d.strike, 2)}
+               даёт больше доходности (${fmtPct(d.aprEff, 1)} против ${fmtPct(r.aprEff, 1)}) при меньшем риске
+               (${fmtPct(d.pConv, 2)} против ${fmtPct(r.pConv, 2)}). Этот якорь всё равно осмыслен: его страйк глубже,
+               и при конвертации BTC достаётся дешевле — пара «доходность и вероятность» глубину не измеряет.</div>`
+            : ''
+        }
       </article>`);
   }
   box.innerHTML = cards.join('') || '<div class="empty">нет данных для оценки</div>';
@@ -699,23 +725,43 @@ function render() {
   // компонуются, и панель переставала бы обновляться, пока на неё не посмотрят.
   setTimeout(() => {
     renderScheduled = false;
-    try {
-      renderHead();
-      const buy = currentRows('BuyLow');
-      const sell = currentRows('SellHigh');
-      renderBuy(buy);
-      renderSell(sell);
-      renderDiag();
-      // Архив пополняется тем же срезом, который только что показан.
-      // Сама запись не чаще раза в минуту — интервал держит сам архив.
+
+    // Каждый блок рисуется в своей защите. Общий try на всю отрисовку означал,
+    // что падение любого блока уносило с собой и диагностику: панель молча
+    // замирала на последнем удачном кадре, а сообщение об ошибке было негде
+    // показать. Теперь падает только пострадавший блок.
+    const step = (name, fn) => {
+      try {
+        return fn();
+      } catch (e) {
+        pushError(`${name}: ${e.message}`);
+        console.error(name, e);
+        return null;
+      }
+    };
+
+    step('шапка', renderHead);
+    const buy = step('расчёт Buy Low', () => currentRows('BuyLow')) || [];
+    const sell = step('расчёт Sell High', () => currentRows('SellHigh')) || [];
+    step('блок Buy Low', () => renderBuy(buy));
+    step('блок Sell High', () => renderSell(sell));
+
+    // Архив пополняется тем же срезом, который только что показан.
+    // Сама запись не чаще раза в минуту — интервал держит сам архив.
+    step('архив', () => {
       if (state.archive && (buy.length || sell.length)) {
         state.archive.sample([...buy, ...sell]).then((written) => {
           if (written) state.archive.stats().then((st) => st && !state.statsRemote && (state.stats = st));
         });
       }
+    });
+
+    // Диагностика рисуется последней и всегда: именно она показывает,
+    // что где-то упало.
+    try {
+      renderDiag();
     } catch (e) {
-      pushError(`отрисовка: ${e.message}`);
-      console.error(e);
+      console.error('диагностика', e);
     }
   }, 0);
 }

@@ -262,6 +262,38 @@ export function buildRows({ products, quotes, direction, now, spot, surface, his
   }
   const front = paretoFront(rows, 'aprEff', 'pConv');
   for (const r of rows) r.pareto = front.has(r);
+  markLadderInversions(rows);
+  return rows;
+}
+
+/**
+ * Перекосы внутри одной лестницы страйков.
+ *
+ * По смыслу инструмента ставка обязана расти по мере приближения страйка к
+ * рынку: ближе страйк — выше шанс конвертации — выше плата за риск. На длинных
+ * сроках Bybit это правило регулярно нарушает, и тогда соседний страйк даёт
+ * одновременно меньший риск и большую ставку. Такая оферта бессмысленна:
+ * тот же продукт, тот же срок, тот же сеттлмент — просто хуже по обоим
+ * параметрам. Помечаем её и запоминаем, чем именно она побита.
+ */
+export function markLadderInversions(rows) {
+  const byProduct = new Map();
+  for (const r of rows) {
+    if (!byProduct.has(r.productId)) byProduct.set(r.productId, []);
+    byProduct.get(r.productId).push(r);
+  }
+  for (const list of byProduct.values()) {
+    for (const a of list) {
+      // Для Buy Low безопаснее меньший страйк, для Sell High — больший.
+      const safer = (b) => (a.direction === 'BuyLow' ? b.strike < a.strike : b.strike > a.strike);
+      let best = null;
+      for (const b of list) {
+        if (b === a || !safer(b)) continue;
+        if (b.apy >= a.apy - 1e-12 && (!best || b.apy > best.apy)) best = b;
+      }
+      a.laddered = best ? { strike: best.strike, apy: best.apy, row: best } : null;
+    }
+  }
   return rows;
 }
 
@@ -273,11 +305,13 @@ export function buildRows({ products, quotes, direction, now, spot, surface, his
 export function pickBest({ rows, maxP, limit = 6 }) {
   const eligible = rows.filter((r) => r.pConv != null && r.pConv <= maxP && r.aprEff != null);
   const front = paretoFront(eligible, 'aprEff', 'pConv');
-  const inFront = eligible.filter((r) => front.has(r)).sort((a, b) => b.aprEff - a.aprEff);
-  if (inFront.length >= limit) return inFront.slice(0, limit);
-  // Добираем ближайших претендентов по доходности, помечая их вне фронта.
-  const rest = eligible.filter((r) => !front.has(r)).sort((a, b) => b.aprEff - a.aprEff);
-  return [...inFront, ...rest].slice(0, limit);
+  // Только фронт и ничего кроме фронта. Добор доминируемых оферт «для полноты»
+  // противоречил самому назначению блока: показанная там оферта заведомо хуже
+  // другой показанной оферты сразу по доходности и по риску.
+  return eligible
+    .filter((r) => front.has(r))
+    .sort((a, b) => b.aprEff - a.aprEff)
+    .slice(0, limit);
 }
 
 /**
@@ -375,15 +409,33 @@ export function frontierWithMargins(rows, riskFree = 0) {
  *           устраивает: то есть страйк — цена, по которой вы и так готовы купить.
  */
 export function pickAnchors(rows) {
-  const top = (key, filter = () => true) => {
-    const pool = rows.filter((r) => Number.isFinite(r[key]) && filter(r));
+  const top = (key) => {
+    const pool = rows.filter((r) => Number.isFinite(r[key]));
     return pool.length ? pool.reduce((a, b) => (b[key] > a[key] ? b : a)) : null;
   };
-  return {
-    market: top('volEdge'),
-    expected: top('expNetApr'),
-    yield: top('aprEff'),
+
+  // Якорь может оказаться доминируемой офертой: критерии у него свои, а пара
+  // «доходность — вероятность» устроена иначе. Это не ошибка, но пользователь
+  // обязан это видеть, поэтому ищем, чем именно якорь побит.
+  const usable = rows.filter((r) => Number.isFinite(r.pConv) && Number.isFinite(r.aprEff));
+  const dominatorOf = (r) => {
+    if (!r || !Number.isFinite(r.pConv)) return null;
+    const better = usable.filter(
+      (b) => b !== r && b.aprEff >= r.aprEff && b.pConv <= r.pConv && (b.aprEff > r.aprEff || b.pConv < r.pConv),
+    );
+    return better.length ? better.reduce((a, b) => (b.aprEff > a.aprEff ? b : a)) : null;
   };
+
+  const out = {};
+  for (const [id, key] of [
+    ['market', 'volEdge'],
+    ['expected', 'expNetApr'],
+    ['yield', 'aprEff'],
+  ]) {
+    const row = top(key);
+    out[id] = row ? { row, key, value: row[key], dominator: dominatorOf(row) } : null;
+  }
+  return out;
 }
 
 /**

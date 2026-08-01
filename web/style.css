@@ -606,6 +606,20 @@ tr.dim td {
   font-size: 11px;
 }
 
+.anchor-warn {
+  font-size: 11px;
+  color: var(--warn);
+  margin-top: 7px;
+  line-height: 1.45;
+  border-top: 1px solid color-mix(in srgb, var(--warn) 28%, transparent);
+  padding-top: 6px;
+}
+
+.flag {
+  color: var(--warn);
+  cursor: help;
+}
+
 .anchor-hint {
   font-size: 11px;
   color: var(--ink-2);
