@@ -126,6 +126,9 @@ function simulate({
   // Множитель роста только по ноге USDT: он показывает ставку, реально
   // полученную в долларах, отдельно от переоценки биткоина.
   let usdtGrowth = 1;
+  // То же самое для ноги BTC: во сколько раз выросло количество монет за счёт
+  // процентов. Отвечает на вопрос, спасает ли обратная нога после конвертации.
+  let btcGrowth = 1;
   let realizedLoss = 0;
 
   // Первое закрытие окна подписки не раньше начала истории.
@@ -217,6 +220,7 @@ function simulate({
       {
         const iCycle = interestRate(apy, yieldDays);
         const payoutBtc = btc * (1 + iCycle);
+        btcGrowth *= 1 + iCycle;
         if (sT >= K) {
           usdt = payoutBtc * K;
           // Убыток считается по выручке против затрат, а не по страйку против
@@ -255,6 +259,9 @@ function simulate({
     idleShare: btcMs > 0 ? btcIdleMs / btcMs : 0,
     // Годовая ставка, полученная в USDT, приведённая ко времени в USDT.
     usdtApr: usdtMs > 0 ? usdtGrowth ** ((YEAR_DAYS * MS_DAY) / usdtMs) - 1 : null,
+    // Годовая ставка в монетах, приведённая ко времени, проведённому в BTC.
+    btcApr: btcMs > 0 ? btcGrowth ** ((YEAR_DAYS * MS_DAY) / btcMs) - 1 : null,
+    btcGrowth,
     endedInBtc: btc > 0,
     maxStuckDays,
     finalUsdt,
@@ -331,22 +338,28 @@ async function main() {
   );
   console.log('Ставки взяты сегодняшние и приняты постоянными на всю историю — см. оговорку в шапке файла.\n');
   console.log(
-    ['срок', 'страйк', 'APY', 'ставка USDT', 'конв.', 'продаж', 'в убыток', 'доля в BTC', 'макс. в BTC', 'итог', 'CAGR'].join(
-      '\t',
-    ),
+    [
+      'срок',
+      'страйк',
+      'ставка USDT',
+      'доля в BTC',
+      'ставка BTC',
+      'из BTC-времени простой',
+      'монет накоплено',
+      'итог',
+      'CAGR',
+    ].join('\t'),
   );
   for (const r of rows) {
     console.log(
       [
         r.duration,
         pct(r.buyM, 0),
-        pct(r.apy, 1),
         pct(r.usdtApr),
-        r.conversions,
-        r.sales,
-        r.realizedLoss,
         pct(r.shareInBtc, 0),
-        `${r.maxStuckDays.toFixed(0)}д`,
+        pct(r.btcApr),
+        pct(r.idleShare, 0),
+        `×${r.btcGrowth.toFixed(3)}`,
         r.endedInBtc ? 'в BTC' : 'в USDT',
         pct(r.cagr),
       ].join('\t'),
