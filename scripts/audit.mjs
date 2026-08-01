@@ -685,7 +685,7 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
   if (best.mode === 'exit') {
     ok('в режиме выхода показаны только безубыточные', best.rows.every((r) => r.profitable));
     const pool = analyzed.filter(
-      (r) => r.profitable && Number.isFinite(r.profitPct) && Number.isFinite(r.pExitHorizon),
+      (r) => r.profitable && Number.isFinite(r.profitPct) && r.pExitHorizon > 0,
     );
     const dominated = (a) =>
       pool.some(
@@ -708,10 +708,19 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
   const deep = analyzeSellHigh({ rows: sell, basis: spot * 4, qty, spot, history, measure: 'max' });
   const waiting = pickBestSell({ rows: deep });
   ok('при недостижимой себестоимости включается режим ожидания', waiting.mode === 'wait');
-  ok('в режиме ожидания риск минимален среди показанных', waiting.rows.every((r, k) => k === 0 || r.pConv >= waiting.rows[k - 1].pConv));
-  const deepPool = deep.filter((r) => Number.isFinite(r.aprEff) && Number.isFinite(r.pConv));
+  // Ось режима ожидания та же, что у режима выхода: шанс срабатывания за общий
+  // горизонт, только здесь он минимизируется.
+  const wAxis = waiting.axis ?? 'pConv';
+  ok(
+    'в режиме ожидания риск минимален среди показанных',
+    waiting.rows.every((r, k) => k === 0 || r[wAxis] >= waiting.rows[k - 1][wAxis] - 1e-12),
+    `ось ${wAxis}`,
+  );
+  const deepPool = deep.filter((r) => Number.isFinite(r.aprEff) && Number.isFinite(r[wAxis]));
   const waitDominated = (a) =>
-    deepPool.some((b) => b !== a && b.aprEff >= a.aprEff && b.pConv <= a.pConv && (b.aprEff > a.aprEff || b.pConv < a.pConv));
+    deepPool.some(
+      (b) => b !== a && b.aprEff >= a.aprEff && b[wAxis] <= a[wAxis] && (b.aprEff > a.aprEff || b[wAxis] < a[wAxis]),
+    );
   ok('в режиме ожидания показаны только недоминируемые', waiting.rows.every((r) => !waitDominated(r)));
 
   // Направление осторожной оценки вероятности.
@@ -800,6 +809,52 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
       'оценка по траекториям не выше формулы независимых попыток',
       higher === 0,
       `сравнено ${cmp}, выше у ${higher}, максимальное занижение ${(worst * 100).toFixed(1)} п.п.`,
+    );
+
+    // Ожидаемое время до выхода: тождества и границы.
+    const withT = analyzed.filter((r) => Number.isFinite(r.expExitDays) && r.horizonInfo?.cycles > 0);
+    ok(
+      'ожидание выхода не короче цикла и не длиннее горизонта',
+      withT.every((r) => r.expExitDays >= r.timing.cycleDays - 1e-9 && r.expExitDays <= H + r.timing.cycleDays),
+      `строк ${withT.length}`,
+    );
+    // Чем дальше страйк, тем дольше ждать.
+    let waitMono = 0;
+    const wg = new Map();
+    for (const r of withT) {
+      if (!wg.has(r.productId)) wg.set(r.productId, []);
+      wg.get(r.productId).push(r);
+    }
+    for (const list of wg.values()) {
+      const srt = [...list].sort((a, b) => a.strike - b.strike);
+      for (let k = 1; k < srt.length; k++) if (srt[k].expExitDays < srt[k - 1].expExitDays - 1e-9) waitMono++;
+    }
+    ok('ожидание выхода растёт со страйком', waitMono === 0, `нарушений ${waitMono}`);
+    ok(
+      'ожидаемая годовая доходность = прибыль × шанс / ожидание',
+      withT.every(
+        (r) => Math.abs(r.expProfitRate - (r.profitPct * r.pExitHorizon * 365) / r.expExitDays) < 1e-9,
+      ),
+    );
+
+    // Карточки берут срез по всему фронту, а не его край.
+    const cards = pickBestSell({ rows: analyzed });
+    const steps0 = exitFrontier(analyzed);
+    if (cards.mode === 'exit' && steps0.length > 6) {
+      const span = Math.max(...cards.rows.map((r) => r.profitPct)) - Math.min(...cards.rows.map((r) => r.profitPct));
+      const full = Math.max(...steps0.map((r) => r.profitPct)) - Math.min(...steps0.map((r) => r.profitPct));
+      ok(
+        'карточки покрывают размах фронта, а не его край',
+        span > full * 0.8,
+        `размах карточек ${pc(span)} против ${pc(full)} у фронта`,
+      );
+    }
+
+    // Нереализуемая прибыль не должна садиться на край фронта.
+    ok(
+      'оферты с нулевым шансом выйти исключены из фронта',
+      exitFrontier(analyzed).every((r) => r.pExitHorizon > 0),
+      `таких оферт среди безубыточных ${analyzed.filter((r) => r.profitable && r.pExitHorizon === 0).length}`,
     );
 
     // Фронт выхода упорядочен и цена шага пересчитана верно.

@@ -432,6 +432,8 @@ const EXIT_FRONT_COLUMNS = [
   ['Прибыль', (r) => `<b>${fmtSigned(r.profitPct, 2)}</b>`],
   ['Шанс выйти', (r) => `<b>${fmtPct(r.pExitHorizon, 1)}</b>`],
   ['Циклов', (r) => (r.horizonInfo ? String(r.horizonInfo.cycles) : '—')],
+  ['Ждать', (r) => fmtSpan(r.expExitDays)],
+  ['Ожид. годовых', (r) => `<span class="${cls(r.expProfitRate)}">${fmtPct(r.expProfitRate, 1)}</span>`],
   ['P за цикл', (r) => `<span class="muted">${fmtPct(r.pConv, 1)}</span>`],
   ['Цикл', (r) => fmtSpan(r.timing.cycleDays)],
   ['Прибавка', (r) => `<span class="${cls(r.gainProfit)}">${fmtSigned(r.gainProfit, 2)}</span>`],
@@ -456,6 +458,9 @@ const SELL_COLUMNS = [
   ['Прибыль', (r) => `<span class="${cls(r.profitUsdt)}">${r.profitUsdt == null ? '—' : fmtUsd(r.profitUsdt, 2)}</span>`],
   ['Прибыль, %', (r) => `<span class="${cls(r.profitPct)}">${fmtSigned(r.profitPct, 2)}</span>`],
   ['Ожид. к себест.', (r) => `<span class="${cls(r.expReturnVsBasis)}">${fmtSigned(r.expReturnVsBasis, 1)}</span>`],
+  ['Шанс выйти', (r) => fmtPct(r.pExitHorizon, 1)],
+  ['Ждать', (r) => fmtSpan(r.expExitDays)],
+  ['Ожид. годовых', (r) => `<span class="${cls(r.expProfitRate)}">${fmtPct(r.expProfitRate, 1)}</span>`],
   ['Премия σ', (r) => `<span class="${cls(r.volEdge)}">${fmtSigned(r.volEdge, 1)}</span>`],
   ['Циклов до б/у', (r) => fmtRecovery(r.recovery)],
   ['Сеттлмент', (r) => fmtTime(r.timing.settle)],
@@ -575,7 +580,9 @@ function sellCardFor(row, mode) {
         <dt>P(продажи)</dt><dd>${fmtPct(row.pConv, 2)}</dd>
         ${
           mode === 'exit'
-            ? `<dt>Выручка</dt><dd>${fmtUsd(row.usdtIfSold, 2)} USDT</dd>
+            ? `<dt>Шанс выйти</dt><dd>${fmtPct(row.pExitHorizon, 1)} за ${ui.horizon} дней</dd>
+               <dt>Ожидание выхода</dt><dd>${fmtSpan(row.expExitDays)}</dd>
+               <dt>Ожид. годовых</dt><dd class="${cls(row.expProfitRate)}">${fmtPct(row.expProfitRate, 1)}</dd>
                <dt>Прибыль</dt><dd class="${cls(row.profitUsdt)}">${row.profitUsdt == null ? '—' : fmtUsd(row.profitUsdt, 2)}</dd>`
             : `<dt>Циклов до безубытка</dt><dd>${fmtRecovery(row.recovery)}</dd>
                <dt>Прирост BTC за срок</dt><dd>${fmtPct(row.i, 3)}</dd>`
@@ -763,7 +770,7 @@ function renderSell(rows) {
   $('best-sell-head').innerHTML =
     best.mode === 'exit'
       ? '<h3>Оптимальный выход в USDT</h3><div class="hint">фронт Парето по паре «прибыль к себестоимости — вероятность продажи». Именно эти две величины тянут в разные стороны: чем выше страйк, тем больше денег на руки, но тем меньше шанс, что продажа состоится. Сверху самый вероятный выход, ниже — всё более дорогие и всё менее вероятные</div>'
-      : '<h3>Заработок на ожидании</h3><div class="hint">безубыточного выхода сейчас нет, поэтому срабатывание страйка означало бы принудительную продажу дешевле себестоимости: здесь отобраны оферты с наибольшей ставкой при наименьшем риске такой продажи</div>';
+      : `<h3>Заработок на ожидании</h3><div class="hint">безубыточного выхода сейчас нет, поэтому срабатывание страйка означало бы принудительную продажу дешевле себестоимости: здесь отобраны оферты с наибольшей ставкой при наименьшем риске такой продажи за ${ui.horizon} дней. Риск считается по тому же горизонту, что и в режиме выхода — вероятности за один цикл у пятидневного и у 237-дневного продукта несравнимы</div>`;
   $('best-sell').innerHTML = best.rows.length
     ? best.rows.map((r) => sellCardFor(r, best.mode)).join('')
     : '<div class="empty">нет доступных оферт Sell High при текущих фильтрах</div>';

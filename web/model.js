@@ -97,27 +97,27 @@ export class History {
     if (!best || best.series.length <= n * best.cycleBars) return null;
 
     const closes = best.series.map((r) => r[1]);
-    const maxima = [];
-    const minima = [];
+    // Нарастающий максимум по контрольным точкам: running[k] — распределение
+    // максимума отношения цены к стартовой за первые k циклов. Отсюда сразу
+    // берётся и шанс выйти к любому моменту внутри горизонта, и ожидаемое
+    // время до выхода, причём для любого страйка это k двоичных поисков.
+    const running = Array.from({ length: n }, () => []);
     for (let i = 0; i + n * best.cycleBars < closes.length; i++) {
       const s0 = closes[i];
       if (!(s0 > 0)) continue;
       let hi = -Infinity;
-      let lo = Infinity;
       for (let k = 1; k <= n; k++) {
         const v = closes[i + k * best.cycleBars] / s0;
         if (v > hi) hi = v;
-        if (v < lo) lo = v;
+        running[k - 1].push(hi);
       }
-      maxima.push(hi);
-      minima.push(lo);
     }
-    maxima.sort((a, b) => a - b);
-    minima.sort((a, b) => a - b);
+    for (const arr of running) arr.sort((a, b) => a - b);
     const hit = {
-      maxima,
-      minima,
+      running,
+      maxima: running[n - 1] ?? [],
       cycles: n,
+      cycleDays,
       spanDays: best.spanDays,
       series: best.key,
       independent: cycleDays > 0 ? best.spanDays / (n * cycleDays) : null,
@@ -479,12 +479,30 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
     // зависимость соседних циклов учтена.
     let pExitHorizon = null;
     let horizonInfo = null;
+    let expExitDays = null;
+    let expProfitRate = null;
     if (history && basis > 0) {
       const ext = history.pathExtremes(r.timing.cycleDays, horizonDays);
       if (ext && ext.maxima.length) {
         const ratio = r.strike / spot;
         pExitHorizon = 1 - empiricalCdf(ext.maxima, ratio);
         horizonInfo = { cycles: ext.cycles, n: ext.maxima.length, independent: ext.independent, series: ext.series };
+
+        // Ожидаемое время до выхода, ограниченное горизонтом.
+        //
+        // Без него две оферты с одинаковой прибылью и одинаковым шансом выйти
+        // выглядят равноценными, хотя одна освобождает капитал через неделю, а
+        // другая через полгода. E[min(T, n)] = Σ P(T > k), а P(T > k) — это
+        // доля траекторий, у которых нарастающий максимум за k циклов не достал
+        // до страйка.
+        let sum = 1;
+        for (let k = 1; k < ext.cycles; k++) sum += empiricalCdf(ext.running[k - 1], ratio);
+        expExitDays = sum * r.timing.cycleDays;
+        if (expExitDays > 0) {
+          // Ожидаемая доходность выхода в годовых: прибыль, взвешенная шансом
+          // её получить, отнесённая к ожидаемому времени ожидания.
+          expProfitRate = ((((1 + r.i) * r.strike) / basis - 1) * pExitHorizon * YEAR_DAYS) / expExitDays;
+        }
       } else {
         // Цикл длиннее горизонта: за это время оферта просто не успевает
         // рассчитаться ни разу, и шанс выхода равен нулю.
@@ -499,6 +517,8 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
       profitable: r.strike >= be,
       pExitHorizon,
       horizonInfo,
+      expExitDays,
+      expProfitRate,
       // Запас над порогом безубытка в процентах цены.
       cushion: be > 0 ? r.strike / be - 1 : null,
       payoutBtc,
@@ -545,7 +565,13 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
   // Фронт строится по шансу выйти за общий горизонт, а не по вероятности за
   // цикл: только так оферты разных сроков сравнимы между собой.
   const axis = profitable.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
-  const front = paretoFront(profitable, 'profitPct', axis, false);
+  // Оферты с нулевым шансом выйти за горизонт исключаются до построения фронта.
+  // Формально самая прибыльная из них недоминируема — по прибыли её никто не
+  // превосходит, — и она садилась на край фронта с обещанием +36% при шансе
+  // получить их, равном нулю. Недоминируемость здесь вырождена: реализовать
+  // такую прибыль за горизонт нельзя ни при каком исходе.
+  const reachable = axis === 'pExitHorizon' ? profitable.filter((r) => r.pExitHorizon > 0) : profitable;
+  const front = paretoFront(reachable, 'profitPct', axis, false);
   for (const r of out) r.sellPareto = front.has(r);
 
   // Убыточные уходят вниз: они не решают задачу выхода, даже если ставка выше.
@@ -672,15 +698,33 @@ export function pickBestSell({ rows, limit = 6 }) {
     // реалистичный выход, ниже — всё более дорогие, но всё менее вероятные.
     const key = profitable.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
     const front = profitable.filter((r) => r.sellPareto).sort((a, b) => b[key] - a[key]);
-    return { mode: 'exit', rows: front.slice(0, limit) };
+    // Берём не край фронта, а равномерный срез по нему. Шесть первых строк —
+    // это шесть самых вероятных и самых дешёвых выходов подряд, они отличаются
+    // друг от друга на доли процента и прячут весь остальной размах: на живых
+    // данных фронт тянется от +0.6% до +36% прибыли.
+    if (front.length <= limit) return { mode: 'exit', axis: key, rows: front };
+    const picked = [];
+    for (let k = 0; k < limit; k++) {
+      picked.push(front[Math.round((k * (front.length - 1)) / (limit - 1))]);
+    }
+    return { mode: 'exit', axis: key, rows: [...new Set(picked)] };
   }
 
-  const usable = rows.filter((r) => Number.isFinite(r.aprEff) && Number.isFinite(r.pConv));
-  const front = paretoFront(usable, 'aprEff', 'pConv', true);
+  // Режим ожидания меряет риск тем же горизонтом, что и режим выхода: иначе
+  // вероятности за цикл у пятидневного и у 237-дневного продукта сравнивались бы
+  // напрямую, а это величины разной размерности. Здесь срабатывание страйка —
+  // принудительная продажа ниже себестоимости, поэтому шанс минимизируется.
+  const axis = rows.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
+  const usable = rows.filter((r) => Number.isFinite(r.aprEff) && Number.isFinite(r[axis]));
+  const front = paretoFront(usable, 'aprEff', axis, true);
   const waiting = usable
     .filter((r) => front.has(r))
-    .sort((a, b) => a.pConv - b.pConv)
+    .sort((a, b) => a[axis] - b[axis])
     .slice(0, limit);
   for (const r of waiting) r.waitPareto = true;
-  return { mode: 'wait', rows: waiting.length ? waiting : usable.sort((a, b) => a.pConv - b.pConv).slice(0, limit) };
+  return {
+    mode: 'wait',
+    axis,
+    rows: waiting.length ? waiting : usable.sort((a, b) => a[axis] - b[axis]).slice(0, limit),
+  };
 }
