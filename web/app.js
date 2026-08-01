@@ -22,6 +22,7 @@ import {
   analyzeSellHigh,
   frontierWithMargins,
   pickAnchors,
+  MIN_INDEPENDENT_WINDOWS,
 } from './model.js';
 import { basisFromConversion, interestRate, cyclesToRecover, MS_DAY } from './quant.js';
 import { scatterChart, ladderChart, durationColor } from './charts.js';
@@ -156,6 +157,18 @@ function fmtLadderFlag(row) {
     ` <span class="flag" title="страйк ${fmtUsd(row.laddered.strike, 2)} того же продукта ` +
     `платит ${fmtPct(row.laddered.apy, 2)} против ${fmtPct(row.apy, 2)} и при этом безопаснее">⚠</span>`
   );
+}
+
+/**
+ * Историческая вероятность вместе с весом выборки. Тонкая выборка приглушается
+ * и в осторожном режиме вообще не участвует в отборе.
+ */
+function fmtHist(row) {
+  if (row.pHist == null) return '<span class="muted">—</span>';
+  const ind = row.histInfo?.independent;
+  const thin = ind != null && ind < MIN_INDEPENDENT_WINDOWS;
+  const title = ind == null ? '' : ` title="независимых окон в выборке: ${Math.round(ind)}"`;
+  return `<span class="${thin ? 'muted' : ''}"${title}>${fmtPct(row.pHist, 2)}${thin ? '&nbsp;·&nbsp;тонкая' : ''}</span>`;
 }
 
 /** Перцентиль текущей ставки относительно собранного архива. */
@@ -367,7 +380,7 @@ const BUY_COLUMNS = [
   ['Блокировка', (r) => fmtSpan(r.timing.lockDays)],
   ['Мёртвое', (r) => `<span class="muted">${fmtSpan(r.timing.idleDays)}</span>`],
   ['P рын.', (r) => fmtPct(r.pRN, 2)],
-  ['P ист.', (r) => fmtPct(r.pHist, 2)],
+  ['P ист.', (r) => fmtHist(r)],
   ['P раб.', (r) => `<b class="${r.pConv > 0.15 ? 'neg' : ''}">${fmtPct(r.pConv, 2)}</b>`],
   ['σ рынок', (r) => fmtPct(r.sigma, 1)],
   ['σ оферты', (r) => fmtPct(r.offerVol, 1)],
@@ -549,6 +562,11 @@ const ANCHOR_META = {
     key: 'volEdge',
     hint: 'премия оферты против цены опциона на тот же риск с той же датой экспирации. Единственный критерий, которому не нужны ваши предпочтения',
   },
+  money: {
+    title: 'Лучшая премия в деньгах',
+    key: 'edgeApr',
+    hint: 'та же премия, но выраженная в годовой доходности на вложенный капитал, а не в пунктах волатильности. Учитывает, сколько мисприсинг стоит в деньгах и как долго заперты средства',
+  },
   expected: {
     title: 'Лучшее матожидание',
     key: 'expNetApr',
@@ -577,7 +595,9 @@ function renderAnchors(rows) {
             ? ` title="Вне фронта Парето: ${d.duration} со страйком ${fmtUsd(d.strike, 2)} даёт ${fmtPct(d.aprEff, 1)} против ${fmtPct(r.aprEff, 1)} при вероятности ${fmtPct(d.pConv, 2)} против ${fmtPct(r.pConv, 2)}. Якорь всё равно осмыслен: его страйк глубже, и при конвертации BTC достаётся дешевле."`
             : ''
         }>${meta.title}${d ? ' <span class="muted">(вне фронта Парето)</span>' : ''}</div>
-        <div class="anchor-value">${meta.key === 'volEdge' ? fmtSigned(a.value, 2) : fmtPct(a.value, 1)}</div>
+        <div class="anchor-value">${
+          meta.key === 'volEdge' || meta.key === 'edgeApr' ? fmtSigned(a.value, 2) : fmtPct(a.value, 1)
+        }</div>
         <div class="anchor-line">
           ${r.duration}${r.isVip ? ' · VIP' : ''} · страйк <b>${fmtUsd(r.strike, 2)}</b> (${fmtSigned(r.moneyness, 2)})
         </div>

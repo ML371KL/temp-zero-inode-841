@@ -375,6 +375,7 @@ console.log('\n── 6. Якоря: сверка с полным перебор
 
   for (const [id, key] of [
     ['market', 'volEdge'],
+    ['money', 'edgeApr'],
     ['expected', 'expNetApr'],
     ['yield', 'aprEff'],
   ]) {
@@ -479,9 +480,16 @@ console.log('\n── 8. Внутренняя согласованность с�
   ok('денежные величины согласованы со ставкой', badMoney === 0);
   ok('вероятности лежат в [0,1]', badProb === 0);
 
+  // Осторожный режим берёт максимум там, где историческая оценка опирается на
+  // достаточную выборку, и только рыночную там, где не опирается. Подробные
+  // проверки обеих ветвей — в разделе 9.
   const measured = buy.filter((r) => r.pRN != null && r.pHist != null);
-  const useMax = measured.every((r) => Math.abs(r.pConv - Math.max(r.pRN, r.pHist)) < 1e-12);
-  ok('режим «худшая из двух» берёт максимум', useMax, `проверено строк ${measured.length}`);
+  const useMax = measured.every((r) => {
+    const thinRow = r.histInfo != null && r.histInfo.independent < 30;
+    const want = thinRow ? r.pRN : Math.max(r.pRN, r.pHist);
+    return Math.abs(r.pConv - want) < 1e-12;
+  });
+  ok('осторожный режим учитывает вес исторической выборки', useMax, `проверено строк ${measured.length}`);
 
   // Монотонность внутри одного продукта: дальше страйк — ниже риск и ниже ставка.
   const byProduct = new Map();
@@ -532,6 +540,21 @@ console.log('\n── 9. Историческая мера');
     if (r.pHist != null && r.shortfall > r.pHist + 1e-9) shortfallBad++;
   }
   ok('ожидаемая потеря не превышает вероятность конвертации', shortfallBad === 0, `нарушений ${shortfallBad}`);
+
+  // Осторожный режим не должен опираться на историческую частоту там, где она
+  // построена на горстке независимых окон.
+  const thinSample = buy.filter((r) => r.histInfo && r.histInfo.independent < 30 && r.pRN != null && r.pHist != null);
+  const thickSample = buy.filter((r) => r.histInfo && r.histInfo.independent >= 30 && r.pRN != null && r.pHist != null);
+  ok(
+    'тонкая историческая выборка исключена из осторожной оценки',
+    thinSample.every((r) => Math.abs(r.pConv - r.pRN) < 1e-12),
+    `строк с тонкой выборкой ${thinSample.length}`,
+  );
+  ok(
+    'на плотной выборке осторожная оценка берёт максимум',
+    thickSample.every((r) => Math.abs(r.pConv - Math.max(r.pRN, r.pHist)) < 1e-12),
+    `строк с плотной выборкой ${thickSample.length}`,
+  );
 }
 
 // ─────────────────────────────────────────── 10. Блок Sell High
