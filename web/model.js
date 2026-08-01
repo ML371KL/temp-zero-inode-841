@@ -69,8 +69,17 @@ export class History {
     let hit = this.cache.get(id);
     if (!hit) {
       const closes = this.raw[p.key].series.map((r) => r[1]);
+      const sorted = logReturns(closes, p.bars);
+      // Среднее и разброс самой выборки: по ним она приводится к сегодняшнему
+      // рынку. Считаем один раз вместе с рядом, чтобы не пересчитывать на
+      // каждую строку таблицы.
+      const mean = sorted.length ? sorted.reduce((a, b) => a + b, 0) / sorted.length : 0;
+      const variance =
+        sorted.length > 1 ? sorted.reduce((a, b) => a + (b - mean) ** 2, 0) / (sorted.length - 1) : 0;
       hit = {
-        sorted: logReturns(closes, p.bars),
+        sorted,
+        mean,
+        sigma: Math.sqrt(variance),
         key: p.key,
         bars: p.bars,
         spanDays: p.spanDays,
@@ -118,12 +127,34 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
   // Историческая частота срабатывания на том же горизонте.
   const hist = history ? history.returns(timing.tauDays) : null;
   let pHist = null;
+  let pHistScaled = null;
   let shortfall = null;
   if (hist && hist.sorted.length) {
     const x = Math.log(strike / spot);
     const below = empiricalCdf(hist.sorted, x);
     pHist = direction === 'BuyLow' ? below : 1 - below;
     shortfall = empiricalShortfall(hist.sorted, spot, strike, direction);
+
+    // Та же выборка, приведённая к сегодняшнему рынку.
+    //
+    // Сырая историческая частота описывает мир, в котором BTC ходил с
+    // волатильностью около 52% годовых и рос на 12% в год. Сегодня рынок
+    // опционов оценивает ближайшие дни в 17–25%. Подставлять в решение о
+    // завтрашней оферте распределение пятилетней давности — значит мерить не
+    // сегодняшний риск, а средний за пять лет.
+    //
+    // Поэтому у выборки убирается её собственный дрейф (направление прошлого —
+    // плохой прогноз), масштаб приводится к текущей волатильности, а сносом
+    // ставится сегодняшний форвард. Остаётся то, ради чего историю и берут:
+    // форма распределения — толстые хвосты и асимметрия, которых нет у
+    // логнормального приближения.
+    if (sigma > 0 && hist.sigma > 0 && Teff > 0) {
+      const k = (sigma * Math.sqrt(Teff)) / hist.sigma;
+      const drift = Math.log(forward / spot);
+      const shifted = hist.sorted.map((r) => (r - hist.mean) * k + drift);
+      const belowScaled = empiricalCdf(shifted, x);
+      pHistScaled = direction === 'BuyLow' ? belowScaled : 1 - belowScaled;
+    }
   }
 
   // Ставка, которую платил бы рынок опционов за тот же риск, в тех же единицах
@@ -190,6 +221,7 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
     exactExpiry: surface ? hasExactExpiry(surface, timing.settle) : false,
     pRN: valued.pTriggerRN,
     pHist,
+    pHistScaled,
     histInfo: hist
       ? {
           series: SERIES_LABEL[hist.key] || hist.key,
@@ -242,12 +274,14 @@ function computeMoney({ direction, amount, strike, i, spot }) {
 // 10 процентных пунктов — такой оценке нельзя позволять управлять отбором.
 export const MIN_INDEPENDENT_WINDOWS = 30;
 
-/** Какую вероятность считать рабочей: рыночную, историческую или худшую из двух. */
+/** Какую вероятность считать рабочей. */
 export function pickProbability(row, measure) {
   const a = row.pRN;
-  const b = row.pHist;
+  // В осторожном режиме сравниваем с нормированной историей: сырая описывает
+  // волатильность пятилетней давности, а решение принимается про сегодня.
+  const b = measure === 'hist' ? row.pHist : (row.pHistScaled ?? row.pHist);
   if (measure === 'rn') return a;
-  if (measure === 'hist') return b;
+  if (measure === 'hist' || measure === 'hist-scaled') return b;
   if (a == null) return b;
   if (b == null) return a;
   // В осторожном режиме историческую оценку берём в расчёт только там, где под
@@ -380,7 +414,10 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
       payoutBtc,
       usdtIfSold,
       profitUsdt: usdtIfSold != null && spent != null ? usdtIfSold - spent : null,
-      profitPct: usdtIfSold != null && spent > 0 ? usdtIfSold / spent - 1 : null,
+      // Доходность выхода не зависит от размера позиции: продаётся (1+i) монеты
+      // по цене K против себестоимости basis. Раньше она считалась только при
+      // введённом количестве, из-за чего отбор до ввода количества был слеп.
+      profitPct: basis > 0 ? ((1 + r.i) * r.strike) / basis - 1 : null,
       recovery: rec,
       expReturnVsBasis,
     };
@@ -402,9 +439,20 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
     }
   }
 
-  // Среди безубыточных оферт срабатывание — это желанный выход в USDT,
-  // поэтому фронт строится по максимуму и доходности, и вероятности продажи.
-  const front = paretoFront(profitable, 'aprEff', 'pConv', false);
+  // Фронт выхода строится по паре «прибыль от продажи — вероятность продажи».
+  //
+  // Раньше здесь стоял эффективный APR, механически перенесённый со стороны
+  // Buy Low. Это была ошибка. Вдоль лестницы Sell High ставка и вероятность
+  // срабатывания движутся в одну сторону: чем ниже страйк, тем и APR выше, и
+  // продажа вероятнее. Пара из двух согласованных величин фронта почти не даёт
+  // (на живых данных из 186 безубыточных оферт на нём оказывались две) и всегда
+  // тянет к самому низкому страйку, то есть к минимальной выручке.
+  //
+  // Настоящий компромисс выхода другой: выше страйк — больше денег на руки, но
+  // меньше шанс, что продажа состоится. Прибыль и вероятность действительно
+  // тянут в разные стороны, и фронт по ним содержателен: те же данные дают 16
+  // недоминируемых оферт с выручкой от долей процента до 36%.
+  const front = paretoFront(profitable, 'profitPct', 'pConv', false);
   for (const r of out) r.sellPareto = front.has(r);
 
   // Убыточные уходят вниз: они не решают задачу выхода, даже если ставка выше.
@@ -502,11 +550,12 @@ export function pickAnchors(rows) {
  * при минимуме вероятности срабатывания — заработок в BTC без фиксации убытка.
  */
 export function pickBestSell({ rows, limit = 6 }) {
-  const profitable = rows.filter((r) => r.profitable && Number.isFinite(r.aprEff));
+  const profitable = rows.filter((r) => r.profitable && Number.isFinite(r.profitPct));
   if (profitable.length) {
-    const front = profitable.filter((r) => r.sellPareto).sort((a, b) => b.aprEff - a.aprEff);
-    const rest = profitable.filter((r) => !r.sellPareto).sort((a, b) => b.aprEff - a.aprEff);
-    return { mode: 'exit', rows: [...front, ...rest].slice(0, limit) };
+    // Сортируем по вероятности продажи от большей к меньшей: сверху самый
+    // реалистичный выход, ниже — всё более дорогие, но всё менее вероятные.
+    const front = profitable.filter((r) => r.sellPareto).sort((a, b) => b.pConv - a.pConv);
+    return { mode: 'exit', rows: front.slice(0, limit) };
   }
 
   const usable = rows.filter((r) => Number.isFinite(r.aprEff) && Number.isFinite(r.pConv));

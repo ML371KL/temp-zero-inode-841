@@ -351,6 +351,14 @@ console.log('\n── 5. Фронт Парето: сверка с полным �
   );
   ok('каждая оферта вне фронта побита офертой с фронта', uncovered.length === 0, `непокрытых ${uncovered.length}`);
 
+  // Перекошенная оферта не может быть на фронте по построению: соседний страйк
+  // того же продукта даёт и большую ставку, и меньший риск.
+  ok(
+    'перекосы лестницы не попадают на фронт',
+    buy.filter((r) => r.laddered && r.pareto).length === 0,
+    `перекошенных всего ${buy.filter((r) => r.laddered).length}`,
+  );
+
   const steps = frontierWithMargins(buy, riskFree ?? 0);
   ok('фронт отсортирован по возрастанию риска', steps.every((r, k) => k === 0 || r.pConv >= steps[k - 1].pConv));
   ok('доходность вдоль фронта не убывает', steps.every((r, k) => k === 0 || r.aprEff >= steps[k - 1].aprEff - 1e-12));
@@ -486,7 +494,8 @@ console.log('\n── 8. Внутренняя согласованность с�
   const measured = buy.filter((r) => r.pRN != null && r.pHist != null);
   const useMax = measured.every((r) => {
     const thinRow = r.histInfo != null && r.histInfo.independent < 30;
-    const want = thinRow ? r.pRN : Math.max(r.pRN, r.pHist);
+    const h = r.pHistScaled ?? r.pHist;
+    const want = thinRow ? r.pRN : Math.max(r.pRN, h);
     return Math.abs(r.pConv - want) < 1e-12;
   });
   ok('осторожный режим учитывает вес исторической выборки', useMax, `проверено строк ${measured.length}`);
@@ -541,6 +550,26 @@ console.log('\n── 9. Историческая мера');
   }
   ok('ожидаемая потеря не превышает вероятность конвертации', shortfallBad === 0, `нарушений ${shortfallBad}`);
 
+  const scaled = buy.filter((r) => r.pHistScaled != null);
+  ok(
+    'нормированная историческая мера лежит в [0,1]',
+    scaled.every((r) => r.pHistScaled >= 0 && r.pHistScaled <= 1),
+    `строк ${scaled.length} из ${buy.length}`,
+  );
+  let monoScaled = 0;
+  const groups = new Map();
+  for (const r of scaled) {
+    if (!groups.has(r.productId)) groups.set(r.productId, []);
+    groups.get(r.productId).push(r);
+  }
+  for (const list of groups.values()) {
+    const srt = [...list].sort((a, b) => a.strike - b.strike);
+    for (let k = 1; k < srt.length; k++) if (srt[k].pHistScaled < srt[k - 1].pHistScaled - 1e-12) monoScaled++;
+  }
+  ok('нормированная мера растёт со страйком внутри продукта', monoScaled === 0, `нарушений ${monoScaled}`);
+  const shrunk = scaled.filter((r) => r.pHistScaled < r.pHist).length;
+  console.log(`       нормировка снизила вероятность у ${shrunk} строк из ${scaled.length}`);
+
   // Осторожный режим не должен опираться на историческую частоту там, где она
   // построена на горстке независимых окон.
   const thinSample = buy.filter((r) => r.histInfo && r.histInfo.independent < 30 && r.pRN != null && r.pHist != null);
@@ -552,7 +581,7 @@ console.log('\n── 9. Историческая мера');
   );
   ok(
     'на плотной выборке осторожная оценка берёт максимум',
-    thickSample.every((r) => Math.abs(r.pConv - Math.max(r.pRN, r.pHist)) < 1e-12),
+    thickSample.every((r) => Math.abs(r.pConv - Math.max(r.pRN, r.pHistScaled ?? r.pHist)) < 1e-12),
     `строк с плотной выборкой ${thickSample.length}`,
   );
 }
@@ -653,9 +682,12 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
   ok('режим определён верно', best.mode === (analyzed.some((r) => r.profitable) ? 'exit' : 'wait'), best.mode);
   if (best.mode === 'exit') {
     ok('в режиме выхода показаны только безубыточные', best.rows.every((r) => r.profitable));
-    const pool = analyzed.filter((r) => r.profitable && Number.isFinite(r.aprEff) && Number.isFinite(r.pConv));
+    const pool = analyzed.filter((r) => r.profitable && Number.isFinite(r.profitPct) && Number.isFinite(r.pConv));
     const dominated = (a) =>
-      pool.some((b) => b !== a && b.aprEff >= a.aprEff && b.pConv >= a.pConv && (b.aprEff > a.aprEff || b.pConv > a.pConv));
+      pool.some(
+        (b) =>
+          b !== a && b.profitPct >= a.profitPct && b.pConv >= a.pConv && (b.profitPct > a.profitPct || b.pConv > a.pConv),
+      );
     const brute = pool.filter((r) => !dominated(r));
     const model = pool.filter((r) => r.sellPareto);
     ok(
@@ -700,6 +732,19 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     const s2 = [...list].sort((a, b) => b.strike - a.strike);
     for (let k = 1; k < s2.length; k++) if (s2[k].apy < s2[k - 1].apy - 1e-9) ladderBad.push(`${s2[k].duration}/${s2[k].strike}`);
   }
+  // Прибыль выхода — свойство самой оферты, а не размера позиции. Раньше она
+  // считалась только при введённом количестве, и до ввода отбор был слеп.
+  const noQty = analyzeSellHigh({ rows: sell, basis, qty: 0, spot, history, measure: 'max' });
+  ok(
+    'доходность выхода считается и без указанного количества',
+    noQty.every((r) => Number.isFinite(r.profitPct)),
+    `строк ${noQty.length}`,
+  );
+  ok(
+    'прибыль выхода = (1+i)K/себестоимость − 1',
+    analyzed.every((r) => Math.abs(r.profitPct - (((1 + r.i) * r.strike) / basis - 1)) < 1e-12),
+  );
+
   const flaggedSell = sell.filter((r) => r.laddered).length;
   ok(
     'перекосы лестницы Sell High помечены',

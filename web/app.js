@@ -164,11 +164,17 @@ function fmtLadderFlag(row) {
  * и в осторожном режиме вообще не участвует в отборе.
  */
 function fmtHist(row) {
-  if (row.pHist == null) return '<span class="muted">—</span>';
+  const value = row.pHistScaled ?? row.pHist;
+  if (value == null) return '<span class="muted">—</span>';
   const ind = row.histInfo?.independent;
   const thin = ind != null && ind < MIN_INDEPENDENT_WINDOWS;
-  const title = ind == null ? '' : ` title="независимых окон в выборке: ${Math.round(ind)}"`;
-  return `<span class="${thin ? 'muted' : ''}"${title}>${fmtPct(row.pHist, 2)}${thin ? '&nbsp;·&nbsp;тонкая' : ''}</span>`;
+  const parts = [];
+  if (ind != null) parts.push(`независимых окон: ${Math.round(ind)}`);
+  if (row.pHistScaled != null && row.pHist != null) {
+    parts.push(`без нормировки: ${fmtPct(row.pHist, 2)}`);
+  }
+  const title = parts.length ? ` title="${parts.join(' · ')}"` : '';
+  return `<span class="${thin ? 'muted' : ''}"${title}>${fmtPct(value, 2)}${thin ? '&nbsp;·&nbsp;тонкая' : ''}</span>`;
 }
 
 /** Перцентиль текущей ставки относительно собранного архива. */
@@ -380,7 +386,7 @@ const BUY_COLUMNS = [
   ['Блокировка', (r) => fmtSpan(r.timing.lockDays)],
   ['Мёртвое', (r) => `<span class="muted">${fmtSpan(r.timing.idleDays)}</span>`],
   ['P рын.', (r) => fmtPct(r.pRN, 2)],
-  ['P ист.', (r) => fmtHist(r)],
+  ['P ист. норм.', (r) => fmtHist(r)],
   ['P раб.', (r) => `<b class="${r.pConv > 0.15 ? 'neg' : ''}">${fmtPct(r.pConv, 2)}</b>`],
   ['σ рынок', (r) => fmtPct(r.sigma, 1)],
   ['σ оферты', (r) => fmtPct(r.offerVol, 1)],
@@ -537,7 +543,11 @@ function sellCardFor(row, mode) {
   return `
     <article class="card${row.sellPareto || row.waitPareto ? ' pareto' : ''}" data-product="${row.productId}">
       <div class="card-top">
-        <div class="apr">${fmtPct(row.aprEff, 1)}<small>эффективный · заявлен ${fmtPct(row.apy, 1)}</small></div>
+        <div class="apr">${
+          mode === 'exit'
+            ? `${fmtSigned(row.profitPct, 2)}<small>прибыль к себестоимости · APR ${fmtPct(row.aprEff, 1)}</small>`
+            : `${fmtPct(row.aprEff, 1)}<small>эффективный · заявлен ${fmtPct(row.apy, 1)}</small>`
+        }</div>
         <div class="tags">${tags.join('')}</div>
       </div>
       <dl class="kv">
@@ -695,7 +705,7 @@ function renderSell(rows) {
   const best = pickBestSell({ rows: analyzed });
   $('best-sell-head').innerHTML =
     best.mode === 'exit'
-      ? '<h3>Оптимальный выход в USDT</h3><div class="hint">фронт Парето среди безубыточных оферт: здесь срабатывание страйка — желанный исход, поэтому максимизируются обе величины сразу — ставка и вероятность продажи</div>'
+      ? '<h3>Оптимальный выход в USDT</h3><div class="hint">фронт Парето по паре «прибыль к себестоимости — вероятность продажи». Именно эти две величины тянут в разные стороны: чем выше страйк, тем больше денег на руки, но тем меньше шанс, что продажа состоится. Сверху самый вероятный выход, ниже — всё более дорогие и всё менее вероятные</div>'
       : '<h3>Заработок на ожидании</h3><div class="hint">безубыточного выхода сейчас нет, поэтому срабатывание страйка означало бы принудительную продажу дешевле себестоимости: здесь отобраны оферты с наибольшей ставкой при наименьшем риске такой продажи</div>';
   $('best-sell').innerHTML = best.rows.length
     ? best.rows.map((r) => sellCardFor(r, best.mode)).join('')
