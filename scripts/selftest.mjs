@@ -703,6 +703,75 @@ section('Срочная структура волатильности и сце�
   ok('рост выборки посчитан', Number.isFinite(auto), `${(auto * 100).toFixed(2)}% годовых`);
 }
 
+// ────────────────────────────────────────────── 8e3. Кэш и вырожденный ввод
+
+section('Кэш не растёт, вырожденный ввод не выдаётся за ответ');
+{
+  // Регрессия, которую прежние тесты поймать не могли: они считали один кадр,
+  // а течь проявляется только на череде кадров с непрерывно меняющимися
+  // временем до сеттлмента и спотом. Замер до починки: 8059 записей за 60
+  // кадров и девять гигабайт за час работы вкладки.
+  const step = MS_DAY;
+  let seed = 999;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5);
+  const series = [];
+  let px = 60000;
+  for (let k = 0; k < 700; k++) {
+    px *= Math.exp(0.0003 + 0.02 * rnd());
+    series.push([k * step, px]);
+  }
+  const hist = new History({ D: { stepMs: step, series } });
+  const curve = atmVarianceCurve({
+    expiries: [
+      { T: 0.1, smile: [{ x: -0.1, iv: 0.4 }, { x: 0.1, iv: 0.4 }] },
+      { T: 0.5, smile: [{ x: -0.1, iv: 0.5 }, { x: 0.1, iv: 0.5 }] },
+    ],
+  });
+  hist.useScenario({ cagr: 0.1, curve, id: 'cache' });
+
+  const H = 90;
+  // Сорок кадров: τ убывает посекундно, как в проде.
+  for (let f = 0; f < 40; f++) {
+    const tau = 5.4 - f * 0.00002;
+    hist.pathSeries(tau, 6, H);
+    hist.pathExtremes(tau, 6, H);
+    hist.scaled(5.4, 0.4 + f * 1e-6, 0.0147, 1.001 + f * 1e-7);
+  }
+  ok(
+    'кэш не растёт от кадра к кадру',
+    hist.cache.size < 20,
+    `записей ${hist.cache.size} после 40 кадров — ключи привязаны к барам, а не к суткам`,
+  );
+  const heavy = [...hist.cache.keys()].filter((k) => k.startsWith('paths:') || k.startsWith('sorted:'));
+  ok('тяжёлых сеток ровно по одной на конфигурацию', heavy.length <= 2, `${heavy.join(', ')}`);
+  ok('нормированные серии не кэшируются вовсе', ![...hist.cache.keys()].some((k) => k.startsWith('scaled:')));
+
+  // Вырожденная поверхность обязана отдаваться как отсутствие данных.
+  ok('пустая поверхность → null, а не нулевая волатильность', atmVarianceCurve({ expiries: [] }) === null);
+  ok(
+    'одной экспирации мало для кривой',
+    atmVarianceCurve({ expiries: [{ T: 0.1, smile: [{ x: 0, iv: 0.4 }] }] }) === null,
+  );
+  {
+    // Без кривой участок остаётся историческим, а не нулевым: риск не обнуляется.
+    const h2 = new History({ D: { stepMs: step, series } });
+    h2.useScenario({ cagr: 0.1, curve: null, id: 'nocurve' });
+    const sp = h2.scenarioPaths(H);
+    const t = [];
+    for (let p = 0; p < sp.paths; p++) t.push(sp.ratio[p * sp.width + sp.bars]);
+    ok('без кривой траектории всё равно расходятся', Math.max(...t) - Math.min(...t) > 0.05, `размах ${(Math.max(...t) - Math.min(...t)).toFixed(3)}`);
+  }
+
+  // Невозможный сценарий роста не должен рождать нечисла.
+  for (const bad of [-1, -1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const h3 = new History({ D: { stepMs: step, series } });
+    h3.useScenario({ cagr: bad, curve, id: `bad${bad}` });
+    const sp = h3.scenarioPaths(H);
+    const finite = sp && [...sp.ratio.slice(0, 500)].every(Number.isFinite);
+    ok(`рост ${bad} не рождает нечисел`, finite === true);
+  }
+}
+
 // ────────────────────────────────────────────── 8f. Свежесть котировок
 
 section('Свежесть котировок');
