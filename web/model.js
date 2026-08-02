@@ -83,6 +83,8 @@ export class History {
   constructor(series) {
     // series: { '60': {stepMs, series:[[ts,close]]}, '240': {...}, 'D': {...} }
     this.raw = series;
+    // Ключи здесь приведены к дискретным величинам — номерам баров и срокам, —
+    // поэтому карта не растёт: она меняется, только когда меняется сам бар.
     this.cache = new Map();
   }
 
@@ -220,14 +222,20 @@ export class History {
     const histVol = Math.sqrt(varBar / barYears);
     const hb = best.bars;
     const curve = this.scenario?.curve ?? null;
-    const cagr = this.scenario?.cagr ?? null;
+    // Падение на сто процентов и глубже — не сценарий, а неверный ввод:
+    // логарифм ушёл бы в минус бесконечность и все траектории стали бы NaN.
+    // Такой сценарий отбрасывается целиком, ряд остаётся историческим.
+    const asked = this.scenario?.cagr ?? null;
+    const cagr = asked != null && asked > -1 && Number.isFinite(asked) ? asked : null;
 
     // Множители по участкам пути: чем дальше точка, тем свою форвардную
     // волатильность рынок ей и приписывает.
     const lam = new Float64Array(hb + 1);
     for (let j = 1; j <= hb; j++) {
       const fv = curve ? forwardVol(curve, (j - 1) * barYears, j * barYears) : null;
-      lam[j] = fv != null && histVol > 0 ? fv / histVol : 1;
+      // Нулевой или неопределённый множитель означает отсутствие данных, а не
+      // отсутствие риска. В таком случае участок остаётся историческим.
+      lam[j] = fv > 0 && histVol > 0 ? fv / histVol : 1;
     }
     const drift = cagr == null ? mean : Math.log(1 + cagr) * barYears;
 
@@ -289,47 +297,50 @@ export class History {
     // ни разу.
     const n = horizonDays < firstDays ? 0 : 1 + Math.floor((horizonDays - firstDays) / cycleDays);
     if (!(n >= 1)) return null;
-    const id = `paths:${firstDays.toFixed(4)}:${cycleDays.toFixed(4)}:${horizonDays}`;
-    const cached = this.cache.get(id);
-    if (cached !== undefined) return cached;
 
     // Траектории общие для всех оферт: здесь мы только снимаем с них свои
     // контрольные точки. Первая — на τ, дальше через цикл; всё округляется до
     // баров ряда, потому что доли своего шага ряд не разрешает.
     const base = this.scenarioPaths(horizonDays);
-    if (!base) {
-      this.cache.set(id, null);
-      return null;
-    }
+    if (!base) return null;
     const paths = base.paths;
     const cycleBars = Math.max(1, Math.round(cycleDays / base.barDays));
     const firstBars = Math.max(1, Math.round(firstDays / base.barDays));
-    if (firstBars > base.bars) {
-      this.cache.set(id, null);
-      return null;
-    }
+    if (firstBars > base.bars) return null;
 
-    const runMin = new Float64Array(paths * n);
-    const runMax = new Float64Array(paths * n);
-    const terminal = new Float64Array(paths);
-    for (let p = 0; p < paths; p++) {
-      const row = p * base.width;
-      let lo = Infinity;
-      let hi = -Infinity;
-      for (let k = 0; k < n; k++) {
-        const v = base.ratio[row + Math.min(base.bars, firstBars + k * cycleBars)];
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
-        runMin[p * n + k] = lo;
-        runMax[p * n + k] = hi;
+    // Ключ кэша строится по УЖЕ ОКРУГЛЁННЫМ барам, а не по сырым суткам.
+    // τ убывает непрерывно, и ключ вида firstDays.toFixed(4) менялся каждые
+    // восемь секунд: за час набегали сотни матриц по несколько мегабайт, и все
+    // оставались в памяти. По барам ключ стабилен целые сутки.
+    const id = `paths:${horizonDays}:${firstBars}:${cycleBars}:${n}`;
+    let heavy = this.cache.get(id);
+    if (heavy === undefined) {
+      const runMin = new Float64Array(paths * n);
+      const runMax = new Float64Array(paths * n);
+      const terminal = new Float64Array(paths);
+      for (let p = 0; p < paths; p++) {
+        const row = p * base.width;
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (let k = 0; k < n; k++) {
+          const v = base.ratio[row + Math.min(base.bars, firstBars + k * cycleBars)];
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+          runMin[p * n + k] = lo;
+          runMax[p * n + k] = hi;
+        }
+        terminal[p] = base.ratio[row + base.bars];
       }
-      terminal[p] = base.ratio[row + base.bars];
+      heavy = { runMin, runMax, terminal };
+      this.cache.set(id, heavy);
     }
 
-    const hit = {
-      runMin,
-      runMax,
-      terminal,
+    // Тяжёлые массивы кэшируются по барам, а точные в сутках величины считаются
+    // на каждый вызов: они дёшевы, а округлять их до бара было бы враньём.
+    return {
+      runMin: heavy.runMin,
+      runMax: heavy.runMax,
+      terminal: heavy.terminal,
       paths,
       cycles: n,
       firstDays,
@@ -352,8 +363,6 @@ export class History {
       spanDays: base.spanDays,
       series: base.series,
     };
-    this.cache.set(id, hit);
-    return hit;
   }
 
   /**
@@ -362,14 +371,15 @@ export class History {
    * Вероятность для любого страйка после этого — один двоичный поиск.
    */
   pathExtremes(firstDays, cycleDays, horizonDays) {
-    const id = `sorted:${firstDays.toFixed(4)}:${cycleDays.toFixed(4)}:${horizonDays}`;
+    const base = this.pathSeries(firstDays, cycleDays, horizonDays);
+    if (!base) return null;
+    // Ключ, как и у попутевых рядов, по округлённым барам: сортированные ряды
+    // выводятся из них однозначно.
+    const id = `sorted:${horizonDays}:${Math.round(base.firstCheckpointDays / base.barDays)}:${Math.round(
+      base.cycleCheckpointDays / base.barDays,
+    )}:${base.cycles}`;
     const cached = this.cache.get(id);
     if (cached !== undefined) return cached;
-    const base = this.pathSeries(firstDays, cycleDays, horizonDays);
-    if (!base) {
-      this.cache.set(id, null);
-      return null;
-    }
     const n = base.cycles;
     const running = [];
     const runningDown = [];
@@ -451,21 +461,24 @@ export class History {
   scaled(tauDays, sigma, Teff, gross) {
     const hist = this.returns(tauDays);
     if (!hist?.sorted.length || !(sigma > 0) || !(hist.sigma > 0) || !(Teff > 0) || !(gross > 0)) return null;
-    const id = `scaled:${hist.key}:${hist.bars}:${sigma.toFixed(6)}:${Teff.toFixed(8)}:${gross.toFixed(8)}`;
-    const cached = this.cache.get(id);
-    if (cached !== undefined) return cached;
+    // Намеренно без кэша.
+    //
+    // Результат зависит от масштаба и сноса, а те — от времени до сеттлмента и
+    // от спота, то есть от величин непрерывных. Ключ был бы новым на каждом
+    // кадре, и карта росла бы неограниченно: замер показал девять гигабайт за
+    // час работы вкладки. Округление ключа снимало бы рост, но ломало точное
+    // тождество E[S_T] = F — а выигрыш от кэша всего 2.5 мс на кадр из 35.
+    // Точность формулы дороже.
+    const k = (sigma * Math.sqrt(Teff)) / hist.sigma;
+    const drift = Math.log(gross);
     // Масштаб — к сегодняшней волатильности, снос — к сегодняшнему форварду.
     // Аффинное преобразование монотонно, поэтому порядок сохраняется и
     // пересортировывать ряд не нужно.
-    const k = (sigma * Math.sqrt(Teff)) / hist.sigma;
-    const drift = Math.log(gross);
     const shifted = hist.sorted.map((r) => (r - hist.mean) * k + drift);
     // Мартингальная поправка: без неё E[S_T] уезжает выше форварда из-за
     // выпуклости экспоненты, и в меру риска попадает молчаливый прогноз роста.
     const fix = martingaleShift(shifted, gross);
-    const out = fix === 0 ? shifted : shifted.map((r) => r + fix);
-    this.cache.set(id, out);
-    return out;
+    return fix === 0 ? shifted : shifted.map((r) => r + fix);
   }
 
   /** Отсортированные логарифмические доходности на горизонте tauDays. */

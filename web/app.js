@@ -314,7 +314,10 @@ function applyScenario() {
   if (!state.history) return null;
   const auto = sampleCagr(state.history, H);
   const typed = ui.cagr === '' ? null : Number(ui.cagr) / 100;
-  const cagr = Number.isFinite(typed) ? typed : auto;
+  // Ниже −95% годовых считать нечего: цена обращается в ноль, и весь расчёт
+  // вырождается. Сверху ограничиваем десятикратным ростом — дальше это уже не
+  // предпосылка, а опечатка.
+  const cagr = Number.isFinite(typed) ? Math.min(Math.max(typed, -0.95), 10) : auto;
   state.varCurve = state.surface ? atmVarianceCurve(state.surface) : null;
   // Ключ сценария включает момент пересборки поверхности: кривая живёт минуту,
   // и без этого траектории остались бы на позавчерашней волатильности.

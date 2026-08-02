@@ -1472,7 +1472,10 @@ console.log('\n── 18. Предпосылки о рынке: кривая в�
 {
   const H = 90;
   const curve = atmVarianceCurve(surface);
-  ok('кривая накопленной дисперсии собрана', curve.points.length >= 5, `${curve.points.length} экспираций, починено провалов ${curve.repaired}`);
+  ok('кривая накопленной дисперсии собрана', curve != null && curve.points.length >= 5, curve ? `${curve.points.length} экспираций, починено провалов ${curve.repaired}` : 'кривая вырождена');
+  // Вырожденная кривая обязана отдаваться как отсутствие данных, а не как
+  // нулевая волатильность: иначе риск обнулился бы у всех оферт разом.
+  ok('пустая поверхность не выдаётся за нулевую волатильность', atmVarianceCurve({ expiries: [] }) === null);
   ok(
     'после починки кривая не убывает',
     curve.points.every((p, k) => k === 0 || p.w >= curve.points[k - 1].w - 1e-15),

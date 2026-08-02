@@ -617,7 +617,20 @@ section('Срочная структура волатильности и сце�
   const hist = new History({ D: { stepMs: step, series } });
   const H = 90;
 
-  hist.useScenario({ cagr: 0.11, curve, id: 'test' });
+  // Для проверки накопленной изменчивости нужна кривая БЕЗ починенных участков:
+  // на плоском участке рынок как бы обещает ноль дополнительной дисперсии, а
+  // ноль на десятках дней BTC физически невозможен, поэтому такой участок
+  // намеренно остаётся историческим — и равенство с кривой там не выполняется.
+  const clean = atmVarianceCurve({
+    expiries: [
+      { T: 0.1, smile: [{ x: -0.1, iv: 0.4 }, { x: 0.1, iv: 0.4 }] },
+      { T: 0.3, smile: [{ x: -0.1, iv: 0.45 }, { x: 0.1, iv: 0.45 }] },
+      { T: 0.6, smile: [{ x: -0.1, iv: 0.5 }, { x: 0.1, iv: 0.5 }] },
+    ],
+  });
+  ok('чистая кривая не требует починки', clean.repaired === 0);
+
+  hist.useScenario({ cagr: 0.11, curve: clean, id: 'clean' });
   const sp = hist.scenarioPaths(H);
   ok('сценарные траектории построены', sp != null && sp.paths > 100, `${sp?.paths} траекторий`);
 
@@ -636,12 +649,32 @@ section('Срочная структура волатильности и сце�
     }
     accVar += s / sp.paths;
   }
-  const want = totalVariance(curve, H / 365);
+  const want = totalVariance(clean, H / 365);
   ok(
     'накопленная дисперсия траекторий равна рыночной w(H)',
     Math.abs(accVar / want - 1) < 0.05,
     `получено ${accVar.toFixed(5)}, рынок ${want.toFixed(5)}, отклонение ${((accVar / want - 1) * 100).toFixed(2)}%`,
   );
+
+  // А на кривой с починенным участком изменчивость обязана быть НЕ МЕНЬШЕ
+  // рыночной: плоский участок остаётся историческим, а не нулевым.
+  hist.useScenario({ cagr: 0.11, curve, id: 'repaired' });
+  const spR = hist.scenarioPaths(H);
+  let varR = 0;
+  for (let j = 1; j <= spR.bars; j++) {
+    let s2 = 0;
+    for (let p = 0; p < spR.paths; p++) {
+      s2 += (Math.log(spR.ratio[p * spR.width + j]) - Math.log(spR.ratio[p * spR.width + j - 1])) ** 2;
+    }
+    varR += s2 / spR.paths;
+  }
+  const wantR = totalVariance(curve, H / 365);
+  ok(
+    'на починенном участке изменчивость не обнуляется',
+    varR > wantR * 1.01,
+    `${varR.toFixed(5)} против рыночных ${wantR.toFixed(5)} — плоский участок взят историческим`,
+  );
+  hist.useScenario({ cagr: 0.11, curve: clean, id: 'clean' });
 
   // Все оферты обязаны считаться на ОДНОМ наборе траекторий.
   const a = hist.pathSeries(1.5, 2, H);
@@ -654,10 +687,10 @@ section('Срочная структура волатильности и сце�
 
   // Смена сценария обязана сбрасывать кэш.
   const before = sp.ratio[sp.bars];
-  hist.useScenario({ cagr: 0.4, curve, id: 'test' });
+  hist.useScenario({ cagr: 0.4, curve: clean, id: 'clean' });
   const sp2 = hist.scenarioPaths(H);
   ok('смена сценария меняет траектории', Math.abs(sp2.ratio[sp2.bars] - before) > 1e-9);
-  hist.useScenario({ cagr: 0.11, curve, id: 'test' });
+  hist.useScenario({ cagr: 0.11, curve: clean, id: 'clean' });
   near('возврат к прежнему сценарию воспроизводит траектории', hist.scenarioPaths(H).ratio[sp.bars], before, 1e-15);
 
   // Без сценария ряд обязан остаться ровно тем, что пришло с биржи.
