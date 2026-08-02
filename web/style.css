@@ -464,6 +464,18 @@ h2 {
   color: var(--warn);
 }
 
+/* Ссылка на инструкцию в подвале: заметная, но не кричащая. */
+.guide-link {
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: none;
+  margin-right: 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.guide-link:hover {
+  border-bottom-color: var(--accent);
+}
+
 /* ───────────────────────────────── переключатель постановки задачи */
 
 .modes {
