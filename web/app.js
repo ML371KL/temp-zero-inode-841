@@ -303,7 +303,12 @@ function currentRows(direction) {
     horizonDays: horizonDays(),
   });
   const allowed = new Set(ui.durations);
-  return allowed.size ? rows.filter((r) => allowed.has(r.duration)) : rows;
+  if (!allowed.size) return rows;
+  // Фильтр по срокам не должен терять счётчик протухших: он висит свойством на
+  // массиве, а filter отдаёт голый новый массив.
+  const kept = rows.filter((r) => allowed.has(r.duration));
+  kept.staleCount = kept.filter((r) => r.quoteStale).length;
+  return kept;
 }
 
 function sortRows(rows) {
@@ -646,7 +651,9 @@ function renderBuy(rows) {
       ? ` · <span class="flag">⚠</span> ${laddered}: у этих оферт в той же лестнице есть страйк дальше от рынка, ` +
         'который платит не меньше — то есть строго безопаснее и не хуже по доходности'
       : '');
-  renderLimitedTable('buy', $('buy-table'), BUY_COLUMNS, sorted, (r) => (r.pareto ? 'pareto' : ''));
+  renderLimitedTable('buy', $('buy-table'), BUY_COLUMNS, sorted, (r) =>
+    [r.pareto ? 'pareto' : '', r.quoteStale ? 'dim' : ''].filter(Boolean).join(' '),
+  );
   renderAnchors(rows);
   renderFrontier(rows);
 
@@ -1027,8 +1034,38 @@ function renderSell(rows) {
     : '<div class="empty">нет доступных оферт Sell High при текущих фильтрах</div>';
 
   renderLimitedTable('sell', $('sell-table'), SELL_COLUMNS, analyzed, (r) =>
-    r.profitable ? (r.sellPareto ? 'pareto' : '') : 'dim',
+    r.quoteStale ? 'dim' : r.profitable ? (r.sellPareto ? 'pareto' : '') : 'dim',
   );
+}
+
+/**
+ * Свежесть котировок.
+ *
+ * Ставка Bybit живёт 2–55 секунд. Пока поток жив, не протухает ничего, и
+ * баннера не видно. Когда поток встал, показывать устаревшую цену как
+ * рекомендацию нельзя: биржа подтвердит сделку по своей, а не по показанной.
+ * Поэтому такие строки выпадают из фронта, карточек и якорей — но остаются в
+ * полных таблицах приглушёнными, чтобы картина рынка не исчезала целиком.
+ */
+function renderStale(buy, sell) {
+  const box = $('stale-banner');
+  const stale = (buy.staleCount || 0) + (sell.staleCount || 0);
+  const total = buy.length + sell.length;
+  if (!stale) {
+    box.hidden = true;
+    return;
+  }
+  box.hidden = false;
+  const all = stale >= total;
+  const age = state.lastQuoteAt ? Math.round((Date.now() - state.lastQuoteAt) / 1000) : null;
+  box.innerHTML = all
+    ? `<b>Рекомендации приостановлены: все котировки устарели.</b> Последний снимок ` +
+      `${age == null ? 'не получен' : `${age} с назад`}, поток — «${state.wsStatus}». Ставка Bybit живёт ` +
+      `меньше минуты, поэтому показывать её как совет уже нельзя: биржа подтвердит сделку по своей. ` +
+      `Таблицы ниже остались, но цены в них уже не действуют. Панель тянет котировки заново каждые 40 секунд.`
+    : `<b>Устарели ${stale} котировок из ${total}.</b> Они убраны из фронта, карточек и якорей, но ` +
+      `остались в полных таблицах приглушёнными. Колонка «Котировка» показывает, сколько секунд осталось ` +
+      `до пересчёта ставки биржей.`;
 }
 
 function renderDiag() {
@@ -1094,6 +1131,7 @@ function render() {
     step('шапка', renderHead);
     const buy = step('расчёт Buy Low', () => currentRows('BuyLow')) || [];
     const sell = step('расчёт Sell High', () => currentRows('SellHigh')) || [];
+    step('свежесть котировок', () => renderStale(buy, sell));
     step('блок Buy Low', () => renderBuy(buy));
     step('блок Sell High', () => renderSell(sell));
 
@@ -1388,6 +1426,14 @@ async function main() {
     await loadProducts();
     await bootstrapQuotes();
   }, 5 * 60_000);
+  // Пока жив поток, котировки приходят каждые несколько секунд и добирать их по
+  // REST незачем. Как только поток встал, пятиминутного цикла мало: ставка живёт
+  // меньше минуты, и блоки рекомендаций мигали бы — живые полминуты из каждых
+  // пяти. Поэтому при тишине в потоке тянем лестницы чаще.
+  setInterval(() => {
+    const quiet = state.wsStatus !== 'open' || Date.now() - state.lastQuoteAt > 40_000;
+    if (quiet) bootstrapQuotes();
+  }, 40_000);
   setInterval(loadHistory, 30 * 60_000);
   // Сводка перцентилей меняется раз в четверть часа — чаще её тянуть незачем.
   setInterval(() => fetchAprStats().then((s) => s && (state.stats = s)), 15 * 60_000);

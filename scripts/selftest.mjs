@@ -32,7 +32,7 @@ import {
   truncate,
   MS_DAY,
 } from '../web/quant.js';
-import { History, annualize, computeStrategy, analyzeSellHigh, pickBest } from '../web/model.js';
+import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows } from '../web/model.js';
 import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry } from '../web/surface.js';
 import { fetchProducts, fetchQuote, fetchOptionTickers, fetchSpot } from '../web/feeds.js';
 
@@ -418,64 +418,117 @@ section('Траектории, накопление процента и стра
   const series = Array.from({ length: 400 }, (_, k) => [k * step, 100 * 1.001 ** k]);
   const hist = new History({ D: { stepMs: step, series } });
 
-  const paths = hist.pathSeries(2, 20);
+  // Первая контрольная точка — на τ, дальше через цикл. Здесь τ = 2 = цикл,
+  // то есть классическая сетка как частный случай.
+  const paths = hist.pathSeries(2, 2, 20);
   ok('циклов внутри горизонта', paths.cycles === 10, `${paths.cycles}`);
   ok('хвост горизонта пуст при кратном цикле', paths.tailDays === 0);
   near('терминальная цена берётся на горизонте, а не на последнем цикле', paths.terminal[0], 1.001 ** 20, 1e-12);
   near('нарастающий минимум растущего ряда — первая контрольная точка', paths.runMin[9], 1.001 ** 2, 1e-12);
   near('нарастающий максимум — последняя', paths.runMax[9], 1.001 ** 20, 1e-12);
 
-  const ext = hist.pathExtremes(2, 20);
+  const ext = hist.pathExtremes(2, 2, 20);
   ok('сортированные ряды согласованы с попутевыми', ext.paths === paths.paths && ext.cycles === paths.cycles);
   near('вероятность уйти ниже первой точки равна нулю', empiricalCdf(ext.minima, 1.001 ** 2 - 1e-9), 0, 0);
   near('вероятность дойти до последней точки равна единице', 1 - empiricalCdf(ext.maxima, 1.001 ** 20 - 1e-9), 1, 0);
 
   // Хвост: горизонт 21 день при цикле 2 оставляет один день незакрытым.
-  const odd = hist.pathSeries(2, 21);
+  const odd = hist.pathSeries(2, 2, 21);
   ok('хвост горизонта посчитан', odd.cycles === 10 && odd.tailDays === 1, `циклов ${odd.cycles}, хвост ${odd.tailDays}`);
 
-  const timing = { cycleDays: 2, yieldDays: 1, lockDays: 1.5 };
+  // ── Главное: сетка начинается с τ, а не с цикла.
+  //
+  // Проверяется не согласованность реализации с самой собой, а попадание
+  // первой контрольной точки в дату сеттлмента. Прежний тест сверял модель с
+  // перебором по ТОЙ ЖЕ сетке и такую ошибку поймать не мог в принципе.
+  {
+    const tau = 1; // сеттлмент через сутки, а полный оборот — через двое
+    const cycle = 2;
+    const p = hist.pathSeries(tau, cycle, 20);
+    ok('первая точка отстоит на τ, а не на цикл', p != null);
+    near('первая контрольная точка — цена через τ', p.runMin[0], 1.001 ** tau, 1e-12);
+    const naive = hist.pathSeries(cycle, cycle, 20);
+    ok(
+      'сетка от τ отличается от сетки от цикла',
+      Math.abs(p.runMin[0] - naive.runMin[0]) > 1e-9,
+      `${p.runMin[0].toFixed(6)} против ${naive.runMin[0].toFixed(6)}`,
+    );
+    // Число сеттлментов: первый через τ, остальные через цикл.
+    ok('число сеттлментов = 1 + ⌊(H − τ)/цикл⌋', p.cycles === 1 + Math.floor((20 - tau) / cycle), `${p.cycles}`);
+    near('последний сеттлмент = τ + (n−1)·цикл', p.modeledDays, tau + (p.cycles - 1) * cycle, 1e-12);
+    // Оферта, которая не успевает рассчитаться ни разу.
+    ok('горизонт короче τ означает отсутствие сеттлментов', hist.pathSeries(30, 2, 20) === null);
+    // Сдвиг сетки не должен ломать соответствие сортированных рядов попутевым.
+    const e2 = hist.pathExtremes(tau, cycle, 20);
+    near('сортированный ряд согласован со сдвинутой сеткой', e2.minima[0], p.runMin[(p.cycles - 1)], 1e-12);
+  }
+
+  // Продукт «1d», купленный за 0.483 суток до закрытия окна: сеттлмент через
+  // 1.483 суток, а полный оборот — через двое. Контрольные точки на дневном
+  // ряду ложатся на бары 1, 3, 5, …
+  const TAU = 1.483;
+  const CYC = 2;
+  const FIRST = Math.max(1, Math.round(TAU)); // бар первой контрольной точки
+  const timing = { tauDays: TAU, cycleDays: CYC, yieldDays: 1, lockDays: TAU + 20 / 1440 };
   const mkRow = (strike, i) => ({ strike, i, apy: (i * 365) / 1, aprEff: 0.1, duration: '1d', productId: 'x', timing });
+  const N = 1 + Math.floor((20 - TAU) / CYC);
+  // Первый цикл, на котором ряд с шагом g достигает цели — считается из
+  // определения ряда, а не из проверяемой функции.
+  const hitAt = (g, target, down) => {
+    for (let k = 0; k < N; k++) {
+      const v = g ** (FIRST + k * CYC);
+      if (down ? v <= target : v >= target) return k;
+    }
+    return -1;
+  };
 
   // Стратегия: страйк ниже любой контрольной точки — конвертации нет никогда.
   const safe = mkRow(90, 0.001);
   computeStrategy({ rows: [safe], history: hist, spot: 100, horizonDays: 20, riskFree: 0 });
   ok('без конвертации риск нулевой', safe.strategy.pEndBtc === 0);
-  near('без конвертации стоимость = (1+i)^n', safe.strategy.value, 1.001 ** 10, 1e-12);
+  near('без конвертации стоимость = (1+i)^n', safe.strategy.value, 1.001 ** N, 1e-12);
   near('среднее и медиана совпадают на детерминированном ряду', safe.strategy.valueMedian, safe.strategy.value, 1e-12);
 
   // Для конвертации цена обязана уйти ВНИЗ, поэтому падающий ряд: 0.1% в сутки.
   const down = Array.from({ length: 400 }, (_, k) => [k * step, 100 * 0.999 ** k]);
   const histDown = new History({ D: { stepMs: step, series: down } });
-  // Страйк 99.9 пробивается уже первой контрольной точкой (0.999² = 0.998001).
-  const hot = mkRow(99.9, 0.001);
+  const hot = mkRow(99.95, 0.001);
   computeStrategy({ rows: [hot], history: histDown, spot: 100, horizonDays: 20, riskFree: 0 });
+  const kHot = hitAt(0.999, 99.95 / 100, true);
   ok('конвертация случается на каждой траектории', hot.strategy.pEndBtc === 1);
+  ok('конвертация приходится на первый же сеттлмент', kHot === 0);
   near(
-    'после конвертации капитал равен (1+i)·S_H/K',
+    'после конвертации капитал равен (1+i)^k·S_H/K',
     hot.strategy.value,
-    (1.001 * (0.999 ** 20 * 100)) / 99.9,
+    (1.001 ** (kHot + 1) * (0.999 ** 20 * 100)) / 99.95,
     1e-12,
   );
   // Более глубокий страйк пробивается позже, значит процент успевает начислиться
   // больше раз — но и монета достаётся дешевле.
   const deep = mkRow(99.0, 0.001);
   computeStrategy({ rows: [deep], history: histDown, spot: 100, horizonDays: 20, riskFree: 0 });
-  const hitCycle = Math.ceil(Math.log(0.99) / Math.log(0.999) / 2);
+  const kDeep = hitAt(0.999, 0.99, true);
+  ok('глубокий страйк пробивается позже ближнего', kDeep > kHot, `цикл ${kDeep + 1} против ${kHot + 1}`);
   near(
     'конвертация на более глубоком страйке считает больше циклов процента',
     deep.strategy.value,
-    (1.001 ** hitCycle * (0.999 ** 20 * 100)) / 99.0,
+    (1.001 ** (kDeep + 1) * (0.999 ** 20 * 100)) / 99.0,
     1e-12,
   );
 
   // Хвост горизонта приносит безрисковый процент только если конвертации не было.
   const withTail = mkRow(90, 0.001);
   computeStrategy({ rows: [withTail], history: hist, spot: 100, horizonDays: 21, riskFree: 0.365 });
-  near('хвост горизонта оплачен по безрисковой ставке', withTail.strategy.value, 1.001 ** 10 * 1.001, 1e-12);
+  const nTail = 1 + Math.floor((21 - TAU) / CYC);
+  const tailDays = 21 - (TAU + (nTail - 1) * CYC);
+  near(
+    'хвост горизонта оплачен по безрисковой ставке',
+    withTail.strategy.value,
+    1.001 ** nTail * (1 + (0.365 * tailDays) / 365),
+    1e-12,
+  );
 
   // Sell High: процент накапливается по числу циклов до выхода.
-  // Страйк 100.3 пробивается второй контрольной точкой (1.004006), а не первой.
   const sellRow = {
     strike: 100.3,
     i: 0.001,
@@ -491,11 +544,14 @@ section('Траектории, накопление процента и стра
   };
   const an = analyzeSellHigh({ rows: [sellRow], basis: 100, qty: 1, spot: 100, history: hist, horizonDays: 20, riskFree: 0 });
   const s = an[0];
+  const kSell = hitAt(1.001, 1.003, false);
   ok('выход состоялся на всех траекториях', s.pExitHorizon === 1);
+  ok('выход приходится не на первый сеттлмент', kSell > 0, `цикл ${kSell + 1}`);
   near('прибыль за один цикл считает один процент', s.profitPct, (1.001 * 100.3) / 100 - 1, 1e-12);
-  near('прибыль к выходу считает процент за все циклы до него', s.profitAtExit, (1.001 ** 2 * 100.3) / 100 - 1, 1e-12);
+  near('прибыль к выходу считает процент за все циклы до него', s.profitAtExit, (1.001 ** (kSell + 1) * 100.3) / 100 - 1, 1e-12);
   ok('накопление увеличивает прибыль', s.profitAtExit > s.profitPct);
   near('скорость выхода = прибыль × шанс × 365 / H', s.exitSpeed, (s.profitAtExit * s.pExitHorizon * 365) / 20, 1e-12);
+  near('ожидание выхода = τ + (циклов−1)·цикл', s.expExitDays, TAU + kSell * CYC, 1e-12);
   ok('полное матожидание посчитано по обеим ветвям', Number.isFinite(s.fullRate) && Number.isFinite(s.fullMedianRate));
   ok('база сравнения приложена к результату', an.baseline != null && Number.isFinite(an.baseline.holdRate));
 }
@@ -524,6 +580,120 @@ section('Отбор карточек');
   const full = Math.max(...rows.map((r) => r.pConv)) - Math.min(...rows.map((r) => r.pConv));
   ok('срез покрывает размах фронта, а не его край', span >= full * 0.9, `${(span * 100).toFixed(1)} из ${(full * 100).toFixed(1)} п.п.`);
   ok('карточки упорядочены от осторожных к доходным', best.every((r, k) => k === 0 || r.pConv >= best[k - 1].pConv));
+}
+
+// ────────────────────────────────────────────── 8f. Свежесть котировок
+
+section('Свежесть котировок');
+{
+  const now = Date.UTC(2026, 6, 31, 12, 0);
+  const product = {
+    productId: '1',
+    duration: '1d',
+    status: 'Available',
+    isVipProduct: false,
+    subscribeStartAt: String(now - 3600_000),
+    subscribeEndAt: String(now + 6 * 3600_000),
+    settlementTime: String(now + 30 * 3600_000),
+    expectReceiveAt: String(now + 30 * 3600_000 + 20 * 60_000),
+  };
+  const level = (strike, apyE8, expiredAt) => ({ selectPrice: String(strike), apyE8: String(apyE8), maxInvestmentAmount: '1000000', expiredAt: String(expiredAt) });
+  // Минимальная поверхность волатильности: без неё у строк нет вероятности, и
+  // фронт оказался бы пуст по причине, не имеющей отношения к свежести.
+  const tickers = [];
+  for (const [d, m, y] of [
+    [2, 7, 26],
+    [10, 7, 26],
+  ]) {
+    for (const K of [55000, 58000, 61000, 64000, 67000]) {
+      tickers.push({
+        symbol: `BTC-${d}AUG${y}-${K}-P-USDT`,
+        markIv: '0.45',
+        underlyingPrice: '61100',
+        indexPrice: '61000',
+      });
+    }
+  }
+  const surface = buildSurface(tickers, now);
+  const quotes = new Map([
+    [
+      '1',
+      {
+        productId: '1',
+        buyLowPrice: [
+          level(60000, 40e8, now + 30_000), // живая, ставка выше
+          level(58000, 10e8, now + 30_000), // живая, осторожная
+          level(62000, 90e8, now - 5_000), // ПРОТУХШАЯ и самая заманчивая
+        ],
+        sellHighPrice: [],
+      },
+    ],
+  ]);
+  const rows = buildRows({
+    products: [product],
+    quotes,
+    direction: 'BuyLow',
+    now,
+    spot: 61000,
+    surface,
+    history: null,
+    riskFree: 0.02,
+    amount: 1000,
+    vip: false,
+    measure: 'rn',
+  });
+  ok('строки построены', rows.length === 3, `${rows.length}`);
+  ok('вероятность посчитана по синтетической поверхности', rows.every((r) => Number.isFinite(r.pConv)));
+  const stale = rows.filter((r) => r.quoteStale);
+  ok('протухшая котировка помечена', stale.length === 1 && stale[0].strike === 62000);
+  ok('счётчик протухших приложен к набору', rows.staleCount === 1, `${rows.staleCount}`);
+  ok('протухшая строка не попадает на фронт Парето', stale[0].pareto === false);
+  ok('живые строки на фронт попадают', rows.filter((r) => r.pareto).length > 0);
+
+  // Самая доходная оферта здесь протухшая: она обязана быть исключена из
+  // рекомендаций, иначе панель советует цену, которой больше нет.
+  const best = pickBest({ rows, maxP: 0.99 });
+  ok('протухшая оферта не попадает в карточки', !best.some((r) => r.quoteStale), `карточек ${best.length}`);
+  ok('карточки не пусты, пока есть живые оферты', best.length > 0);
+  const anchors = pickAnchors(rows);
+  ok(
+    'протухшая оферта не становится якорем',
+    Object.values(anchors).every((a) => !a || !a.row.quoteStale),
+  );
+
+  // Когда протухло всё, рекомендаций не остаётся вовсе — это и есть пауза.
+  const allStale = buildRows({
+    products: [product],
+    quotes: new Map([['1', { productId: '1', buyLowPrice: [level(60000, 40e8, now - 1)], sellHighPrice: [] }]]),
+    direction: 'BuyLow',
+    now,
+    spot: 61000,
+    surface,
+    history: null,
+    riskFree: 0.02,
+    amount: 1000,
+    vip: false,
+    measure: 'rn',
+  });
+  ok('при полностью устаревшем снимке фронт пуст', allStale.every((r) => !r.pareto));
+  ok('и карточек нет', pickBest({ rows: allStale, maxP: 0.99 }).length === 0);
+  ok('счётчик показывает, что устарело всё', allStale.staleCount === allStale.length);
+
+  // Отсутствие поля не наказываем: у уровня без expiredAt котировка живая.
+  const noField = buildRows({
+    products: [product],
+    quotes: new Map([['1', { productId: '1', buyLowPrice: [{ selectPrice: '60000', apyE8: '4000000000', maxInvestmentAmount: '1' }], sellHighPrice: [] }]]),
+    direction: 'BuyLow',
+    now,
+    spot: 61000,
+    surface,
+    history: null,
+    riskFree: 0.02,
+    amount: 1000,
+    vip: false,
+    measure: 'rn',
+  });
+  ok('уровень без срока истечения считается живым', noField.every((r) => !r.quoteStale));
 }
 
 // ────────────────────────────────────────────── 9. Разбор символов опционов

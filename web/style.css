@@ -510,6 +510,20 @@ h2 {
   line-height: 1.5;
 }
 
+/* Котировка живёт секунды. Когда поток встал, рекомендации приостановлены —
+   и это должно быть видно, а не выведено пользователем из пустого блока. */
+.stale-banner {
+  margin: 0 0 14px;
+  padding: 11px 14px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line));
+  border-left: 3px solid var(--warn);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--warn) 8%, var(--panel));
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
 .kv {
   display: grid;
   grid-template-columns: auto 1fr;

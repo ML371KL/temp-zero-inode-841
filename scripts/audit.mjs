@@ -905,10 +905,17 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
 
     // Ожидаемое время до выхода: тождества и границы.
     const withT = analyzed.filter((r) => Number.isFinite(r.expExitDays) && r.horizonInfo?.cycles > 0);
+    // Нижняя граница — τ, а не цикл: первый сеттлмент наступает раньше полного
+    // оборота, и после правки сетки самый быстрый выход занимает именно τ.
     ok(
-      'ожидание выхода не короче цикла и не длиннее горизонта',
-      withT.every((r) => r.expExitDays >= r.timing.cycleDays - 1e-9 && r.expExitDays <= H + r.timing.cycleDays),
+      'ожидание выхода не короче времени до первого сеттлмента и не длиннее горизонта',
+      withT.every((r) => r.expExitDays >= r.timing.tauDays - 1e-9 && r.expExitDays <= H + r.timing.cycleDays),
       `строк ${withT.length}`,
+    );
+    ok(
+      'у части оферт выход наступает быстрее полного оборота',
+      withT.some((r) => r.expExitDays < r.timing.cycleDays - 1e-9),
+      `таких строк ${withT.filter((r) => r.expExitDays < r.timing.cycleDays - 1e-9).length}`,
     );
     // Чем дальше страйк, тем дольше ждать.
     let waitMono = 0;
@@ -1119,8 +1126,10 @@ console.log('\n── 13. Траектории: попутевые ряды пр
   let hitBad = 0;
   let checked = 0;
   for (const c of cycles) {
-    const paths = history.pathSeries(c, 90);
-    const ext = history.pathExtremes(c, 90);
+    // Сетка начинается с τ; для сводной проверки берём типичный τ этого цикла.
+    const tau = buy.find((r) => r.timing.cycleDays === c)?.timing.tauDays ?? c;
+    const paths = history.pathSeries(tau, c, 90);
+    const ext = history.pathExtremes(tau, c, 90);
     if (!paths || !ext) continue;
     checked++;
     const n = paths.cycles;
@@ -1205,7 +1214,7 @@ console.log('\n── 14. Стратегия до выбранной даты');
   // Полный перебор стоимости для нескольких строк.
   let valBad = 0;
   for (const r of rows.filter((x) => x.strategy).slice(0, 6)) {
-    const paths = history.pathSeries(r.timing.cycleDays, HS);
+    const paths = history.pathSeries(r.timing.tauDays, r.timing.cycleDays, HS);
     const n = paths.cycles;
     const target = r.strike / spot;
     const tail = 1 + (riskFree * paths.tailDays) / YEAR_DAYS;
@@ -1265,6 +1274,171 @@ console.log('\n── 14. Стратегия до выбранной даты');
     same < Math.min(single.length, res.rows.length) * 0.7,
     `совпадает ${same} оферт из ${Math.min(single.length, res.rows.length)}`,
   );
+}
+
+// ─────────────────────────────────────────── 15. Сетка контрольных точек
+
+console.log('\n── 15. Первый сеттлмент: сетка против реального расписания продукта');
+{
+  // Ключевой момент: проверка НЕ замкнута на себя. Первая контрольная точка
+  // сверяется с датой сеттлмента, взятой прямо из полей продукта, а не с той же
+  // сеткой, по которой считает модель. Прежний тест сравнивал computeStrategy с
+  // перебором по ОДНОЙ И ТОЙ ЖЕ сетке и такую ошибку поймать не мог в принципе.
+  const H = 90;
+  let bad = [];
+  let checked = 0;
+  for (const p of products.filter((x) => x.status === 'Available')) {
+    const t = productTiming(p, now);
+    if (!t.open) continue;
+    const paths = history.pathSeries(t.tauDays, t.cycleDays, H);
+    if (!paths) continue;
+    checked++;
+    // Первая точка обязана отстоять на время до сеттлмента ЭТОГО продукта.
+    const wantTau = (Number(p.settlementTime) - now) / MS_DAY;
+    if (Math.abs(paths.firstDays - wantTau) > 1e-9) bad.push(`${p.duration}: сетка ${paths.firstDays.toFixed(4)} против расписания ${wantTau.toFixed(4)}`);
+    // Число сеттлментов внутри горизонта — по расписанию, а не по циклам.
+    const wantN = H < wantTau ? 0 : 1 + Math.floor((H - wantTau) / t.cycleDays);
+    if (paths.cycles !== wantN) bad.push(`${p.duration}: сеттлментов ${paths.cycles} против ${wantN}`);
+    // Последний смоделированный сеттлмент не должен выходить за горизонт.
+    if (paths.modeledDays > H + 1e-9) bad.push(`${p.duration}: последний сеттлмент на ${paths.modeledDays.toFixed(1)} при горизонте ${H}`);
+  }
+  ok('первая контрольная точка совпадает с датой сеттлмента продукта', bad.length === 0, bad.slice(0, 3).join(' · ') || `проверено ${checked} продуктов`);
+
+  // Сдвиг сетки действительно живой: у продуктов, купленных не в момент
+  // закрытия окна, τ строго меньше цикла.
+  const shifts = [];
+  for (const p of products.filter((x) => x.status === 'Available')) {
+    const t = productTiming(p, now);
+    if (t.open) shifts.push(t.cycleDays - t.tauDays);
+  }
+  const minShift = Math.min(...shifts);
+  const maxShift = Math.max(...shifts);
+  ok(
+    'τ строго меньше цикла, пока окно подписки открыто',
+    minShift > 0 && maxShift <= 1 + 1e-9,
+    `сдвиг от ${minShift.toFixed(3)} до ${maxShift.toFixed(3)} суток`,
+  );
+
+  // Насколько правка вообще меняет числа. Сравниваем с прежней сеткой «с цикла».
+  let maxDp = 0;
+  let worst = null;
+  let differing = 0;
+  for (const r of buy) {
+    const a = history.pathExtremes(r.timing.tauDays, r.timing.cycleDays, H);
+    const b = history.pathExtremes(r.timing.cycleDays, r.timing.cycleDays, H);
+    if (!a || !b) continue;
+    const ratio = r.strike / spot;
+    const d = Math.abs(empiricalCdf(a.minima, ratio) - empiricalCdf(b.minima, ratio));
+    if (d > 1e-12) differing++;
+    if (d > maxDp) {
+      maxDp = d;
+      worst = r;
+    }
+  }
+  ok(
+    'сетка от τ отличается от сетки от цикла на реальных данных',
+    differing > 0,
+    `строк с расхождением ${differing}, максимум ${(maxDp * 100).toFixed(2)} п.п.` +
+      (worst ? ` (${worst.duration}/${worst.strike})` : ''),
+  );
+  ok(
+    'расхождение остаётся в разумных пределах',
+    maxDp < 0.06,
+    `${(maxDp * 100).toFixed(2)} п.п. — правка уточняет фазу, а не переписывает оценку`,
+  );
+
+  // Ожидание выхода на стороне Sell High тоже считает первый оборот по τ.
+  const basisT = basisFromConversion(spot * 1.06, 0.4, 1);
+  const anT = analyzeSellHigh({ rows: sell, basis: basisT, qty: 0.2, spot, history, measure: 'max', horizonDays: H, riskFree });
+  let waitBad = 0;
+  for (const r of anT) {
+    if (!Number.isFinite(r.expExitDays)) continue;
+    if (r.expExitDays < r.timing.tauDays - 1e-9) waitBad++;
+  }
+  ok('ожидание выхода не короче времени до первого сеттлмента', waitBad === 0, `нарушений ${waitBad}`);
+}
+
+// ─────────────────────────────────────────── 16. Внутридневная стационарность
+
+console.log('\n── 16. Допущение: час суток контрольных точек не влияет на оценку');
+{
+  // Контрольные точки берутся по границам баров, а сеттлмент идёт в 08:00 UTC.
+  // Синхронизации нет, и это допущение о внутридневной стационарности. Меряем,
+  // отличим ли эффект от ошибки выборки — если да, допущение придётся чинить.
+  const h1 = history.raw['60'];
+  const bars = h1?.series ?? [];
+  const cycleBars = 24;
+  const horizonBars = 30 * 24;
+  const target = 0.95;
+  const byAnchor = [];
+  for (const hour of [0, 4, 8, 12, 16, 20]) {
+    const mins = [];
+    for (let i = 0; i + horizonBars < bars.length; i++) {
+      if (new Date(bars[i][0]).getUTCHours() !== hour) continue;
+      const s0 = bars[i][1];
+      if (!(s0 > 0)) continue;
+      let lo = Infinity;
+      for (let k = 1; k * cycleBars <= horizonBars; k++) {
+        const v = bars[i + k * cycleBars][1] / s0;
+        if (v < lo) lo = v;
+      }
+      mins.push(lo);
+    }
+    mins.sort((a, b) => a - b);
+    if (mins.length) byAnchor.push({ hour, p: empiricalCdf(mins, target), n: mins.length });
+  }
+  if (byAnchor.length >= 2) {
+    const ps = byAnchor.map((x) => x.p);
+    const spread = Math.max(...ps) - Math.min(...ps);
+    const nObs = byAnchor[0].n;
+    const pBar = ps.reduce((a, b) => a + b, 0) / ps.length;
+    // Ошибка выборки при этом размере. Окна перекрываются, поэтому это ещё и
+    // оптимистичная оценка: независимых наблюдений здесь меньше двух.
+    const se = Math.sqrt((pBar * (1 - pBar)) / nObs);
+    ok(
+      'размах между часами суток неотличим от ошибки выборки',
+      spread < 3 * se,
+      `размах ${(spread * 100).toFixed(2)} п.п. при ошибке ${(se * 100).toFixed(2)} п.п. ` +
+        `(${nObs} перекрывающихся окон, ${(((h1.series.length * h1.stepMs) / MS_DAY) / 30).toFixed(1)} независимых)`,
+    );
+    // И заодно фиксируем цену предлагаемого «лечения».
+    const spanH = (h1.series.length * h1.stepMs) / MS_DAY;
+    const spanD = (history.raw.D.series.length * history.raw.D.stepMs) / MS_DAY;
+    ok(
+      'переход на часовой ряд стоил бы кратной потери глубины выборки',
+      spanD / spanH > 5,
+      `дневной ${spanD.toFixed(0)} суток против часового ${spanH.toFixed(0)}: ` +
+        `${(spanD / 90).toFixed(1)} независимых окон на горизонт 90 дней против ${(spanH / 90).toFixed(1)}`,
+    );
+  }
+}
+
+// ─────────────────────────────────────────── 17. Свежесть котировок
+
+console.log('\n── 17. Протухшие котировки не участвуют в рекомендациях');
+{
+  ok('счётчик протухших приложен к набору', Number.isFinite(buy.staleCount), `${buy.staleCount} из ${buy.length}`);
+  ok('на живом потоке протухших нет', buy.staleCount === 0 && sell.staleCount === 0, `Buy ${buy.staleCount}, Sell ${sell.staleCount}`);
+
+  // Подделываем устаревание самой заманчивой оферты и проверяем, что она
+  // выпадает из всех рекомендательных поверхностей сразу.
+  const victim = buy.filter((r) => Number.isFinite(r.aprEff)).reduce((a, b) => (b.aprEff > a.aprEff ? b : a));
+  const faked = buy.map((r) => (r === victim ? { ...r, quoteStale: true } : r));
+  const bestFake = pickBest({ rows: faked, maxP: 1 });
+  ok('и из карточек', !bestFake.some((r) => r.quoteStale), `карточек ${bestFake.length}`);
+  const anchorsFake = pickAnchors(faked);
+  ok('и из якорей', Object.values(anchorsFake).every((a) => !a || !a.row.quoteStale));
+  ok('живые оферты при этом остаются', bestFake.length > 0 && Object.values(anchorsFake).some(Boolean));
+
+  // Когда протухло всё, рекомендаций не остаётся — это и есть пауза.
+  const allStale = buy.map((r) => ({ ...r, quoteStale: true }));
+  ok('при полностью устаревшем снимке карточек нет', pickBest({ rows: allStale, maxP: 1 }).length === 0);
+  ok(
+    'и якорей нет',
+    Object.values(pickAnchors(allStale)).every((a) => !a),
+  );
+  const stratStale = computeStrategy({ rows: allStale, history, spot, horizonDays: 90, riskFree });
+  ok('и фронт стратегии пуст', stratStale.rows.length === 0, `учтено ${stratStale.counted}, устарело ${stratStale.stale}`);
 }
 
 console.log(`\nИтого: ${passed} успешно, ${failed} провалено`);
