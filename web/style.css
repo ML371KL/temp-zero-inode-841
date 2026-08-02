@@ -166,6 +166,10 @@ h2 {
   background: var(--good);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--good) 22%, transparent);
 }
+.dot.warn {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent);
+}
 .dot.bad {
   background: var(--bad);
 }
@@ -510,18 +514,31 @@ h2 {
   line-height: 1.5;
 }
 
-/* Котировка живёт секунды. Когда поток встал, рекомендации приостановлены —
-   и это должно быть видно, а не выведено пользователем из пустого блока. */
-.stale-banner {
-  margin: 0 0 14px;
+/* Статус котировок. Блок присутствует всегда — и когда всё хорошо, и когда
+   поток встал: появляющийся и исчезающий блок дёргал бы страницу под курсором.
+   Меняется только цвет и текст. */
+.status-panel {
+  margin: 0 0 18px;
   padding: 11px 14px;
-  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--line));
-  border-left: 3px solid var(--warn);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--ink-3);
   border-radius: 8px;
-  background: color-mix(in srgb, var(--warn) 8%, var(--panel));
+  background: var(--panel);
   color: var(--ink);
   font-size: 13px;
   line-height: 1.55;
+}
+
+.status-panel.ok {
+  border-color: color-mix(in srgb, var(--good) 35%, var(--line));
+  border-left-color: var(--good);
+  background: color-mix(in srgb, var(--good) 6%, var(--panel));
+}
+
+.status-panel.stale {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--line));
+  border-left-color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 8%, var(--panel));
 }
 
 .kv {

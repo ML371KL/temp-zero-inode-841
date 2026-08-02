@@ -101,8 +101,6 @@
       <div class="mode-note" id="mode-note"></div>
     </section>
 
-    <div class="stale-banner" id="stale-banner" hidden></div>
-
     <section class="panel highlight" id="best-panel">
       <div class="panel-head">
         <h2>Текущая подписка: доходность против риска на сеттлменте</h2>
@@ -279,6 +277,10 @@
         <button class="more" data-more="sell"></button>
       </div>
     </section>
+
+    <!-- Блок статуса котировок стоит здесь и виден всегда: при появлении и
+         исчезновении он не должен сдвигать страницу под курсором. -->
+    <div class="status-panel ok" id="stale-banner"></div>
 
     <footer class="foot">
       <div id="diag"></div>

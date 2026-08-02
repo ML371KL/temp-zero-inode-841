@@ -436,12 +436,18 @@ function renderHead() {
   const dot = $('ws-dot');
   const text = $('ws-text');
   const age = state.lastQuoteAt ? (Date.now() - state.lastQuoteAt) / 1000 : null;
+  // Кружок в шапке отвечает не за соединение, а за пригодность цен: поток может
+  // быть открыт, а часть ставок уже пересчитана биржей. Оранжевый означает
+  // ровно это, и тогда подробности ждут в блоке статуса внизу страницы.
+  const stale = state.stale?.count ?? 0;
   if (state.wsStatus === 'open' && age != null && age < 30) {
-    dot.className = 'dot live';
-    text.textContent = `котировки живые · ${age.toFixed(0)} с назад`;
+    dot.className = stale ? 'dot warn' : 'dot live';
+    text.textContent = stale
+      ? `устарели ${stale} из ${state.stale.total}`
+      : `котировки живые · ${age.toFixed(0)} с назад`;
   } else if (state.wsStatus === 'open') {
-    dot.className = 'dot';
-    text.textContent = 'поток тих';
+    dot.className = stale ? 'dot warn' : 'dot';
+    text.textContent = stale ? `поток тих · устарели ${stale} из ${state.stale.total}` : 'поток тих';
   } else {
     dot.className = 'dot bad';
     text.textContent = state.wsStatus.startsWith('reconnect')
@@ -712,17 +718,21 @@ function renderBuy(rows) {
   const strategy = ui.mode === 'strategy' ? renderStrategy(rows) : null;
   const durations = [...new Set(state.products.map((p) => p.duration))].sort((a, b) => durationDays(a) - durationDays(b));
   if (strategy) {
-    $('scatter-title').textContent = 'Стоимость стратегии против риска остаться в BTC';
+    $('scatter-title').textContent = 'Геометрическая стоимость стратегии против риска остаться в BTC';
     $('scatter-hint').textContent =
       `обе оси на горизонте ${ui.horizon} дней и на одних траекториях; линией — фронт Парето`;
+    // Ось Y обязана быть той же, по которой построен фронт, а это геометрическая
+    // стоимость. С арифметической линия фронта шла бы немонотонно, и фоновые
+    // точки оказывались бы выше неё — глазами это читалось бы как ошибка отбора,
+    // хотя отбор верен, а врал график.
     scatterChart($('scatter'), rows, {
       durations,
       onHover: showTip,
       xKey: 'stratRisk',
-      yKey: 'stratAnnual',
+      yKey: 'stratGeo',
       frontKey: 'stratPareto',
       xLabel: `шанс закончить ${ui.horizon} дней в биткоине`,
-      yLabel: 'ожидаемая годовая стоимость',
+      yLabel: 'геометрическая годовая стоимость',
       showThreshold: false,
     });
   } else {
@@ -1113,21 +1123,32 @@ function renderStale(buy, sell) {
   const box = $('stale-banner');
   const stale = (buy.staleCount || 0) + (sell.staleCount || 0);
   const total = buy.length + sell.length;
+  state.stale = { count: stale, total };
+
+  const age = state.lastQuoteAt ? Math.round((Date.now() - state.lastQuoteAt) / 1000) : null;
+  const all = total > 0 && stale >= total;
+  box.className = `status-panel ${stale ? 'stale' : 'ok'}`;
+
   if (!stale) {
-    box.hidden = true;
+    box.innerHTML =
+      `<b>Котировки живые: все ${total} оферт участвуют в отборе.</b> ` +
+      (age == null ? '' : `Последний снимок ${age} с назад, поток — «${state.wsStatus}». `) +
+      `Ставка Bybit живёт от двух до пятидесяти пяти секунд, поэтому панель следит, чтобы в рекомендации ` +
+      `не попала цена, которой уже нет: истёкшие уровни выпадают из фронта, карточек и якорей, а в полных ` +
+      `таблицах остаются приглушёнными. Колонка «Котировка» показывает, сколько секунд осталось до ` +
+      `пересчёта ставки биржей.`;
     return;
   }
-  box.hidden = false;
-  const all = stale >= total;
-  const age = state.lastQuoteAt ? Math.round((Date.now() - state.lastQuoteAt) / 1000) : null;
+
   box.innerHTML = all
     ? `<b>Рекомендации приостановлены: все котировки устарели.</b> Последний снимок ` +
       `${age == null ? 'не получен' : `${age} с назад`}, поток — «${state.wsStatus}». Ставка Bybit живёт ` +
       `меньше минуты, поэтому показывать её как совет уже нельзя: биржа подтвердит сделку по своей. ` +
-      `Таблицы ниже остались, но цены в них уже не действуют. Панель тянет котировки заново каждые 40 секунд.`
+      `Таблицы выше остались, но цены в них уже не действуют. Панель тянет котировки заново каждые 40 секунд.`
     : `<b>Устарели ${stale} котировок из ${total}.</b> Они убраны из фронта, карточек и якорей, но ` +
       `остались в полных таблицах приглушёнными. Колонка «Котировка» показывает, сколько секунд осталось ` +
-      `до пересчёта ставки биржей.`;
+      `до пересчёта ставки биржей. Это нормальное состояние: ставки пересчитываются постоянно, и часть ` +
+      `строк всегда ждёт следующего снимка.`;
 }
 
 function renderDiag() {
@@ -1206,14 +1227,15 @@ function render() {
       }
     };
 
-    step('шапка', renderHead);
     step('предпосылки', () => {
       state.riskFree = opportunityRate();
       applyScenario();
     });
     const buy = step('расчёт Buy Low', () => currentRows('BuyLow')) || [];
     const sell = step('расчёт Sell High', () => currentRows('SellHigh')) || [];
+    // Свежесть считается до шапки: кружок в ней показывает именно её.
     step('свежесть котировок', () => renderStale(buy, sell));
+    step('шапка', renderHead);
     step('блок Buy Low', () => renderBuy(buy));
     step('блок Sell High', () => renderSell(sell));
 
