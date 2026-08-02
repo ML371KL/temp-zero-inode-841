@@ -32,8 +32,8 @@ import {
   truncate,
   MS_DAY,
 } from '../web/quant.js';
-import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows } from '../web/model.js';
-import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry } from '../web/surface.js';
+import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr } from '../web/model.js';
+import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry, atmVarianceCurve, totalVariance, forwardVol } from '../web/surface.js';
 import { fetchProducts, fetchQuote, fetchOptionTickers, fetchSpot } from '../web/feeds.js';
 
 let failed = 0;
@@ -580,6 +580,94 @@ section('Отбор карточек');
   const full = Math.max(...rows.map((r) => r.pConv)) - Math.min(...rows.map((r) => r.pConv));
   ok('срез покрывает размах фронта, а не его край', span >= full * 0.9, `${(span * 100).toFixed(1)} из ${(full * 100).toFixed(1)} п.п.`);
   ok('карточки упорядочены от осторожных к доходным', best.every((r, k) => k === 0 || r.pConv >= best[k - 1].pConv));
+}
+
+// ────────────────────────────────────────────── 8e2. Сценарный слой
+
+section('Срочная структура волатильности и сценарные траектории');
+{
+  // Кривая с техническим провалом: на 0.2 года накопленная дисперсия ниже, чем
+  // на 0.1. Такого не бывает — форвардная дисперсия была бы отрицательной.
+  const fake = {
+    expiries: [
+      { T: 0.1, smile: [{ x: -0.1, iv: 0.5 }, { x: 0.1, iv: 0.5 }] },
+      { T: 0.2, smile: [{ x: -0.1, iv: 0.2 }, { x: 0.1, iv: 0.2 }] },
+      { T: 0.5, smile: [{ x: -0.1, iv: 0.4 }, { x: 0.1, iv: 0.4 }] },
+    ],
+  };
+  const curve = atmVarianceCurve(fake);
+  ok('провал монотонности найден и починен', curve.repaired === 1, `починено ${curve.repaired}`);
+  near('дисперсия на первой экспирации', curve.points[0].w, 0.25 * 0.1, 1e-15);
+  near('провал подтянут до предыдущего уровня', curve.points[1].w, 0.25 * 0.1, 1e-15);
+  ok('после починки кривая не убывает', curve.points.every((p, k) => k === 0 || p.w >= curve.points[k - 1].w - 1e-15));
+  ok('форвардная волатильность неотрицательна на почищенном участке', forwardVol(curve, 0.1, 0.2) === 0);
+  near('форвардная волатильность участка', forwardVol(curve, 0.2, 0.5), Math.sqrt((0.08 - 0.025) / 0.3), 1e-12);
+  near('накопленная дисперсия линейна внутри участка', totalVariance(curve, 0.35), 0.025 + 0.5 * (0.08 - 0.025), 1e-12);
+
+  // Ряд со случайным блужданием: детерминированный генератор ради повторяемости.
+  let seed = 12345;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5);
+  const step = MS_DAY;
+  const series = [];
+  let px = 60000;
+  for (let k = 0; k < 900; k++) {
+    px *= Math.exp(0.0004 + 0.03 * rnd());
+    series.push([k * step, px]);
+  }
+  const hist = new History({ D: { stepMs: step, series } });
+  const H = 90;
+
+  hist.useScenario({ cagr: 0.11, curve, id: 'test' });
+  const sp = hist.scenarioPaths(H);
+  ok('сценарные траектории построены', sp != null && sp.paths > 100, `${sp?.paths} траекторий`);
+
+  // Геометрическое среднее конечных значений обязано в точности равняться цели.
+  let accLog = 0;
+  for (let p = 0; p < sp.paths; p++) accLog += Math.log(sp.ratio[p * sp.width + sp.bars]);
+  const geo = Math.exp(accLog / sp.paths) ** (365 / H) - 1;
+  near('геометрический рост траекторий равен заданному CAGR', geo, 0.11, 1e-9);
+
+  // Накопленная изменчивость пути обязана совпасть с рыночной кривой.
+  let accVar = 0;
+  for (let j = 1; j <= sp.bars; j++) {
+    let s = 0;
+    for (let p = 0; p < sp.paths; p++) {
+      s += (Math.log(sp.ratio[p * sp.width + j]) - Math.log(sp.ratio[p * sp.width + j - 1])) ** 2;
+    }
+    accVar += s / sp.paths;
+  }
+  const want = totalVariance(curve, H / 365);
+  ok(
+    'накопленная дисперсия траекторий равна рыночной w(H)',
+    Math.abs(accVar / want - 1) < 0.05,
+    `получено ${accVar.toFixed(5)}, рынок ${want.toFixed(5)}, отклонение ${((accVar / want - 1) * 100).toFixed(2)}%`,
+  );
+
+  // Все оферты обязаны считаться на ОДНОМ наборе траекторий.
+  const a = hist.pathSeries(1.5, 2, H);
+  const b = hist.pathSeries(26.5, 27, H);
+  ok('разные оферты берут одинаковое число траекторий', a.paths === b.paths, `${a.paths} и ${b.paths}`);
+  let sameTerminal = true;
+  for (let p = 0; p < a.paths; p += 37) if (Math.abs(a.terminal[p] - b.terminal[p]) > 1e-15) sameTerminal = false;
+  ok('и одинаковые конечные цены: набор траекторий общий', sameTerminal);
+  ok('контрольные точки при этом свои у каждой', a.cycles !== b.cycles, `${a.cycles} против ${b.cycles}`);
+
+  // Смена сценария обязана сбрасывать кэш.
+  const before = sp.ratio[sp.bars];
+  hist.useScenario({ cagr: 0.4, curve, id: 'test' });
+  const sp2 = hist.scenarioPaths(H);
+  ok('смена сценария меняет траектории', Math.abs(sp2.ratio[sp2.bars] - before) > 1e-9);
+  hist.useScenario({ cagr: 0.11, curve, id: 'test' });
+  near('возврат к прежнему сценарию воспроизводит траектории', hist.scenarioPaths(H).ratio[sp.bars], before, 1e-15);
+
+  // Без сценария ряд обязан остаться ровно тем, что пришло с биржи.
+  const raw = new History({ D: { stepMs: step, series } });
+  const rp = raw.scenarioPaths(H);
+  near('без сценария траектория повторяет исходный ряд', rp.ratio[rp.width + 10], series[10 + 1][1] / series[1][1], 1e-12);
+
+  // Рост центральной линии выборки считается геометрически.
+  const auto = sampleCagr(raw, H);
+  ok('рост выборки посчитан', Number.isFinite(auto), `${(auto * 100).toFixed(2)}% годовых`);
 }
 
 // ────────────────────────────────────────────── 8f. Свежесть котировок

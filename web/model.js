@@ -27,7 +27,7 @@ import {
   STRESS_LEVEL,
   YEAR_DAYS,
 } from './quant.js';
-import { volAt, forwardAt, hasExactExpiry } from './surface.js';
+import { volAt, forwardAt, hasExactExpiry, forwardVol } from './surface.js';
 
 /**
  * Первый цикл, на котором нарастающий максимум траектории дотянулся до цели.
@@ -136,6 +136,152 @@ export class History {
    * именно цикле сработал страйк у этой траектории и чего стоила монета в
    * конце. Обе формы строятся из одного прохода и кэшируются.
    */
+  /**
+   * Сценарий рынка: во что мы верим про будущее, вместо «прошлое повторится».
+   *
+   * История даёт форму движений — кластеры, толстые хвосты, асимметрию. Но её
+   * дрейф и её размах относятся к прожитому режиму, а не к сегодняшнему. Здесь
+   * задаются оба параметра явно:
+   *
+   *   cagr  — рост центральной линии, к которому приводится снос выборки;
+   *   curve — срочная структура ATM-волатильности с рынка опционов.
+   *
+   * Смена сценария сбрасывает траекторные кэши: они целиком от него зависят.
+   */
+  useScenario({ cagr = null, curve = null, id = '' } = {}) {
+    const key = `${cagr == null ? 'raw' : cagr.toFixed(6)}|${id}`;
+    if (this.scenarioKey === key) return this;
+    this.scenarioKey = key;
+    this.scenario = { cagr, curve };
+    for (const k of [...this.cache.keys()]) {
+      if (k.startsWith('scen:') || k.startsWith('paths:') || k.startsWith('sorted:') || k.startsWith('hold:')) {
+        this.cache.delete(k);
+      }
+    }
+    return this;
+  }
+
+  /**
+   * Общий набор траекторий на горизонт — один на все оферты сразу.
+   *
+   * Это принципиально. Раньше каждый продукт получал собственную сетку, а
+   * волатильность в оценке риска бралась из улыбки его собственного страйка.
+   * Тогда две оферты сравнивались на разных мирах: у одной рынок «тише», у
+   * другой «громче», и разница в отборе оказывалась артефактом улыбки, а не
+   * свойством оферты. Здесь строится одна матрица цен, и каждая оферта лишь
+   * снимает с неё свои контрольные точки.
+   *
+   * Как строится. Берутся исторические логарифмические приращения, у них
+   * убирается собственный снос, и каждое приращение масштабируется под ту
+   * волатильность, которую рынок опционов ждёт ИМЕННО НА ЭТОМ УЧАСТКЕ пути:
+   *
+   *   λ(j) = σ_форв(рынок, от (j−1)-го бара до j-го) / σ_истории
+   *
+   * Одного числа на весь горизонт мало: сегодня рынок оценивает первую неделю
+   * в 33% годовых, а участок от 90 до 365 дней — в 44%. Масштабировать всё
+   * одним множителем значило бы завысить ближний риск и занизить дальний.
+   * Накопленная дисперсия пути к любой контрольной точке после этого равна
+   * ровно рыночной w(T) — это проверяется тестом.
+   *
+   * Снос ставится равным заданному CAGR, и в конце делается точная нормировка:
+   * из-за неравномерных весов λ остаточный снос выборки не уходит в ноль сам,
+   * поэтому геометрическое среднее конечных значений досаживается на цель
+   * ровно. Без этого просили 10.4% годовых, а получали 8.2%.
+   */
+  scenarioPaths(horizonDays) {
+    if (!(horizonDays > 0)) return null;
+    const id = `scen:${horizonDays}`;
+    const cached = this.cache.get(id);
+    if (cached !== undefined) return cached;
+
+    // Самый глубокий ряд, в который горизонт помещается целиком.
+    let best = null;
+    for (const key of ['60', '240', 'D']) {
+      const s = this.raw[key];
+      if (!s?.series?.length || !s.stepMs) continue;
+      const bars = Math.round((horizonDays * 86_400_000) / s.stepMs);
+      if (bars < 1 || s.series.length <= bars + 1) continue;
+      const spanDays = (s.series.length * s.stepMs) / 86_400_000;
+      if (!best || spanDays > best.spanDays) best = { key, bars, spanDays, series: s.series, stepMs: s.stepMs };
+    }
+    if (!best) {
+      this.cache.set(id, null);
+      return null;
+    }
+
+    const closes = best.series.map((r) => r[1]);
+    const lr = [];
+    for (let i = 1; i < closes.length; i++) {
+      lr.push(closes[i] > 0 && closes[i - 1] > 0 ? Math.log(closes[i] / closes[i - 1]) : 0);
+    }
+    const mean = lr.reduce((a, b) => a + b, 0) / lr.length;
+    const varBar = lr.reduce((a, b) => a + (b - mean) ** 2, 0) / (lr.length - 1);
+    const barYears = best.stepMs / 86_400_000 / YEAR_DAYS;
+    const histVol = Math.sqrt(varBar / barYears);
+    const hb = best.bars;
+    const curve = this.scenario?.curve ?? null;
+    const cagr = this.scenario?.cagr ?? null;
+
+    // Множители по участкам пути: чем дальше точка, тем свою форвардную
+    // волатильность рынок ей и приписывает.
+    const lam = new Float64Array(hb + 1);
+    for (let j = 1; j <= hb; j++) {
+      const fv = curve ? forwardVol(curve, (j - 1) * barYears, j * barYears) : null;
+      lam[j] = fv != null && histVol > 0 ? fv / histVol : 1;
+    }
+    const drift = cagr == null ? mean : Math.log(1 + cagr) * barYears;
+
+    const starts = [];
+    for (let i = 0; i + hb < closes.length; i++) if (closes[i] > 0) starts.push(i);
+    const paths = starts.length;
+    if (!paths) {
+      this.cache.set(id, null);
+      return null;
+    }
+
+    const width = hb + 1;
+    const logs = new Float64Array(paths * width);
+    for (let p = 0; p < paths; p++) {
+      const i0 = starts[p];
+      let cum = 0;
+      for (let j = 1; j <= hb; j++) {
+        cum += (lr[i0 + j - 1] - mean) * lam[j] + drift;
+        logs[p * width + j] = cum;
+      }
+    }
+    // Точная посадка геометрического среднего на цель. Только когда цель
+    // задана: без сценария ряд должен оставаться ровно тем, что пришло с биржи,
+    // иначе «сырой» режим перестал бы быть сырым.
+    let resid = 0;
+    if (cagr != null) {
+      let acc = 0;
+      for (let p = 0; p < paths; p++) acc += logs[p * width + hb];
+      resid = hb * drift - acc / paths;
+    }
+    const ratio = new Float64Array(paths * width);
+    for (let p = 0; p < paths; p++) {
+      ratio[p * width] = 1;
+      for (let j = 1; j <= hb; j++) ratio[p * width + j] = Math.exp(logs[p * width + j] + (resid * j) / hb);
+    }
+
+    const hit = {
+      ratio,
+      width,
+      paths,
+      bars: hb,
+      barDays: best.stepMs / 86_400_000,
+      horizonDays,
+      spanDays: best.spanDays,
+      series: best.key,
+      histVol,
+      scenarioVol: curve ? forwardVol(curve, 0, horizonDays / YEAR_DAYS) : histVol,
+      cagr,
+      independent: best.spanDays / horizonDays,
+    };
+    this.cache.set(id, hit);
+    return hit;
+  }
+
   pathSeries(firstDays, cycleDays, horizonDays) {
     if (!(cycleDays > 0) || !(firstDays > 0)) return null;
     // Сколько сеттлментов помещается в горизонт: первый через τ, дальше через
@@ -147,40 +293,18 @@ export class History {
     const cached = this.cache.get(id);
     if (cached !== undefined) return cached;
 
-    // Берём самый глубокий ряд, в котором цикл разрешается хотя бы одним баром.
-    let best = null;
-    for (const key of ['60', '240', 'D']) {
-      const s = this.raw[key];
-      if (!s?.series?.length || !s.stepMs) continue;
-      const cycleBars = Math.round((cycleDays * 86_400_000) / s.stepMs);
-      if (cycleBars < 1) continue;
-      const spanDays = (s.series.length * s.stepMs) / 86_400_000;
-      if (!best || spanDays > best.spanDays) best = { key, cycleBars, spanDays, series: s.series, stepMs: s.stepMs };
-    }
-    if (!best) {
-      // Ни один ряд не разрешает цикл хотя бы одним баром — считать нечего.
+    // Траектории общие для всех оферт: здесь мы только снимаем с них свои
+    // контрольные точки. Первая — на τ, дальше через цикл; всё округляется до
+    // баров ряда, потому что доли своего шага ряд не разрешает.
+    const base = this.scenarioPaths(horizonDays);
+    if (!base) {
       this.cache.set(id, null);
       return null;
     }
-    // Первая контрольная точка — на τ, а не на цикле. Не меньше одного бара:
-    // ряд не умеет разрешать доли своего шага.
-    const firstBars = Math.max(1, Math.round((firstDays * 86_400_000) / best.stepMs));
-    const lastBars = firstBars + (n - 1) * best.cycleBars;
-    // Цена в конце горизонта берётся именно на H, а не на последнем цикле:
-    // у 236-дневного продукта при горизонте 365 после единственного сеттлмента
-    // остаётся ещё 128 дней, и оценивать позицию по цене 237-го дня значило бы
-    // сравнивать продукты на окнах разной длины.
-    const horizonBars = Math.max(lastBars, Math.round((horizonDays * 86_400_000) / best.stepMs));
-    if (best.series.length <= horizonBars) {
-      this.cache.set(id, null);
-      return null;
-    }
-
-    const closes = best.series.map((r) => r[1]);
-    const starts = [];
-    for (let i = 0; i + horizonBars < closes.length; i++) if (closes[i] > 0) starts.push(i);
-    const paths = starts.length;
-    if (!paths) {
+    const paths = base.paths;
+    const cycleBars = Math.max(1, Math.round(cycleDays / base.barDays));
+    const firstBars = Math.max(1, Math.round(firstDays / base.barDays));
+    if (firstBars > base.bars) {
       this.cache.set(id, null);
       return null;
     }
@@ -189,18 +313,17 @@ export class History {
     const runMax = new Float64Array(paths * n);
     const terminal = new Float64Array(paths);
     for (let p = 0; p < paths; p++) {
-      const i0 = starts[p];
-      const s0 = closes[i0];
+      const row = p * base.width;
       let lo = Infinity;
       let hi = -Infinity;
       for (let k = 0; k < n; k++) {
-        const v = closes[i0 + firstBars + k * best.cycleBars] / s0;
+        const v = base.ratio[row + Math.min(base.bars, firstBars + k * cycleBars)];
         if (v < lo) lo = v;
         if (v > hi) hi = v;
         runMin[p * n + k] = lo;
         runMax[p * n + k] = hi;
       }
-      terminal[p] = closes[i0 + horizonBars] / s0;
+      terminal[p] = base.ratio[row + base.bars];
     }
 
     const hit = {
@@ -216,12 +339,18 @@ export class History {
       // него остаётся незакрытого хвоста горизонта.
       modeledDays: firstDays + (n - 1) * cycleDays,
       tailDays: Math.max(0, horizonDays - (firstDays + (n - 1) * cycleDays)),
+      // Куда контрольные точки легли после округления до баров ряда. Рядом с
+      // firstDays это показывает, какое разрешение реально доступно: на дневном
+      // ряду τ = 1.2 суток и τ = 0.8 суток дают одну и ту же первую точку.
+      firstCheckpointDays: firstBars * base.barDays,
+      cycleCheckpointDays: cycleBars * base.barDays,
+      barDays: base.barDays,
       // Вес выборки меряется горизонтом, а не длиной цикла: наблюдение здесь —
       // это целое окно длиной H, и непересекающихся окон в истории ровно
       // столько, сколько горизонтов в неё помещается.
-      independent: horizonDays > 0 ? best.spanDays / horizonDays : null,
-      spanDays: best.spanDays,
-      series: best.key,
+      independent: base.independent,
+      spanDays: base.spanDays,
+      series: base.series,
     };
     this.cache.set(id, hit);
     return hit;
@@ -283,35 +412,33 @@ export class History {
     const id = `hold:${horizonDays}`;
     const cached = this.cache.get(id);
     if (cached !== undefined) return cached;
-    let best = null;
-    for (const key of ['60', '240', 'D']) {
-      const s = this.raw[key];
-      if (!s?.series?.length || !s.stepMs) continue;
-      const bars = Math.round((horizonDays * 86_400_000) / s.stepMs);
-      if (bars < 1) continue;
-      const spanDays = (s.series.length * s.stepMs) / 86_400_000;
-      if (!best || spanDays > best.spanDays) best = { key, bars, spanDays, series: s.series };
-    }
-    if (!best || best.series.length <= best.bars) {
+    // База считается по ТЕМ ЖЕ траекториям, что и стратегии, иначе сравнение
+    // велось бы с другим рынком: у баз был бы прожитый режим, а у стратегий —
+    // сценарный.
+    const base = this.scenarioPaths(horizonDays);
+    if (!base) {
       this.cache.set(id, null);
       return null;
     }
-    const closes = best.series.map((r) => r[1]);
-    const all = [];
-    for (let i = 0; i + best.bars < closes.length; i++) {
-      if (!(closes[i] > 0)) continue;
-      all.push(closes[i + best.bars] / closes[i]);
+    const all = new Float64Array(base.paths);
+    let acc = 0;
+    let accLog = 0;
+    for (let p = 0; p < base.paths; p++) {
+      const v = base.ratio[p * base.width + base.bars];
+      all[p] = v;
+      acc += v;
+      accLog += Math.log(v);
     }
-    const n = all.length;
-    const hit = n
-      ? {
-          gross: all.reduce((a, b) => a + b, 0) / n,
-          grossMedian: median(all),
-          n,
-          series: best.key,
-          spanDays: best.spanDays,
-        }
-      : null;
+    const hit = {
+      gross: acc / base.paths,
+      grossMedian: median(all),
+      // Геометрическое — то, во что превратится капитал при удержании, а не
+      // среднее по эпизодам. Именно оно сопоставимо с геометрическим стратегий.
+      grossGeo: Math.exp(accLog / base.paths),
+      n: base.paths,
+      series: base.series,
+      spanDays: base.spanDays,
+    };
     this.cache.set(id, hit);
     return hit;
   }
@@ -373,6 +500,42 @@ export class History {
 }
 
 const SERIES_LABEL = { 60: '1ч', 240: '4ч', D: '1д' };
+
+/**
+ * Рост центральной линии выборки: геометрическое среднее по окнам длиной H.
+ *
+ * Именно оно, а не арифметическое и не наклон лог-регрессии. Арифметическое на
+ * скошенном распределении завышено на всю волатильность: на живых данных оно
+ * даёт 29.6% годовых там, где геометрическое даёт 10.4%. Лог-регрессия на
+ * пятилетнем окне и вовсе непригодна — она выдаёт 31% при R² около 0.5 и линии,
+ * которая сегодня проходит на 36% выше цены.
+ *
+ * Считается по сырой истории, без сценария: это отправная точка, от которой
+ * пользователь задаёт свой взгляд, а не результат его же взгляда.
+ */
+export function sampleCagr(history, horizonDays) {
+  let best = null;
+  for (const key of ['60', '240', 'D']) {
+    const s = history?.raw?.[key];
+    if (!s?.series?.length || !s.stepMs) continue;
+    const bars = Math.round((horizonDays * 86_400_000) / s.stepMs);
+    if (bars < 1 || s.series.length <= bars) continue;
+    const spanDays = (s.series.length * s.stepMs) / 86_400_000;
+    if (!best || spanDays > best.spanDays) best = { bars, spanDays, series: s.series };
+  }
+  if (!best) return null;
+  let acc = 0;
+  let n = 0;
+  for (let i = 0; i + best.bars < best.series.length; i++) {
+    const a = best.series[i][1];
+    const b = best.series[i + best.bars][1];
+    if (a > 0 && b > 0) {
+      acc += Math.log(b / a);
+      n++;
+    }
+  }
+  return n ? Math.exp(acc / n) ** (YEAR_DAYS / horizonDays) - 1 : null;
+}
 
 /**
  * Ключ корзины сводки перцентилей. Должен побайтово совпадать с
@@ -1233,6 +1396,7 @@ export function computeStrategy({ rows, history, spot, horizonDays, riskFree = 0
     const tail = 1 + (riskFree * paths.tailDays) / YEAR_DAYS;
     const values = new Float64Array(paths.paths);
     let acc = 0;
+    let accLog = 0;
     let converted = 0;
     for (let p = 0; p < paths.paths; p++) {
       const k = firstHitDown(paths.runMin, p * n, n, target);
@@ -1248,17 +1412,31 @@ export function computeStrategy({ rows, history, spot, horizonDays, riskFree = 0
       }
       values[p] = v;
       acc += v;
+      accLog += Math.log(Math.max(v, 1e-12));
     }
     const value = acc / paths.paths;
-    // Медиана обязательна рядом со средним: распределение годовых исходов BTC
-    // скошено настолько, что среднее задаёт правый хвост, и один только средний
-    // результат читается как обещание типичного.
+    // Три статистики, и они отвечают на разные вопросы.
+    //
+    // Среднее арифметическое — ожидание ОДНОГО эпизода. Правильная величина,
+    // если вы делаете это один раз малой долей капитала. На скошенном вправо
+    // распределении оно задаётся правым хвостом: на пятилетней выборке среднее
+    // годовое удержание биткоина даёт около 30%, а геометрическое — около 10%.
+    //
+    // Геометрическое — во что превратится капитал, если политику ПОВТОРЯТЬ.
+    // Именно оно складывается по периодам, и именно по нему строится фронт:
+    // на живых данных оно отрицательно у большинства строк, которые по
+    // арифметическому выглядели положительными.
+    //
+    // Медиана — типичный исход. Разрыв со средним и есть мера скошенности.
     const mid = median(values);
+    const geo = Math.exp(accLog / paths.paths);
     r.strategy = {
       value,
       annual: annualize(value, horizonDays),
       valueMedian: mid,
       annualMedian: annualize(mid, horizonDays),
+      valueGeo: geo,
+      annualGeo: annualize(geo, horizonDays),
       pEndBtc: converted / paths.paths,
       cycles: n,
       modeledDays: paths.modeledDays,
@@ -1268,21 +1446,36 @@ export function computeStrategy({ rows, history, spot, horizonDays, riskFree = 0
       series: paths.series,
     };
     r.stratAnnual = r.strategy.annual;
+    r.stratGeo = r.strategy.annualGeo;
     r.stratRisk = r.strategy.pEndBtc;
   }
 
   // Фронт стратегии — рекомендация, поэтому строится только по живым котировкам.
-  const usable = rows.filter((r) => !r.quoteStale && Number.isFinite(r.stratAnnual) && Number.isFinite(r.stratRisk));
-  const front = paretoFront(usable, 'stratAnnual', 'stratRisk');
+  // Ось доходности — геометрическая: капитал складывается по периодам, а не
+  // усредняется по эпизодам.
+  const usable = rows.filter((r) => !r.quoteStale && Number.isFinite(r.stratGeo) && Number.isFinite(r.stratRisk));
+  const front = paretoFront(usable, 'stratGeo', 'stratRisk');
   for (const r of usable) r.stratPareto = front.has(r);
 
   const hold = history.holdGross(horizonDays);
+  const scen = history.scenarioPaths(horizonDays);
   return {
     horizonDays,
     rows: usable.filter((r) => front.has(r)).sort((a, b) => a.stratRisk - b.stratRisk),
     usdtAnnual: riskFree,
     btcAnnual: hold ? annualize(hold.gross, horizonDays) : null,
     btcAnnualMedian: hold ? annualize(hold.grossMedian, horizonDays) : null,
+    btcAnnualGeo: hold ? annualize(hold.grossGeo, horizonDays) : null,
+    scenario: scen
+      ? {
+          cagr: scen.cagr,
+          histVol: scen.histVol,
+          scenarioVol: scen.scenarioVol,
+          series: scen.series,
+          paths: scen.paths,
+          independent: scen.independent,
+        }
+      : null,
     btcInfo: hold ? { n: hold.n, series: hold.series, spanDays: hold.spanDays } : null,
     counted: usable.length,
     stale: rows.filter((r) => r.quoteStale).length,

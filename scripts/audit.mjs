@@ -15,7 +15,7 @@ import {
   fetchRiskFree,
   fetchKlines,
 } from '../web/feeds.js';
-import { buildSurface, volAt, forwardAt } from '../web/surface.js';
+import { buildSurface, volAt, forwardAt, atmVarianceCurve, totalVariance, forwardVol } from '../web/surface.js';
 import { empiricalCdf } from '../web/quant.js';
 import {
   History,
@@ -29,6 +29,7 @@ import {
   computeStrategy,
   markHorizonRisk,
   annualize,
+  sampleCagr,
   MIN_INDEPENDENT_WINDOWS,
 } from '../web/model.js';
 import {
@@ -887,9 +888,13 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     for (const r of withH) {
       const n = r.horizonInfo?.cycles ?? 0;
       if (n < 2 || !(r.pExitHorizon > 0)) continue;
-      const cycleRet = history.returns(r.timing.cycleDays);
-      if (!cycleRet?.sorted.length) continue;
-      const pCycleHist = 1 - empiricalCdf(cycleRet.sorted, Math.log(r.strike / spot));
+      // Вероятность за один цикл берётся из ТОГО ЖЕ набора траекторий — это
+      // распределение первой контрольной точки. Раньше здесь стояла частота из
+      // history.returns, то есть из другой выборки и другого ряда, и сравнение
+      // ловило не зависимость циклов, а шум между двумя оценками.
+      const ext = history.pathExtremes(r.timing.tauDays, r.timing.cycleDays, H);
+      if (!ext?.running?.length) continue;
+      const pCycleHist = 1 - empiricalCdf(ext.running[0], r.strike / spot);
       if (!(pCycleHist > 0)) continue;
       const indep = 1 - (1 - pCycleHist) ** n;
       cmp++;
@@ -1234,14 +1239,15 @@ console.log('\n── 14. Стратегия до выбранной даты');
   ok('стоимость стратегии совпадает с полным перебором', valBad === 0, `нарушений ${valBad}`);
 
   // Фронт стратегии — полным перебором.
-  const usable = rows.filter((r) => Number.isFinite(r.stratAnnual) && Number.isFinite(r.stratRisk));
+  // Фронт строится по геометрическому: капитал складывается по периодам.
+  const usable = rows.filter((r) => Number.isFinite(r.stratGeo) && Number.isFinite(r.stratRisk));
   const dominated = (a) =>
     usable.some(
       (b) =>
         b !== a &&
-        b.stratAnnual >= a.stratAnnual &&
+        b.stratGeo >= a.stratGeo &&
         b.stratRisk <= a.stratRisk &&
-        (b.stratAnnual > a.stratAnnual || b.stratRisk < a.stratRisk),
+        (b.stratGeo > a.stratGeo || b.stratRisk < a.stratRisk),
     );
   const brute = usable.filter((r) => !dominated(r));
   ok(
@@ -1251,8 +1257,13 @@ console.log('\n── 14. Стратегия до выбранной даты');
   );
   ok('фронт стратегии упорядочен по риску', res.rows.every((r, k) => k === 0 || r.stratRisk >= res.rows[k - 1].stratRisk));
   ok(
-    'доходность вдоль фронта стратегии не убывает',
-    res.rows.every((r, k) => k === 0 || r.stratAnnual >= res.rows[k - 1].stratAnnual - 1e-12),
+    'геометрическая доходность вдоль фронта не убывает',
+    res.rows.every((r, k) => k === 0 || r.stratGeo >= res.rows[k - 1].stratGeo - 1e-12),
+  );
+  ok(
+    'геометрическое не выше арифметического ни на одной строке',
+    res.rows.every((r) => r.stratGeo <= r.stratAnnual + 1e-9),
+    `строк ${res.rows.length}`,
   );
   ok(
     'медиана стоимости посчитана',
@@ -1335,16 +1346,30 @@ console.log('\n── 15. Первый сеттлмент: сетка проти
       worst = r;
     }
   }
+  // Инвариант, не зависящий от времени суток: первая контрольная точка равна
+  // округлённому до баров τ. Разница с прежней сеткой «от цикла» исчезает сразу
+  // после открытия окна подписки, когда τ и цикл округляются в один бар, —
+  // поэтому требовать её всегда нельзя.
+  let gridBad = 0;
+  let sample = null;
+  for (const r of buy) {
+    const ps = history.pathSeries(r.timing.tauDays, r.timing.cycleDays, H);
+    if (!ps) continue;
+    if (!sample) sample = ps;
+    // Точка обязана лежать в пределах половины бара от τ — ближе ряд не умеет.
+    if (Math.abs(ps.firstCheckpointDays - ps.firstDays) > ps.barDays / 2 + 1e-9) gridBad++;
+    if (Math.abs(ps.cycleCheckpointDays - ps.cycleDays) > ps.barDays / 2 + 1e-9) gridBad++;
+  }
   ok(
-    'сетка от τ отличается от сетки от цикла на реальных данных',
-    differing > 0,
-    `строк с расхождением ${differing}, максимум ${(maxDp * 100).toFixed(2)} п.п.` +
-      (worst ? ` (${worst.duration}/${worst.strike})` : ''),
+    'первая контрольная точка садится на τ с точностью до бара ряда',
+    gridBad === 0,
+    `нарушений ${gridBad}` + (sample ? `, пример: τ ${sample.firstDays.toFixed(2)} → точка ${sample.firstCheckpointDays.toFixed(2)} сут` : ''),
   );
   ok(
-    'расхождение остаётся в разумных пределах',
+    'расхождение с прежней сеткой остаётся в разумных пределах',
     maxDp < 0.06,
-    `${(maxDp * 100).toFixed(2)} п.п. — правка уточняет фазу, а не переписывает оценку`,
+    `${(maxDp * 100).toFixed(2)} п.п. у ${differing} строк` +
+      (differing === 0 ? ' — сейчас окно подписки только открылось, τ и цикл округляются в один бар' : ''),
   );
 
   // Ожидание выхода на стороне Sell High тоже считает первый оборот по τ.
@@ -1439,6 +1464,90 @@ console.log('\n── 17. Протухшие котировки не участ�
   );
   const stratStale = computeStrategy({ rows: allStale, history, spot, horizonDays: 90, riskFree });
   ok('и фронт стратегии пуст', stratStale.rows.length === 0, `учтено ${stratStale.counted}, устарело ${stratStale.stale}`);
+}
+
+// ─────────────────────────────────────────── 18. Сценарный слой на живых данных
+
+console.log('\n── 18. Предпосылки о рынке: кривая волатильности и рост центральной линии');
+{
+  const H = 90;
+  const curve = atmVarianceCurve(surface);
+  ok('кривая накопленной дисперсии собрана', curve.points.length >= 5, `${curve.points.length} экспираций, починено провалов ${curve.repaired}`);
+  ok(
+    'после починки кривая не убывает',
+    curve.points.every((p, k) => k === 0 || p.w >= curve.points[k - 1].w - 1e-15),
+  );
+  const near7 = forwardVol(curve, 0, 7 / 365);
+  const far = forwardVol(curve, 90 / 365, 365 / 365);
+  ok(
+    'срочная структура непостоянна — одного числа на весь горизонт мало',
+    Math.abs(far / near7 - 1) > 0.1,
+    `первая неделя ${pc(near7, 1)}, участок 90–365 дней ${pc(far, 1)}`,
+  );
+
+  const auto = sampleCagr(history, H);
+  ok('рост центральной линии выборки посчитан', Number.isFinite(auto), `${pc(auto, 1)} годовых`);
+
+  history.useScenario({ cagr: auto, curve, id: 'audit' });
+  const sp = history.scenarioPaths(H);
+  ok('сценарные траектории построены', sp && sp.paths > 100, `${sp.paths} траекторий ряда ${sp.series}`);
+
+  let accLog = 0;
+  for (let p = 0; p < sp.paths; p++) accLog += Math.log(sp.ratio[p * sp.width + sp.bars]);
+  const geo = Math.exp(accLog / sp.paths) ** (365 / H) - 1;
+  ok('геометрический рост траекторий равен заданному', Math.abs(geo - auto) < 1e-9, `${pc(geo, 3)} против ${pc(auto, 3)}`);
+
+  let accVar = 0;
+  for (let j = 1; j <= sp.bars; j++) {
+    let s = 0;
+    for (let p = 0; p < sp.paths; p++) {
+      s += (Math.log(sp.ratio[p * sp.width + j]) - Math.log(sp.ratio[p * sp.width + j - 1])) ** 2;
+    }
+    accVar += s / sp.paths;
+  }
+  const wantW = totalVariance(curve, H / 365);
+  ok(
+    'накопленная изменчивость траекторий равна рыночной',
+    Math.abs(accVar / wantW - 1) < 0.05,
+    `${accVar.toFixed(5)} против ${wantW.toFixed(5)} (${((accVar / wantW - 1) * 100).toFixed(2)}%)`,
+  );
+  ok(
+    'сценарная волатильность ниже реализованной за пять лет',
+    sp.scenarioVol < sp.histVol,
+    `рынок ${pc(sp.scenarioVol, 1)} против истории ${pc(sp.histVol, 1)}`,
+  );
+
+  // Все оферты — на одном наборе траекторий.
+  const rowsS = buildRows({ ...opts, direction: 'BuyLow', horizonDays: H });
+  const byDur = new Map();
+  for (const r of rowsS) if (!byDur.has(r.duration)) byDur.set(r.duration, r);
+  const list = [...byDur.values()].map((r) => history.pathSeries(r.timing.tauDays, r.timing.cycleDays, H)).filter(Boolean);
+  const same =
+    list.length > 1 &&
+    list.every((p) => p.paths === list[0].paths) &&
+    list.every((p) => Math.abs(p.terminal[0] - list[0].terminal[0]) < 1e-15 && Math.abs(p.terminal[7] - list[0].terminal[7]) < 1e-15);
+  ok('все сроки считаются на одном наборе траекторий', same, `сроков ${list.length}`);
+
+  // Базы сравнения и фронт в трёх статистиках.
+  const res = computeStrategy({ rows: rowsS, history, spot, horizonDays: H, riskFree });
+  ok('базы сравнения посчитаны в трёх видах', [res.btcAnnual, res.btcAnnualMedian, res.btcAnnualGeo].every(Number.isFinite));
+  ok(
+    'среднее удержания BTC выше геометрического: это эффект волатильности, а не роста',
+    res.btcAnnual > res.btcAnnualGeo,
+    `среднее ${pc(res.btcAnnual, 1)}, геометрическое ${pc(res.btcAnnualGeo, 1)}, медиана ${pc(res.btcAnnualMedian, 1)}`,
+  );
+  ok(
+    'геометрический рост базы BTC близок к заданной предпосылке',
+    Math.abs(res.btcAnnualGeo - auto) < 0.02,
+    `${pc(res.btcAnnualGeo, 2)} против ${pc(auto, 2)}`,
+  );
+  const negGeo = res.rows.filter((r) => r.stratGeo < 0).length;
+  const negMean = res.rows.filter((r) => r.stratAnnual < 0).length;
+  console.log(
+    `       фронт ${res.rows.length} строк: отрицательных по геометрическому ${negGeo}, по арифметическому ${negMean}` +
+      ` · состав ${[...new Set(res.rows.map((r) => r.duration))].join(' ')}`,
+  );
+  history.useScenario({ cagr: null, curve: null, id: '' });
 }
 
 console.log(`\nИтого: ${passed} успешно, ${failed} провалено`);

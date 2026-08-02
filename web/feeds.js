@@ -92,6 +92,74 @@ export async function fetchKlines(interval, pages = 1) {
   return { stepMs: step, series: closes };
 }
 
+// ─────────────────────────────────────── альтернативная стоимость денег
+
+/**
+ * Кривая доходностей казначейства США.
+ *
+ * Гибкий депозит Bybit — это не стоимость денег, а то, что платит конкретная
+ * биржа: сейчас 1.58% против 3.8% по трёхмесячным бумагам. Сравнивать стратегию
+ * надо с тем, что доллар может заработать вообще, а не только здесь.
+ *
+ * Берём напрямую с сайта казначейства: там открыт CORS, ключа не нужно.
+ * У FRED данные те же, но заголовка Access-Control-Allow-Origin нет, поэтому из
+ * браузера он недоступен — это проверено, не догадка.
+ */
+const TENOR_DAYS = { '1 Mo': 30, '2 Mo': 60, '3 Mo': 91, '4 Mo': 121, '6 Mo': 182, '1 Yr': 365, '2 Yr': 730 };
+
+function splitCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let quoted = false;
+  for (const ch of line) {
+    if (ch === '"') quoted = !quoted;
+    else if (ch === ',' && !quoted) {
+      out.push(cur);
+      cur = '';
+    } else cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+async function treasuryYear(year) {
+  const url =
+    `https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/${year}/all` +
+    `?type=daily_treasury_yield_curve&field_tdr_date_value=${year}&_format=csv`;
+  const res = await fetch(url, { cache: 'no-cache' });
+  if (!res.ok) return null;
+  const text = await res.text();
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length < 2) return null;
+  const head = splitCsvLine(lines[0]).map((s) => s.trim().replace(/^"|"$/g, ''));
+  // Файл отсортирован по убыванию даты, поэтому свежая строка — первая.
+  const row = splitCsvLine(lines[1]).map((s) => s.trim().replace(/^"|"$/g, ''));
+  const tenors = {};
+  for (let k = 1; k < head.length; k++) {
+    const days = TENOR_DAYS[head[k]];
+    const v = Number(row[k]);
+    if (days && Number.isFinite(v) && v > 0) tenors[head[k]] = { days, rate: v / 100 };
+  }
+  return Object.keys(tenors).length ? { date: row[0], tenors } : null;
+}
+
+export async function fetchTreasuryCurve() {
+  const year = new Date().getUTCFullYear();
+  try {
+    // В первые дни января файл текущего года ещё пуст — берём прошлый.
+    return (await treasuryYear(year)) ?? (await treasuryYear(year - 1));
+  } catch {
+    return null;
+  }
+}
+
+/** Тенор, ближайший к горизонту: 90 дней → 3 месяца, 365 → год. */
+export function rateForHorizon(curve, horizonDays) {
+  const list = Object.values(curve?.tenors ?? {});
+  if (!list.length || !(horizonDays > 0)) return null;
+  return list.reduce((a, b) => (Math.abs(b.days - horizonDays) < Math.abs(a.days - horizonDays) ? b : a));
+}
+
 /**
  * Сводка перцентилей ставок, которую собирает scripts/record.mjs на ветке data.
  * Тянется напрямую с raw.githubusercontent.com, поэтому обновляется без

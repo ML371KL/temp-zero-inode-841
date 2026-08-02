@@ -8,11 +8,13 @@ import {
   fetchRiskFree,
   fetchKlines,
   fetchAprStats,
+  fetchTreasuryCurve,
+  rateForHorizon,
   OfferStream,
   SpotStream,
   normalizeWsOffer,
 } from './feeds.js';
-import { buildSurface } from './surface.js';
+import { buildSurface, atmVarianceCurve, forwardVol } from './surface.js';
 import { Archive } from './archive.js';
 import {
   History,
@@ -24,6 +26,7 @@ import {
   frontierWithMargins,
   pickAnchors,
   computeStrategy,
+  sampleCagr,
   MIN_INDEPENDENT_WINDOWS,
 } from './model.js';
 import { basisFromConversion, interestRate, cyclesToRecover, rnLossProfile, STRESS_LEVEL, MS_DAY } from './quant.js';
@@ -38,10 +41,20 @@ const state = {
   spotDir: 0,
   surface: null,
   history: null,
+  // Рабочая альтернативная стоимость доллара. По умолчанию — доходность бумаг
+  // казначейства США на срок вашего горизонта, а не то, что платит биржа:
+  // гибкий депозит Bybit даёт 1.6% там, где трёхмесячные бумаги дают 3.8%,
+  // и сравнивать стратегию надо с тем, что доллар может заработать вообще.
   riskFree: null,
+  // Что платит именно биржа — показывается рядом для справки.
+  bybitUsdt: null,
+  treasury: null,
   // Ставка по BTC нужна отдельно: Sell High запирает монету, и стоимость этого
   // простоя измеряется ставкой по монете, а не по доллару.
   riskFreeBtc: null,
+  // Сценарий рынка: рост центральной линии и срочная структура волатильности.
+  varCurve: null,
+  scenarioInfo: null,
   stats: null,
   archive: null,
   wsStatus: 'connecting',
@@ -65,6 +78,9 @@ const ui = {
   durations: [],
   tz: 'local',
   theme: null,
+  // Пустая строка означает «взять автоматическое значение».
+  cagr: '',
+  rfOpp: '',
   convPrice: '',
   convQty: '',
   convWasDual: true,
@@ -284,6 +300,41 @@ function pushError(msg) {
 
 const horizonDays = () => Number(ui.horizon) || 90;
 
+/**
+ * Предпосылки о рынке, которые панель больше не принимает молча.
+ *
+ * Рост центральной линии и срочная структура волатильности — это взгляд на
+ * будущее, а не факт из прошлого. Раньше траекторный слой брал и то и другое
+ * из пятилетней выборки: дрейф 13% годовых и волатильность 52.5%, тогда как
+ * рынок опционов сегодня оценивает ближайшую неделю в 33%, а год в 42%.
+ * Теперь оба параметра явные, с разумными умолчаниями и с полями ввода.
+ */
+function applyScenario() {
+  const H = horizonDays();
+  if (!state.history) return null;
+  const auto = sampleCagr(state.history, H);
+  const typed = ui.cagr === '' ? null : Number(ui.cagr) / 100;
+  const cagr = Number.isFinite(typed) ? typed : auto;
+  state.varCurve = state.surface ? atmVarianceCurve(state.surface) : null;
+  // Ключ сценария включает момент пересборки поверхности: кривая живёт минуту,
+  // и без этого траектории остались бы на позавчерашней волатильности.
+  state.history.useScenario({
+    cagr,
+    curve: state.varCurve,
+    id: `${state.lastOptionsAt}|${state.varCurve?.points.length ?? 0}`,
+  });
+  state.scenarioInfo = { cagr, auto, typed: Number.isFinite(typed) };
+  return state.scenarioInfo;
+}
+
+/** Альтернативная стоимость доллара на срок вашего горизонта. */
+function opportunityRate() {
+  const typed = ui.rfOpp === '' ? null : Number(ui.rfOpp) / 100;
+  if (Number.isFinite(typed) && typed >= 0) return typed;
+  const t = rateForHorizon(state.treasury, horizonDays());
+  return t ? t.rate : (state.bybitUsdt ?? 0);
+}
+
 function currentRows(direction) {
   if (!state.spot || !state.products.length) return [];
   const rows = buildRows({
@@ -478,7 +529,8 @@ const STRATEGY_COLUMNS = [
   ['Страйк', (r) => `${fmtUsd(r.strike, 2)}${fmtLadderFlag(r)}`],
   ['От спота', (r) => `<span class="muted">${fmtSigned(r.moneyness, 2)}</span>`],
   ['Закончить в BTC', (r) => `<b>${fmtPct(r.stratRisk, 1)}</b>`],
-  ['Ожид. годовых', (r) => `<b class="${cls(r.stratAnnual)}">${fmtSigned(r.stratAnnual, 1)}</b>`],
+  ['Геометрич. годовых', (r) => `<b class="${cls(r.stratGeo)}">${fmtSigned(r.stratGeo, 1)}</b>`],
+  ['Ожид. годовых', (r) => `<span class="${cls(r.stratAnnual)}">${fmtSigned(r.stratAnnual, 1)}</span>`],
   ['Медиана годовых', (r) => `<span class="${cls(r.strategy?.annualMedian)}">${fmtSigned(r.strategy?.annualMedian, 1)}</span>`],
   ['Циклов', (r) => (r.strategy ? String(r.strategy.cycles) : '—')],
   ['Цикл', (r) => fmtSpan(r.timing.cycleDays)],
@@ -711,19 +763,29 @@ function renderStrategy(rows) {
     return res;
   }
 
-  const info = res.rows.find((r) => r.strategy)?.strategy;
+  const sc = res.scenario;
+  // Два конца кривой: ближайшая неделя и вторая половина горизонта. Брать
+  // фиксированные 90 дней нельзя — на горизонте 90 участок выродился бы в точку.
+  const near = state.varCurve ? forwardVol(state.varCurve, 0, Math.min(7, H / 2) / 365) : null;
+  const far = state.varCurve ? forwardVol(state.varCurve, H / 2 / 365, H / 365) : null;
   note.innerHTML =
-    `Базы сравнения на тех же траекториях: держать USDT — <b>${fmtPct(res.usdtAnnual, 2)}</b> годовых, ` +
-    `держать BTC — <b>${fmtSigned(res.btcAnnual, 1)}</b> в среднем и <b>${fmtSigned(res.btcAnnualMedian, 1)}</b> по медиане. ` +
-    `Расхождение между средним и медианой здесь и есть мера того, насколько распределение исходов ` +
-    `скошено вправо: среднее задаёт бычий хвост пятилетней выборки, и по нему нельзя планировать. ` +
-    (info
-      ? `Оценка построена по ${info.paths} траекториям ряда ${SERIES_NAME[info.series] || info.series}, ` +
-        `около ${Math.round(info.independent ?? 0)} независимых наблюдений на горизонт. `
+    `<b>Предпосылки.</b> Рост центральной линии BTC <b>${fmtPct(sc?.cagr, 1)}</b>` +
+    (state.scenarioInfo?.typed ? ' (задан вами)' : ` (геометрическое среднее выборки; поле «Рост BTC» пусто)`) +
+    `. Волатильность взята не одним числом, а рыночной кривой: рынок опционов оценивает ближайшую неделю в ` +
+    `<b>${fmtPct(near, 0)}</b>, а вторую половину горизонта в <b>${fmtPct(far, 0)}</b>, тогда как ` +
+    `реализованная за пять лет — ${fmtPct(sc?.histVol, 0)}. Каждый участок траектории масштабируется под ту ` +
+    `изменчивость, которую рынок ждёт именно до этой даты, и все оферты считаются на одном наборе траекторий.<br />` +
+    `<b>Базы сравнения на тех же траекториях:</b> держать USDT — <b>${fmtPct(res.usdtAnnual, 2)}</b> годовых, ` +
+    `держать BTC — <b>${fmtSigned(res.btcAnnualGeo, 1)}</b> геометрических, <b>${fmtSigned(res.btcAnnual, 1)}</b> в среднем, ` +
+    `<b>${fmtSigned(res.btcAnnualMedian, 1)}</b> по медиане. Фронт строится по <b>геометрическому</b>: именно оно ` +
+    `складывается по периодам, если политику повторять. Среднее отвечает на другой вопрос — сколько даст один ` +
+    `эпизод малой долей капитала, — и на скошенном распределении задаётся правым хвостом.` +
+    (sc
+      ? ` Оценка построена по ${sc.paths} траекториям ряда ${SERIES_NAME[sc.series] || sc.series}, ` +
+        `около ${Math.round(sc.independent ?? 0)} независимых наблюдений на горизонт.`
       : '') +
-    `Ставка и лестница страйков приняты неизменными на весь горизонт, а обратная нога Sell High после ` +
-    `конвертации консервативно не учитывается — по бэктесту безубыточного страйка нет от 69% до 91% ` +
-    `времени в биткоине.`;
+    ` Ставка и лестница страйков приняты неизменными на весь горизонт, а обратная нога Sell High после ` +
+    `конвертации консервативно не учитывается.`;
 
   // Карточки: самый осторожный, самый доходный и лучший по цене риска.
   const byRisk = [...res.rows].sort((a, b) => a.stratRisk - b.stratRisk);
@@ -736,7 +798,7 @@ function renderStrategy(rows) {
   };
   take(byRisk[0], 'минимум риска');
   take(
-    byRisk.reduce((a, b) => (b.stratAnnual > a.stratAnnual ? b : a)),
+    byRisk.reduce((a, b) => (b.stratGeo > a.stratGeo ? b : a)),
     'максимум стоимости',
   );
   const priced = byRisk.filter((r) => Number.isFinite(r.volEdge));
@@ -766,7 +828,7 @@ function strategyCardFor(row) {
   return `
     <article class="card${row.stratPareto ? ' pareto' : ''}" data-product="${row.productId}">
       <div class="card-top">
-        <div class="apr">${fmtSigned(row.stratAnnual, 1)}<small>ожидаемых годовых · медиана ${fmtSigned(s?.annualMedian, 1)}</small></div>
+        <div class="apr">${fmtSigned(row.stratGeo, 1)}<small>геометрических годовых · ожидаемых ${fmtSigned(row.stratAnnual, 1)} · медиана ${fmtSigned(s?.annualMedian, 1)}</small></div>
         <div class="tags">${tags.join('')}</div>
       </div>
       <dl class="kv">
@@ -1084,8 +1146,24 @@ function renderDiag() {
   } else {
     parts.push('история: загружается');
   }
-  if (state.riskFree != null) parts.push(`гибкий депозит USDT: ${fmtPct(state.riskFree, 2)}`);
-  if (state.riskFreeBtc != null) parts.push(`BTC: ${fmtPct(state.riskFreeBtc, 2)}`);
+  const t = rateForHorizon(state.treasury, horizonDays());
+  parts.push(
+    `альтернативная ставка: ${fmtPct(state.riskFree, 2)}` +
+      (ui.rfOpp !== '' ? ' (задана вами)' : t ? ` (Treasury ${t.days} дн, ${state.treasury.date})` : ' (Bybit)'),
+  );
+  if (state.bybitUsdt != null) parts.push(`гибкий депозит Bybit: USDT ${fmtPct(state.bybitUsdt, 2)}`);
+  if (state.riskFreeBtc != null) parts.push(`BTC ${fmtPct(state.riskFreeBtc, 2)}`);
+  if (state.scenarioInfo) {
+    parts.push(
+      `рост BTC: ${fmtPct(state.scenarioInfo.cagr, 1)}` + (state.scenarioInfo.typed ? ' (задан вами)' : ' (по выборке)'),
+    );
+  }
+  if (state.varCurve) {
+    parts.push(
+      `кривая волатильности: ${state.varCurve.points.length} экспираций` +
+        (state.varCurve.repaired ? `, починено провалов ${state.varCurve.repaired}` : ''),
+    );
+  }
   parts.push(`режим: ${ui.mode === 'strategy' ? `стратегия до ${ui.horizon} дней` : 'текущая подписка'}`);
   if (state.stats) {
     const where = state.stats.source === 'local' ? 'в браузере' : 'на ветке data';
@@ -1129,6 +1207,10 @@ function render() {
     };
 
     step('шапка', renderHead);
+    step('предпосылки', () => {
+      state.riskFree = opportunityRate();
+      applyScenario();
+    });
     const buy = step('расчёт Buy Low', () => currentRows('BuyLow')) || [];
     const sell = step('расчёт Sell High', () => currentRows('SellHigh')) || [];
     step('свежесть котировок', () => renderStale(buy, sell));
@@ -1259,6 +1341,8 @@ function bindControls() {
     ['conv-price', 'convPrice'],
     ['conv-qty', 'convQty'],
     ['conv-apy', 'convApy'],
+    ['cagr', 'cagr'],
+    ['rf-opp', 'rfOpp'],
   ]) {
     $(id).value = ui[key];
     $(id).oninput = (e) => {
@@ -1374,7 +1458,8 @@ async function main() {
   await Promise.all([
     loadOptions(),
     bootstrapQuotes(),
-    fetchRiskFree('USDT').then((r) => (state.riskFree = r)),
+    fetchRiskFree('USDT').then((r) => (state.bybitUsdt = r)),
+    fetchTreasuryCurve().then((c) => (state.treasury = c)),
     // Ставка по монете нужна для Sell High: там заперт биткоин, и стоимость
     // этого простоя измеряется ставкой по биткоину, а не по доллару.
     fetchRiskFree('BTC').then((r) => (state.riskFreeBtc = r)),

@@ -149,3 +149,87 @@ export function volAt(surface, spot, K, T) {
 export function hasExactExpiry(surface, settleMs, toleranceMs = 2 * 3600_000) {
   return surface.expiries.some((e) => Math.abs(e.expiry - settleMs) <= toleranceMs);
 }
+
+// ────────────────────────────────────── срочная структура волатильности
+
+/**
+ * Кривая накопленной дисперсии «на деньгах»: w(T) = σ_ATM(T)²·T.
+ *
+ * Зачем именно накопленная дисперсия, а не волатильность. Складывается по
+ * срокам именно дисперсия, поэтому только в этих единицах можно спросить
+ * «сколько изменчивости рынок ждёт на участке с 30-го по 90-й день» — это
+ * разность w(90/365) − w(30/365). Волатильности вычитать нельзя.
+ *
+ * Монотонность чинится нарастающим максимумом. Провал, при котором на более
+ * дальней дате накопленная дисперсия оказалась бы меньше, чем на ближней,
+ * означал бы отрицательную форвардную дисперсию — величину, которой не бывает.
+ * В котировках такие провалы возникают технически: неликвидная экспирация,
+ * устаревшая марк-цена, редкая улыбка. Чинить их обязательно, иначе участок
+ * траектории пришлось бы масштабировать корнем из отрицательного числа.
+ */
+export function atmVarianceCurve(surface) {
+  const pts = [];
+  for (const e of surface.expiries) {
+    const iv = atmIv(e);
+    if (!(iv > 0) || !(e.T > 0)) continue;
+    pts.push({ T: e.T, iv, w: iv * iv * e.T, raw: iv * iv * e.T });
+  }
+  pts.sort((a, b) => a.T - b.T);
+  let run = 0;
+  let repaired = 0;
+  for (const p of pts) {
+    if (p.w < run - 1e-15) repaired++;
+    run = Math.max(run, p.w);
+    p.w = run;
+  }
+  return { points: pts, repaired };
+}
+
+/** Волатильность «на деньгах» одной экспирации: улыбка в точке log-moneyness 0. */
+function atmIv(expiry) {
+  const s = expiry.smile;
+  if (!s?.length) return null;
+  if (s.length === 1) return s[0].iv;
+  if (0 <= s[0].x) return s[0].iv;
+  if (0 >= s[s.length - 1].x) return s[s.length - 1].iv;
+  for (let k = 1; k < s.length; k++) {
+    if (0 <= s[k].x) {
+      const a = s[k - 1];
+      const b = s[k];
+      return a.iv + ((0 - a.x) / (b.x - a.x)) * (b.iv - a.iv);
+    }
+  }
+  return s[s.length - 1].iv;
+}
+
+/**
+ * Накопленная дисперсия на произвольный срок. Между котируемыми экспирациями
+ * линейно по w — так форвардная дисперсия на участке остаётся постоянной и
+ * неотрицательной. За правым краем продолжаем с последней волатильностью,
+ * за левым — с первой: экстраполировать наклон кривой опаснее, чем держать его.
+ */
+export function totalVariance(curve, T) {
+  const p = curve?.points;
+  if (!p?.length || !(T > 0)) return 0;
+  if (T <= p[0].T) return (p[0].w * T) / p[0].T;
+  if (T >= p[p.length - 1].T) return (p[p.length - 1].w * T) / p[p.length - 1].T;
+  for (let k = 1; k < p.length; k++) {
+    if (T <= p[k].T) {
+      const a = p[k - 1];
+      const b = p[k];
+      const u = (T - a.T) / (b.T - a.T);
+      return a.w + u * (b.w - a.w);
+    }
+  }
+  return p[p.length - 1].w;
+}
+
+/**
+ * Волатильность, которую рынок ждёт на участке [T0, T1], а не с нуля.
+ * Именно ею масштабируется соответствующий кусок исторической траектории.
+ */
+export function forwardVol(curve, T0, T1) {
+  if (!(T1 > T0)) return null;
+  const dv = totalVariance(curve, T1) - totalVariance(curve, T0);
+  return Math.sqrt(Math.max(dv, 0) / (T1 - T0));
+}

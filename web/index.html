@@ -77,6 +77,16 @@
         </select>
       </label>
 
+      <label class="ctl">
+        <span class="ctl-label" title="Рост центральной линии цикла. Пусто — геометрическое среднее выборки">Рост BTC, % год</span>
+        <input type="number" id="cagr" placeholder="авто" step="0.1" />
+      </label>
+
+      <label class="ctl">
+        <span class="ctl-label" title="Что доллар может заработать вместо этой сделки. Пусто — бумаги казначейства США на срок горизонта">Альт. ставка, %</span>
+        <input type="number" id="rf-opp" placeholder="авто" step="0.01" min="0" />
+      </label>
+
       <div class="ctl wide">
         <span class="ctl-label">Сроки</span>
         <div class="chips" id="durations"></div>
