@@ -26,6 +26,7 @@ import {
   exitFrontier,
   frontierWithMargins,
   pickAnchors,
+  pickExitAnchors,
   computeStrategy,
   markHorizonRisk,
   annualize,
@@ -780,6 +781,113 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
       brute.length === model.length && brute.every((r) => r.sellPareto),
       `перебор ${brute.length}, модель ${model.length}`,
     );
+
+    // Главная регрессия этого блока: равномерный срез по номеру строки не знал
+    // ни об одной метрике и перешагивал и чемпиона по скорости выхода, и лучший
+    // типичный исход. Оба лежат в середине фронта, куда номера 0, len/5, 2·len/5
+    // просто не попадают. Проверяем каждый именованный ответ явно.
+    const onFront = analyzed.filter((r) => r.profitable && !r.quoteStale && r.sellPareto);
+    const named = [
+      ['быстрее всего', 'exitSpeed', 'максимум скорости выхода'],
+      ['лучший типичный исход', 'fullMedianRate', 'лучший типичный исход'],
+      ['дороже всего', 'profitAxis', 'самый дорогой выход'],
+    ];
+    for (const [tag, key, label] of named) {
+      const pool2 = onFront.filter((r) => Number.isFinite(r[key]));
+      if (!pool2.length) continue;
+      const champ = pool2.reduce((a, b) => (b[key] > a[key] ? b : a));
+      ok(
+        `${label} показан и подписан`,
+        best.rows.includes(champ) && (champ.bestTag ?? '').includes(tag),
+        `${champ.duration}/${champ.strike} ${key}=${pc(champ[key])}, ярлык «${champ.bestTag ?? '—'}»`,
+      );
+    }
+    // Сид у reduce не ставим: строка без конечного шанса выйти прошла бы через
+    // все сравнения нетронутой и подменила бы победителя на первую попавшуюся.
+    const surePool = onFront.filter((r) => Number.isFinite(r.pExitHorizon));
+    if (surePool.length) {
+      const surest = surePool.reduce((a, b) => (b.pExitHorizon > a.pExitHorizon ? b : a));
+      ok(
+        'самый вероятный выход показан и подписан',
+        best.rows.includes(surest) && (surest.bestTag ?? '').includes('вернее всего'),
+        `${surest.duration}/${surest.strike} шанс ${pc(surest.pExitHorizon, 1)}, ярлык «${surest.bestTag ?? '—'}»`,
+      );
+    }
+
+    // Добор карточек не должен сбиваться в кучу у краёв, занятых именованными
+    // ответами. Меряем это двумя способами: разными страйками и равномерностью
+    // покрытия оси. Первая версия правки давала три карточки на одном страйке.
+    if (best.rows.length >= 4) {
+      const strikes = new Set(best.rows.map((r) => r.strike));
+      ok(
+        'карточки выхода не дублируют страйк',
+        strikes.size >= Math.min(best.rows.length, 4),
+        `разных страйков ${strikes.size} из ${best.rows.length}`,
+      );
+      const ps = best.rows.map((r) => r.pExitHorizon).filter(Number.isFinite).sort((a, b) => a - b);
+      const span = ps[ps.length - 1] - ps[0];
+      const gaps = ps.slice(1).map((v, k) => v - ps[k]);
+      // Ни один разрыв не должен съедать больше половины размаха: именно так
+      // выглядит «все карточки в одном углу, а середина потеряна».
+      ok(
+        'карточки выхода покрывают ось равномерно',
+        span > 0 && Math.max(...gaps) <= span * 0.5 + 1e-9,
+        `размах ${pc(span, 1)}, наибольший разрыв ${pc(Math.max(...gaps), 1)}`,
+      );
+    }
+
+    // Шапка блока берёт оферту прямо из отбора карточек, поэтому разойтись они
+    // больше не могут. Проверяем это со стороны шапки: её собственный критерий
+    // (максимум скорости среди ВСЕХ безубыточных) обязан указывать на карточку.
+    const headPool = analyzed.filter((r) => r.profitable && !r.quoteStale && Number.isFinite(r.exitSpeed));
+    if (headPool.length) {
+      const headBest = headPool.reduce((a, b) => (b.exitSpeed > a.exitSpeed ? b : a));
+      ok(
+        'оферта из шапки блока есть среди карточек',
+        best.rows.some((r) => r.productId === headBest.productId && r.strike === headBest.strike),
+        `${headBest.duration}/${headBest.strike} скорость ${pc(headBest.exitSpeed, 1)}`,
+      );
+    }
+
+    // Якоря: ответы, максимум которых к осям фронта не монотонен и потому лежать
+    // на фронте не обязан. Проверяем и сам максимум, и честность пометки «побит».
+    const anchors = pickExitAnchors(analyzed);
+    const anchorPool = analyzed.filter((r) => r.profitable && !r.quoteStale);
+    for (const [aid, key] of [
+      ['full', 'fullRate'],
+      ['median', 'fullMedianRate'],
+      ['market', 'volEdge'],
+    ]) {
+      const a = anchors[aid];
+      const pool3 = anchorPool.filter((r) => Number.isFinite(r[key]));
+      if (!pool3.length) {
+        ok(`якорь «${aid}» отсутствует, когда нечего выбирать`, a == null);
+        continue;
+      }
+      const champ = pool3.reduce((x, y) => (y[key] > x[key] ? y : x));
+      ok(
+        `якорь «${aid}» — действительный максимум ${key}`,
+        a != null && Math.abs(a.value - champ[key]) < 1e-12,
+        `${champ.duration}/${champ.strike} ${pc(champ[key], 1)}`,
+      );
+      if (!a) continue;
+      const domBrute = anchorPool.some(
+        (b) =>
+          b !== a.row &&
+          Number.isFinite(b.profitAxis) &&
+          Number.isFinite(b[a.axis]) &&
+          Number.isFinite(a.row.profitAxis) &&
+          Number.isFinite(a.row[a.axis]) &&
+          b.profitAxis >= a.row.profitAxis &&
+          b[a.axis] >= a.row[a.axis] &&
+          (b.profitAxis > a.row.profitAxis || b[a.axis] > a.row[a.axis]),
+      );
+      ok(
+        `пометка «вне фронта» у якоря «${aid}» соответствует перебору`,
+        Boolean(a.dominator) === domBrute,
+        domBrute ? `побит ${a.dominator?.duration}/${a.dominator?.strike}` : 'на фронте',
+      );
+    }
   }
 
   // Тот же набор, но при недостижимой себестоимости: должен включиться режим ожидания.
@@ -800,6 +908,27 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
       (b) => b !== a && b.aprEff >= a.aprEff && b[wAxis] <= a[wAxis] && (b.aprEff > a.aprEff || b[wAxis] < a[wAxis]),
     );
   ok('в режиме ожидания показаны только недоминируемые', waiting.rows.every((r) => !waitDominated(r)));
+  // Тот же дефект жил и в режиме ожидания, только в другом виде: отбор брал шесть
+  // первых строк от осторожного края, и оферта с максимальной ставкой не
+  // показывалась никогда.
+  {
+    const pool = waiting.rows.length ? deepPool.filter((r) => r.waitPareto) : [];
+    const src = pool.length ? pool : deepPool;
+    if (src.length) {
+      const rich = src.reduce((a, b) => (b.aprEff > a.aprEff ? b : a));
+      ok(
+        'в режиме ожидания максимум ставки показан и подписан',
+        waiting.rows.includes(rich) && (rich.bestTag ?? '').includes('максимум ставки'),
+        `${rich.duration}/${rich.strike} ${pc(rich.aprEff)}, ярлык «${rich.bestTag ?? '—'}»`,
+      );
+      const safe = src.reduce((a, b) => (b[wAxis] < a[wAxis] ? b : a));
+      ok(
+        'в режиме ожидания минимум риска показан и подписан',
+        waiting.rows.includes(safe) && (safe.bestTag ?? '').includes('минимум риска'),
+        `${safe.duration}/${safe.strike} ${pc(safe[wAxis], 2)}`,
+      );
+    }
+  }
 
   // Направление осторожной оценки вероятности.
   // Историческая нога здесь — нормированная серия, та же, что и на стороне

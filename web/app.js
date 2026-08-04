@@ -25,6 +25,7 @@ import {
   exitFrontier,
   frontierWithMargins,
   pickAnchors,
+  pickExitAnchors,
   computeStrategy,
   sampleCagr,
   MIN_INDEPENDENT_WINDOWS,
@@ -859,6 +860,10 @@ function strategyCardFor(row) {
 function sellCardFor(row, mode) {
   const tags = [];
   if (row.isVip) tags.push('<span class="tag vip">VIP</span>');
+  // Ярлык называет, на какой именно вопрос отвечает эта карточка. Без него блок
+  // с заголовком «Оптимальный выход» показывал шесть чисел без объяснения, какое
+  // из них чем лучше, а собственная шапка блока называла седьмое.
+  if (row.bestTag) tags.push(`<span class="tag pick">${row.bestTag}</span>`);
   if (row.sellPareto || row.waitPareto) tags.push('<span class="tag good">Парето</span>');
   tags.push(
     row.profitable
@@ -991,10 +996,65 @@ function renderFrontier(rows) {
         'доходности за тот же прирост риска, и останавливаться разумно там, где «цена шага» падает.');
 }
 
+const EXIT_ANCHOR_META = {
+  full: {
+    title: 'Лучшее полное матожидание',
+    hint: 'обе ветви сразу: и продажа, если она состоялась, и остаток в биткоине, если нет. Отвечает на вопрос «стоило ли вообще продавать колл», а не «когда я выйду». Максимум этой величины к осям фронта не монотонен и лежать на нём не обязан',
+  },
+  median: {
+    title: 'Лучший типичный исход',
+    hint: 'медиана тех же двух ветвей. Со средним расходится тем сильнее, чем длиннее правый хвост биткоина: среднее задают редкие сильные росты, медиану — то, что случается обычно',
+  },
+  market: {
+    title: 'Лучшая цена риска',
+    hint: 'насколько ставка оферты отличается от цены колла с той же датой экспирации, в пунктах волатильности. Единственная величина здесь, которой не нужны ваши предпочтения',
+  },
+};
+
+/**
+ * Якоря блока выхода.
+ *
+ * Карточки живут по правилу «только фронт», и это правильно: показанная там
+ * оферта не должна быть хуже другой показанной сразу по прибыли и по шансу
+ * выйти. Но два содержательных ответа этому правилу не подчиняются, потому что
+ * считают обе ветви сразу, а фронт — только ветвь выхода. Их место здесь.
+ */
+function renderExitAnchors(analyzed) {
+  const box = $('exit-anchors');
+  if (!box) return;
+  const anchors = pickExitAnchors(analyzed);
+  const H = Number(ui.horizon) || 90;
+  const cards = [];
+  for (const [id, meta] of Object.entries(EXIT_ANCHOR_META)) {
+    const a = anchors[id];
+    if (!a) continue;
+    const r = a.row;
+    const d = a.dominator;
+    cards.push(`
+      <article class="anchor" data-product="${r.productId}">
+        <div class="anchor-title"${
+          d
+            ? ` title="Вне фронта выхода: ${d.duration} со страйком ${fmtUsd(d.strike, 2)} даёт прибыль ${fmtSigned(d.profitAtExit, 2)} против ${fmtSigned(r.profitAtExit, 2)} при шансе выйти ${fmtPct(d[a.axis], 1)} против ${fmtPct(r[a.axis], 1)}. Якорь всё равно осмыслен: он отвечает на вопрос об обеих ветвях, а фронт считает только ветвь выхода."`
+            : ''
+        }>${meta.title}${d ? ' <span class="muted">(вне фронта выхода)</span>' : ''}</div>
+        <div class="anchor-value ${cls(a.value)}">${fmtSigned(a.value, 1)}</div>
+        <div class="anchor-line">
+          ${r.duration}${r.isVip ? ' · VIP' : ''} · страйк <b>${fmtUsd(r.strike, 2)}</b> (${fmtSigned(r.moneyness, 2)})
+        </div>
+        <div class="anchor-line muted">
+          прибыль к выходу ${fmtSigned(r.profitAtExit, 2)} · шанс выйти ${fmtPct(r.pExitHorizon, 1)} за ${H} дн · скорость ${fmtPct(r.exitSpeed, 1)}
+        </div>
+        <div class="anchor-hint">${meta.hint}</div>
+      </article>`);
+  }
+  box.innerHTML = cards.join('') || '<div class="empty">безубыточных оферт нет — якорям не из чего выбирать</div>';
+}
+
 /** Полный фронт выхода: все неулучшаемые оферты и цена каждого шага по нему. */
 function renderExitFrontier(analyzed) {
   const steps = exitFrontier(analyzed);
   const H = Number(ui.horizon) || 90;
+  renderExitAnchors(analyzed);
   renderLimitedTable('exitfront', $('exit-front-table'), EXIT_FRONT_COLUMNS, steps, (r) =>
     r.laddered ? 'dim' : '',
   );
@@ -1017,7 +1077,16 @@ function renderExitFrontier(analyzed) {
   }
   const info = steps.find((r) => r.horizonInfo)?.horizonInfo;
   const locked = analyzed.filter((r) => r.profitable && r.pExitHorizon === 0).length;
+  const base = analyzed.baseline;
   note.innerHTML =
+    // База обязана стоять рядом с якорями матожидания: сами по себе «+8.5%» и
+    // «+33.4%» ничего не говорят, вопрос всегда в том, лучше ли это бездействия.
+    (base
+      ? `Отсчёт для двух якорей матожидания — <b>ничего не делать</b>: держать биткоин те же ${H} дней даёт
+         <b class="${cls(base.holdRate)}">${fmtSigned(base.holdRate, 1)}</b> в среднем и
+         <b class="${cls(base.holdMedianRate)}">${fmtSigned(base.holdMedianRate, 1)}</b> по медиане на тех же траекториях.
+         Продажа колла обрезает правый хвост, поэтому по среднему она проигрывает почти всегда, а выигрывает по медиане. `
+      : '') +
     `Строк на фронте: <b>${steps.length}</b>.` +
     (locked
       ? ` Ещё <b>${locked}</b> безубыточных оферт не попали в него вовсе: их цикл длиннее ${H} дней,
@@ -1061,6 +1130,15 @@ function renderSell(rows) {
   // тогда как обратное отношение даёт бессмысленные сотни процентов.
   const gap = state.spot && info.basis > 0 ? state.spot / info.basis - 1 : null;
 
+  // Отбор карточек считается ДО шапки, и шапка берёт свою оферту прямо из него.
+  // Раньше оба места искали максимум скорости выхода независимо: шапка по всем
+  // безубыточным, карточки — равномерным срезом фронта. Совпадение получалось
+  // случайно и на живых данных регулярно не получалось. Теперь расхождение
+  // невозможно по построению, а не по рассуждению.
+  const best = pickBestSell({ rows: analyzed });
+  const headline =
+    best.mode === 'exit' ? best.rows.find((r) => (r.bestTag ?? '').includes('быстрее всего')) : null;
+
   line.innerHTML = `
     Себестоимость: <b>${fmtUsd(info.basis, 2)}</b> USDT за BTC${qty > 0 ? ` · позиция <b>${fmtBtc(qty)}</b> BTC на <b>${fmtUsd(qty * info.basis, 2)}</b> USDT` : ''}.
     <span class="muted">${info.note}</span><br />
@@ -1071,23 +1149,21 @@ function renderSell(rows) {
       if (!profitable.length) {
         return 'Ни одна оферта не выводит в USDT без убытка — смотрите строку «циклов до безубытка»: процент в BTC постепенно закрывает разрыв.';
       }
-      // Сводка обязана называть ту же оферту, что и отбор ниже. Здесь раньше
-      // стоял максимум эффективного APR — критерий, от которого блок ушёл,
-      // и строка противоречила собственным карточкам.
-      const pool = profitable.filter((r) => Number.isFinite(r.exitSpeed));
-      if (!pool.length) return '';
-      const best = pool.reduce((a, b) => (b.exitSpeed > a.exitSpeed ? b : a));
+      // Сводка обязана называть ту же оферту, что и отбор ниже, — и теперь берёт
+      // её оттуда буквально, а не ищет заново по своему критерию.
+      if (!headline) return '';
       const base = analyzed.baseline;
       return (
-        `Быстрее всех выводит в безубыток страйк <b>${fmtUsd(best.strike, 2)}</b>: прибыль ` +
-        `<b>${fmtSigned(best.profitAtExit, 2)}</b> к моменту выхода с шансом <b>${fmtPct(best.pExitHorizon, 1)}</b> ` +
-        `за ${ui.horizon} дней, ожидание <b>${fmtSpan(best.expExitDays)}</b> — это <b>${fmtPct(best.exitSpeed, 1)}</b> годовых ` +
+        `Быстрее всех выводит в безубыток страйк <b>${fmtUsd(headline.strike, 2)}</b> — он же первой карточкой ` +
+        `с ярлыком «быстрее всего в безубыток»: прибыль ` +
+        `<b>${fmtSigned(headline.profitAtExit, 2)}</b> к моменту выхода с шансом <b>${fmtPct(headline.pExitHorizon, 1)}</b> ` +
+        `за ${ui.horizon} дней, ожидание <b>${fmtSpan(headline.expExitDays)}</b> — это <b>${fmtPct(headline.exitSpeed, 1)}</b> годовых ` +
         `по ветви выхода.<br />` +
         // Скорость выхода считает только желанную ветвь и потому всегда
         // положительна. Полное матожидание считает обе и отвечает на другой
         // вопрос: стоило ли вообще продавать колл вместо того, чтобы просто ждать.
-        `Полное матожидание этой же оферты по обеим ветвям — <b class="${cls(best.fullRate)}">${fmtSigned(best.fullRate, 1)}</b> годовых ` +
-        `(медиана ${fmtSigned(best.fullMedianRate, 1)})` +
+        `Полное матожидание этой же оферты по обеим ветвям — <b class="${cls(headline.fullRate)}">${fmtSigned(headline.fullRate, 1)}</b> годовых ` +
+        `(медиана ${fmtSigned(headline.fullMedianRate, 1)})` +
         (base
           ? `, тогда как просто держать биткоин те же ${ui.horizon} дней дало бы ` +
             `<b class="${cls(base.holdRate)}">${fmtSigned(base.holdRate, 1)}</b> в среднем и ` +
@@ -1099,10 +1175,9 @@ function renderSell(rows) {
 
   renderExitFrontier(analyzed);
 
-  const best = pickBestSell({ rows: analyzed });
   $('best-sell-head').innerHTML =
     best.mode === 'exit'
-      ? '<h3>Оптимальный выход в USDT</h3><div class="hint">фронт Парето по паре «прибыль к себестоимости — вероятность продажи». Именно эти две величины тянут в разные стороны: чем выше страйк, тем больше денег на руки, но тем меньше шанс, что продажа состоится. Сверху самый вероятный выход, ниже — всё более дорогие и всё менее вероятные</div>'
+      ? '<h3>Оптимальный выход в USDT</h3><div class="hint">единого оптимума здесь не существует: метрики выхода тянут в разные стороны, и максимум скорости выхода ухудшает полное матожидание, а максимум среднего ухудшает медиану. Поэтому каждая карточка подписана тем вопросом, на который отвечает именно она — «вернее всего выйти», «быстрее всего в безубыток», «лучший типичный исход», «дороже всего». Все они лежат на фронте Парето по паре «прибыль к себестоимости — шанс выйти»; ответы, которые на этот фронт не ложатся, вынесены в якоря под таблицей ниже</div>'
       : `<h3>Заработок на ожидании</h3><div class="hint">безубыточного выхода сейчас нет, поэтому срабатывание страйка означало бы принудительную продажу дешевле себестоимости: здесь отобраны оферты с наибольшей ставкой при наименьшем риске такой продажи за ${ui.horizon} дней. Риск считается по тому же горизонту, что и в режиме выхода — вероятности за один цикл у пятидневного и у 237-дневного продукта несравнимы</div>`;
   $('best-sell').innerHTML = best.rows.length
     ? best.rows.map((r) => sellCardFor(r, best.mode)).join('')

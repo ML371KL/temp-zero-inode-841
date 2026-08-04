@@ -1314,10 +1314,70 @@ export function exitFrontier(rows, { limit = 0 } = {}) {
 }
 
 /**
+ * Именованные ответы блока выхода, не привязанные к паре осей фронта.
+ *
+ * Фронт выхода строится по паре «прибыль к моменту выхода — шанс выйти», и
+ * максимум любой величины, монотонно растущей по обеим осям, гарантированно
+ * лежит на нём. Скорость выхода — как раз такая: это произведение осей. А вот
+ * полное матожидание и его медиана к осям не монотонны, и их максимумы регулярно
+ * оказываются вне фронта: сегодня лучшая медиана у страйка, который побит по
+ * паре осей соседней строкой, но отвечает на другой вопрос — не «когда я выйду»,
+ * а «сколько у меня останется, если выход не состоится».
+ *
+ * Поэтому такие ответы место не на карточках (там правило «только фронт»), а
+ * рядом с полным фронтом — ровно как якоря на стороне Buy Low, с пометкой, чем
+ * именно якорь побит.
+ */
+export function pickExitAnchors(rows) {
+  const pool = rows.filter((r) => r.profitable && !r.quoteStale);
+  const top = (key) => {
+    const p = pool.filter((r) => Number.isFinite(r[key]));
+    return p.length ? p.reduce((a, b) => (b[key] > a[key] ? b : a)) : null;
+  };
+
+  // Доминирование считается по той же паре, что и фронт: здесь обе величины
+  // максимизируются, поэтому «побит» означает «есть оферта не хуже по прибыли и
+  // не хуже по шансу выйти, и хотя бы по одной строго лучше».
+  const axis = pool.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
+  const usable = pool.filter((r) => Number.isFinite(r.profitAxis) && Number.isFinite(r[axis]));
+  const dominatorOf = (r) => {
+    if (!r || !Number.isFinite(r.profitAxis) || !Number.isFinite(r[axis])) return null;
+    const better = usable.filter(
+      (b) =>
+        b !== r &&
+        b.profitAxis >= r.profitAxis &&
+        b[axis] >= r[axis] &&
+        (b.profitAxis > r.profitAxis || b[axis] > r[axis]),
+    );
+    return better.length ? better.reduce((a, b) => (b.profitAxis > a.profitAxis ? b : a)) : null;
+  };
+
+  const out = {};
+  for (const [id, key] of [
+    ['full', 'fullRate'],
+    ['median', 'fullMedianRate'],
+    ['market', 'volEdge'],
+  ]) {
+    const row = top(key);
+    out[id] = row ? { row, key, value: row[key], axis, dominator: dominatorOf(row) } : null;
+  }
+  return out;
+}
+
+/**
  * Отбор в блок «оптимальные Sell High».
  *
  * Если безубыточные оферты есть — берём их фронт Парето: там срабатывание
  * желанно, значит максимизируем и ставку, и вероятность продажи.
+ *
+ * Внутри фронта сначала берутся ИМЕНОВАННЫЕ ответы и только потом равномерный
+ * срез. Порядок здесь не косметика. Срез по номеру строки не знает ни об одной
+ * метрике: он берёт точки 0, len/5, 2·len/5 и так далее, а чемпион по скорости
+ * выхода и лучший типичный исход лежат в середине фронта, куда эти номера
+ * попадают только случайно. На живых данных из-за этого блок «Оптимальный выход»
+ * не показывал ни оферту, которую называла собственная шапка блока (максимум
+ * скорости выхода, 19-я строка фронта из 27), ни лучший типичный исход (13-я).
+ * Та же схема уже работает в pickBest на стороне Buy Low.
  *
  * Если рынок ушёл ниже себестоимости и безубыточного выхода нет, знак риска
  * переворачивается обратно: сработавший страйк означает принудительную продажу
@@ -1325,22 +1385,70 @@ export function exitFrontier(rows, { limit = 0 } = {}) {
  * при минимуме вероятности срабатывания — заработок в BTC без фиксации убытка.
  */
 export function pickBestSell({ rows, limit = 6 }) {
+  // Подписи сбрасываем на всём наборе, а не только на отобранных: при повторном
+  // вызове строка может выпасть из отбора и унести с собой ярлык прошлого расчёта.
+  for (const r of rows) r.bestTag = null;
+
+  const out = [];
+  const take = (r, tag) => {
+    if (!r) return;
+    // Одна и та же оферта бывает и самой вероятной, и самой быстрой. Тогда
+    // карточка одна, но обе причины на ней должны быть названы.
+    if (out.includes(r)) {
+      if (tag && r.bestTag && !r.bestTag.includes(tag)) r.bestTag += ` · ${tag}`;
+      else if (tag && !r.bestTag) r.bestTag = tag;
+      return;
+    }
+    r.bestTag = tag;
+    out.push(r);
+  };
+  // Добор идёт равномерно ПО ЗНАЧЕНИЮ оси, а не по номеру строки.
+  //
+  // Именованные ответы уже занимают оба края фронта, поэтому прежний срез по
+  // номерам 0, len/5, 2·len/5 … сажал бы оставшиеся карточки вплотную к уже
+  // занятым краям. Замер на живых данных: три карточки из шести приходились на
+  // один и тот же страйк 65 000, а вся середина фронта снова пропадала — то
+  // есть ровно тот дефект, ради которого блок и переделывался.
+  const fill = (pool, key) => {
+    const vals = pool.map((r) => r[key]).filter(Number.isFinite);
+    if (!vals.length) return;
+    const lo = Math.min(...vals);
+    const hi = Math.max(...vals);
+    const need = limit - out.length;
+    for (let k = 1; k <= need; k++) {
+      const rest = pool.filter((r) => !out.includes(r) && Number.isFinite(r[key]));
+      if (!rest.length) break;
+      const target = lo + ((hi - lo) * k) / (need + 1);
+      take(
+        rest.reduce((a, b) => (Math.abs(b[key] - target) < Math.abs(a[key] - target) ? b : a)),
+        null,
+      );
+    }
+    // Вырожденный случай: у всех строк ось одинаковая, ближайшая всегда одна и
+    // та же. Тогда просто добираем подряд, лишь бы блок не оказался полупустым.
+    for (const r of pool) {
+      if (out.length >= limit) break;
+      take(r, null);
+    }
+  };
+
   const profitable = rows.filter((r) => r.profitable && !r.quoteStale && Number.isFinite(r.profitAxis));
   if (profitable.length) {
     // Сортируем по вероятности продажи от большей к меньшей: сверху самый
     // реалистичный выход, ниже — всё более дорогие, но всё менее вероятные.
     const key = profitable.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
     const front = profitable.filter((r) => r.sellPareto).sort((a, b) => b[key] - a[key]);
-    // Берём не край фронта, а равномерный срез по нему. Шесть первых строк —
-    // это шесть самых вероятных и самых дешёвых выходов подряд, они отличаются
-    // друг от друга на доли процента и прячут весь остальной размах: на живых
-    // данных фронт тянется от +0.6% до +36% прибыли.
-    if (front.length <= limit) return { mode: 'exit', axis: key, rows: front };
-    const picked = [];
-    for (let k = 0; k < limit; k++) {
-      picked.push(front[Math.round((k * (front.length - 1)) / (limit - 1))]);
-    }
-    return { mode: 'exit', axis: key, rows: [...new Set(picked)] };
+    if (!front.length) return { mode: 'exit', axis: key, rows: [] };
+    const maxBy = (k) => {
+      const p = front.filter((r) => Number.isFinite(r[k]));
+      return p.length ? p.reduce((a, b) => (b[k] > a[k] ? b : a)) : null;
+    };
+    take(front[0], 'вернее всего выйти');
+    take(maxBy('exitSpeed'), 'быстрее всего в безубыток');
+    take(maxBy('fullMedianRate'), 'лучший типичный исход');
+    take(maxBy('profitAxis'), 'дороже всего');
+    fill(front, key);
+    return { mode: 'exit', axis: key, rows: out.sort((a, b) => b[key] - a[key]).slice(0, limit) };
   }
 
   // Режим ожидания меряет риск тем же горизонтом, что и режим выхода: иначе
@@ -1350,16 +1458,18 @@ export function pickBestSell({ rows, limit = 6 }) {
   const axis = rows.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
   const usable = rows.filter((r) => !r.quoteStale && Number.isFinite(r.aprEff) && Number.isFinite(r[axis]));
   const front = paretoFront(usable, 'aprEff', axis, true);
-  const waiting = usable
-    .filter((r) => front.has(r))
-    .sort((a, b) => a[axis] - b[axis])
-    .slice(0, limit);
-  for (const r of waiting) r.waitPareto = true;
-  return {
-    mode: 'wait',
-    axis,
-    rows: waiting.length ? waiting : usable.sort((a, b) => a[axis] - b[axis]).slice(0, limit),
-  };
+  const ranked = usable.filter((r) => front.has(r)).sort((a, b) => a[axis] - b[axis]);
+  for (const r of ranked) r.waitPareto = true;
+  // Тот же дефект жил и здесь, только в другом виде: прежний отбор брал шесть
+  // первых строк от самого осторожного края, и оферта с максимальной ставкой в
+  // блок не попадала никогда.
+  const pool = ranked.length ? ranked : [...usable].sort((a, b) => a[axis] - b[axis]);
+  if (!pool.length) return { mode: 'wait', axis, rows: [] };
+  take(pool[0], 'минимум риска');
+  const rated = pool.filter((r) => Number.isFinite(r.aprEff));
+  if (rated.length) take(rated.reduce((a, b) => (b.aprEff > a.aprEff ? b : a)), 'максимум ставки');
+  fill(pool, axis);
+  return { mode: 'wait', axis, rows: out.sort((a, b) => a[axis] - b[axis]).slice(0, limit) };
 }
 
 /**
