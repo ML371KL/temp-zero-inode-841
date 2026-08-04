@@ -1479,21 +1479,58 @@ console.log('\n── 15. Первый сеттлмент: сетка проти
   // округлённому до баров τ. Разница с прежней сеткой «от цикла» исчезает сразу
   // после открытия окна подписки, когда τ и цикл округляются в один бар, —
   // поэтому требовать её всегда нельзя.
+  //
+  // Половины бара мало: у восьмичасового продукта τ живёт в (0, 0.333], и когда
+  // оно опускается ниже половины суток, округление даёт ноль, а сетка обязана
+  // зажать точку до первого бара. Прежняя формулировка теста этого не учитывала
+  // и падала ровно половину каждого восьмичасового окна — то есть была ровно
+  // такой же зависимой от времени суток, какой была версия до неё.
   let gridBad = 0;
+  let clamped = 0;
   let sample = null;
   for (const r of buy) {
     const ps = history.pathSeries(r.timing.tauDays, r.timing.cycleDays, H);
     if (!ps) continue;
     if (!sample) sample = ps;
-    // Точка обязана лежать в пределах половины бара от τ — ближе ряд не умеет.
-    if (Math.abs(ps.firstCheckpointDays - ps.firstDays) > ps.barDays / 2 + 1e-9) gridBad++;
-    if (Math.abs(ps.cycleCheckpointDays - ps.cycleDays) > ps.barDays / 2 + 1e-9) gridBad++;
+    const half = ps.barDays / 2 + 1e-9;
+    const dF = Math.abs(ps.firstCheckpointDays - ps.firstDays);
+    // Зажатие до первого бара законно ровно тогда, когда сам τ короче половины
+    // бара: ближе ряд поставить точку не может физически.
+    if (dF > half) {
+      if (ps.firstCheckpointDays === ps.barDays && ps.firstDays < half) clamped++;
+      else gridBad++;
+    }
+    if (Math.abs(ps.cycleCheckpointDays - ps.cycleDays) > half) gridBad++;
   }
   ok(
-    'первая контрольная точка садится на τ с точностью до бара ряда',
+    'контрольные точки садятся на расписание с точностью до бара ряда',
     gridBad === 0,
-    `нарушений ${gridBad}` + (sample ? `, пример: τ ${sample.firstDays.toFixed(2)} → точка ${sample.firstCheckpointDays.toFixed(2)} сут` : ''),
+    `нарушений ${gridBad}, зажато до первого бара ${clamped}` +
+      (sample ? `, пример: τ ${sample.firstDays.toFixed(2)} → точка ${sample.firstCheckpointDays.toFixed(2)} сут` : ''),
   );
+
+  // Цена этого зажатия, измеренная, а не предположенная: сдвиг всего расписания
+  // на один бар — верхняя граница фазовой ошибки для самых коротких продуктов.
+  {
+    let maxShift = 0;
+    let worstRow = null;
+    for (const r of buy) {
+      const a = history.pathExtremes(r.timing.tauDays, r.timing.cycleDays, H);
+      const b = history.pathExtremes(r.timing.tauDays + 1, r.timing.cycleDays, H);
+      if (!a || !b) continue;
+      const ratio = r.strike / spot;
+      const d = Math.abs(empiricalCdf(a.minima, ratio) - empiricalCdf(b.minima, ratio));
+      if (d > maxShift) {
+        maxShift = d;
+        worstRow = r;
+      }
+    }
+    ok(
+      'сдвиг расписания на целый бар почти не двигает риск за горизонт',
+      maxShift < 0.03,
+      `максимум ${(maxShift * 100).toFixed(2)} п.п.` + (worstRow ? ` (${worstRow.duration}/${worstRow.strike})` : ''),
+    );
+  }
   ok(
     'расхождение с прежней сеткой остаётся в разумных пределах',
     maxDp < 0.06,
@@ -1617,8 +1654,23 @@ console.log('\n── 18. Предпосылки о рынке: кривая в�
     `первая неделя ${pc(near7, 1)}, участок 90–365 дней ${pc(far, 1)}`,
   );
 
-  const auto = sampleCagr(history, H);
+  const auto = sampleCagr(history);
   ok('рост центральной линии выборки посчитан', Number.isFinite(auto), `${pc(auto, 1)} годовых`);
+
+  // Предпосылка о рынке обязана быть свойством данных, а не положения ползунка
+  // горизонта. Прежняя оценка усредняла по окнам длиной H и на этом же ряду
+  // давала 10.2% при 90, 8.1% при 180 и 18.9% при 365 — переключение горизонта
+  // молча меняло мир, в котором считается стратегия.
+  ok('оценка роста не зависит от горизонта', sampleCagr.length === 1, `аргументов у функции: ${sampleCagr.length}`);
+  {
+    const d = history.raw.D.series;
+    const edge = (Math.log(d[d.length - 1][1] / d[0][1]) * 365) / (d.length - 1);
+    ok(
+      'оценка роста совпадает с ростом ряда от края до края',
+      Math.abs(Math.log(1 + auto) - edge) < 1e-9,
+      `${pc(auto, 2)} против ${pc(Math.exp(edge) - 1, 2)}`,
+    );
+  }
 
   history.useScenario({ cagr: auto, curve, id: 'audit' });
   const sp = history.scenarioPaths(H);
