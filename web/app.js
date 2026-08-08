@@ -474,6 +474,22 @@ function renderHead() {
   }
 }
 
+/**
+ * Подписи «почему эта карточка здесь» — каждая отдельной плашкой.
+ *
+ * В модели причины копятся в одну строку через « · », потому что там это
+ * удобно проверять поиском подстроки. Одной плашкой такая склейка не рисуется:
+ * у плашки `white-space: nowrap`, и «максимум доходности · лучшая цена риска»
+ * оказывается шире карточки — верстка уезжала вправо вместе со всей таблицей
+ * значений. Отдельные плашки переносятся сами.
+ */
+function pickTags(row) {
+  return String(row.bestTag ?? '')
+    .split(' · ')
+    .filter(Boolean)
+    .map((t) => `<span class="tag pick">${t}</span>`);
+}
+
 function cardFor(row) {
   const t = row.timing;
   const closeIn = (t.subEnd - Date.now()) / MS_DAY;
@@ -482,7 +498,7 @@ function cardFor(row) {
   // Почему именно эта карточка попала в блок. Раньше все шесть были подряд с
   // верхнего края фронта, и подпись была не нужна — но и осторожных вариантов
   // там не было вовсе.
-  if (row.bestTag) tags.push(`<span class="tag pick">${row.bestTag}</span>`);
+  tags.push(...pickTags(row));
   if (row.pareto) tags.push('<span class="tag good">Парето</span>');
   if (row.volEdge > 0) tags.push(`<span class="tag good">σ +${(row.volEdge * 100).toFixed(1)}</span>`);
   else if (row.volEdge < 0) tags.push(`<span class="tag warn">σ ${(row.volEdge * 100).toFixed(1)}</span>`);
@@ -853,7 +869,7 @@ function strategyCardFor(row) {
   const s = row.strategy;
   const tags = [];
   if (row.isVip) tags.push('<span class="tag vip">VIP</span>');
-  if (row.bestTag) tags.push(`<span class="tag pick">${row.bestTag}</span>`);
+  tags.push(...pickTags(row));
   if (row.volEdge > 0) tags.push(`<span class="tag good">σ +${(row.volEdge * 100).toFixed(1)}</span>`);
   else if (row.volEdge < 0) tags.push(`<span class="tag warn">σ ${(row.volEdge * 100).toFixed(1)}</span>`);
 
@@ -881,7 +897,7 @@ function sellCardFor(row, mode) {
   // Ярлык называет, на какой именно вопрос отвечает эта карточка. Без него блок
   // с заголовком «Оптимальный выход» показывал шесть чисел без объяснения, какое
   // из них чем лучше, а собственная шапка блока называла седьмое.
-  if (row.bestTag) tags.push(`<span class="tag pick">${row.bestTag}</span>`);
+  tags.push(...pickTags(row));
   if (row.sellPareto || row.waitPareto) tags.push('<span class="tag good">Парето</span>');
   tags.push(
     row.profitable
