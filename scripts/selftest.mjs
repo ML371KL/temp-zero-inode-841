@@ -30,6 +30,11 @@ import {
   twapEffectiveT,
   apyFromE8,
   truncate,
+  percentileFromQuantiles,
+  quantiles,
+  bucketKey,
+  summarizeBuckets,
+  QUANTILE_LEVELS,
   MS_DAY,
 } from '../web/quant.js';
 import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr } from '../web/model.js';
@@ -986,6 +991,93 @@ if (!offline) {
   } catch (e) {
     failed++;
     console.log(`  FAIL живые данные — ${e.message}`);
+  }
+}
+
+// ───────────────────────────────────────────── архив ставок и перцентиль
+//
+// До этого набора web/archive.js не импортировался ни одним скриптом, и ни одна
+// из 282 проверок selftest+audit не касалась ключа корзины, квантилей и
+// перцентиля. Дефект «неподвижная ставка печатается как нижний край шкалы»
+// прожил в проде именно поэтому.
+
+console.log('\nАрхив ставок и перцентиль');
+
+{
+  const L = QUANTILE_LEVELS;
+
+  // 1. Вырожденный ряд: сравнивать не с чем.
+  const flat = [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05];
+  ok('неподвижная ставка не даёт перцентиля', percentileFromQuantiles(L, flat, 0.05) === null);
+  ok('неподвижная ставка не даёт перцентиля и ниже ряда', percentileFromQuantiles(L, flat, 0.01) === null);
+
+  // 2. Упоры помечаются, а не выдаются за ранг.
+  const q = [1, 2, 3, 4, 5, 6, 7];
+  const lo = percentileFromQuantiles(L, q, 0.5);
+  const hi = percentileFromQuantiles(L, q, 99);
+  ok('значение ниже сетки — упор снизу', lo?.clamp === 'low' && lo.p === L[0]);
+  ok('значение выше сетки — упор сверху', hi?.clamp === 'high' && hi.p === L[L.length - 1]);
+  ok('равенство минимуму — тоже упор, а не точный ранг', percentileFromQuantiles(L, q, 1)?.clamp === 'low');
+  const mid = percentileFromQuantiles(L, q, 4);
+  ok('медиана ряда даёт 50-й перцентиль без упора', mid?.clamp === '' && Math.abs(mid.p - 0.5) < 1e-12, `${mid?.p}`);
+  const between = percentileFromQuantiles(L, q, 4.5);
+  ok('между узлами интерполируется линейно', Math.abs(between.p - 0.625) < 1e-12, `${between?.p}`);
+
+  // 3. Квантили на известном ряду.
+  const ten = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+  const qq = quantiles(ten, [0, 0.5, 1]);
+  ok('квантили: край, медиана, край', qq[0] === 1 && Math.abs(qq[1] - 5.5) < 1e-12 && qq[2] === 10);
+
+  // 4. Ключ корзины переживает суточный перекат меток срока.
+  //    Наблюдение 2026-08-08: у семи продуктов из десяти метка сменилась за один
+  //    такт, при этом дата сеттлмента осталась прежней.
+  const roll = [
+    [20, 19],
+    [13, 12],
+    [83, 82],
+    [139, 138],
+    [230, 229],
+  ];
+  let pooled = 0;
+  for (const [before, after] of roll) {
+    const k1 = bucketKey(before, true, 'BuyLow', -0.05);
+    const k2 = bucketKey(after, true, 'BuyLow', -0.05);
+    const obs = [];
+    for (let i = 0; i < 30; i++) obs.push({ key: k1, value: 0.1 + i * 1e-4, day: 1 + (i % 3) });
+    for (let i = 0; i < 30; i++) obs.push({ key: k2, value: 0.1 + i * 1e-4, day: 4 + (i % 3) });
+    const b = summarizeBuckets(obs);
+    if (b[k2] && b[k2].n === 60 && b[k2].days === 6) pooled++;
+  }
+  ok('вчерашняя метка срока попадает в сегодняшнюю корзину', pooled === roll.length, `${pooled} из ${roll.length}`);
+
+  // 5. Далёкие сроки в одну корзину НЕ сливаются: 3d и 6d это ×2 по сроку.
+  {
+    const k3 = bucketKey(3, false, 'BuyLow', -0.02);
+    const k6 = bucketKey(6, false, 'BuyLow', -0.02);
+    const obs = [];
+    for (let i = 0; i < 40; i++) obs.push({ key: k3, value: 0.5 + i * 1e-4, day: 1 + (i % 4) });
+    for (let i = 0; i < 40; i++) obs.push({ key: k6, value: 0.1 + i * 1e-4, day: 1 + (i % 4) });
+    const b = summarizeBuckets(obs);
+    ok('соседняя корзина не подмешивает вдвое более длинный срок', b[k3]?.n === 40 && b[k6]?.n === 40);
+  }
+
+  // 6. Порог считается в РАЗНЫХ сутках, а не в наблюдениях.
+  {
+    const k = bucketKey(20, false, 'SellHigh', 0.03);
+    const oneDay = Array.from({ length: 200 }, (_, i) => ({ key: k, value: 0.1 + i * 1e-4, day: 7 }));
+    ok('двести наблюдений за одни сутки корзины не дают', summarizeBuckets(oneDay)[k] === undefined);
+    const threeDays = Array.from({ length: 30 }, (_, i) => ({ key: k, value: 0.1 + i * 1e-4, day: 7 + (i % 3) }));
+    ok('тридцать наблюдений за трое суток корзину дают', summarizeBuckets(threeDays)[k]?.days === 3);
+  }
+
+  // 7. Ключ различает то, что обязан различать.
+  {
+    const base = bucketKey(20, false, 'BuyLow', -0.05);
+    ok('ключ различает VIP', bucketKey(20, true, 'BuyLow', -0.05) !== base);
+    ok('ключ различает направление', bucketKey(20, false, 'SellHigh', -0.05) !== base);
+    ok('ключ различает удаление от спота', bucketKey(20, false, 'BuyLow', -0.06) !== base);
+    ok('ячейка удаления шириной полпроцента', bucketKey(20, false, 'BuyLow', -0.0505) === base);
+    ok('нечисловой срок ключа не даёт', bucketKey(NaN, false, 'BuyLow', -0.05) === null);
   }
 }
 

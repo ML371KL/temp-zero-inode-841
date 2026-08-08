@@ -10,42 +10,42 @@
 // панель была открыта. Это не непрерывный ряд, и панель честно показывает,
 // сколько наблюдений и за какой период набрано.
 
+import { QUANTILE_LEVELS, bucketKey, parseDuration, summarizeBuckets, utcDay } from './quant.js';
+
+export { QUANTILE_LEVELS };
+
 const DB_NAME = 'dual-assets-archive';
 const STORE = 'samples';
-const DB_VERSION = 1;
+// Версия 2: ключ корзины перешёл со строковой метки срока на срок в сутках.
+// Старые записи несовместимы по ключу, поэтому при обновлении стор очищается —
+// иначе сводка молча собиралась бы из двух несопоставимых наборов.
+const DB_VERSION = 2;
 
 // Как часто класть точку. Котировки живут секунды, но нам нужна не каждая
 // из них, а равномерная сетка: иначе активные минуты просмотра перевесят.
 export const SAMPLE_INTERVAL_MS = 60_000;
 // Глубина хранения.
 const KEEP_DAYS = 60;
-// Уровни, по которым считаются перцентили.
-export const QUANTILE_LEVELS = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95];
-// Минимум наблюдений в корзине, ниже которого перцентиль не показывается.
-const MIN_BUCKET_N = 20;
+// Пороги показа перцентиля: и наблюдений достаточно, и они из РАЗНЫХ суток.
+// Порог в одних наблюдениях набирался за двадцать минут открытой вкладки, и
+// перцентиль по такому архиву мерил дрожание спота внутри одной ячейки,
+// а не условия оферты.
+const MIN_BUCKET_N = 30;
+const MIN_BUCKET_DAYS = 3;
 
 function openDb() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
-      if (!db.objectStoreNames.contains(STORE)) {
-        const store = db.createObjectStore(STORE, { keyPath: 'id', autoIncrement: true });
-        store.createIndex('ts', 'ts');
-      }
+      // Ключи корзин версии 1 несопоставимы с версией 2, смешивать нельзя.
+      if (db.objectStoreNames.contains(STORE)) db.deleteObjectStore(STORE);
+      const store = db.createObjectStore(STORE, { keyPath: 'id', autoIncrement: true });
+      store.createIndex('ts', 'ts');
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
-}
-
-/**
- * Ключ корзины совпадает с тем, что считает scripts/record.mjs:
- * срок, статус VIP, направление и удаление от спота с шагом полпроцента.
- */
-export function bucketKey(duration, isVip, direction, moneyness) {
-  const half = Math.max(-60, Math.min(60, Math.round(moneyness * 200)));
-  return `${duration}|${isVip ? 1 : 0}|${direction === 'BuyLow' ? 'B' : 'S'}|${half}`;
 }
 
 export class Archive {
@@ -75,9 +75,16 @@ export class Archive {
     if (now - this.lastSampleAt < SAMPLE_INTERVAL_MS) return false;
     this.lastSampleAt = now;
 
-    const points = rows
-      .filter((r) => Number.isFinite(r.apy) && Number.isFinite(r.moneyness))
-      .map((r) => ({ ts: now, k: bucketKey(r.duration, r.isVip, r.direction, r.moneyness), a: r.apy }));
+    const points = [];
+    for (const r of rows) {
+      if (!Number.isFinite(r.apy) || !Number.isFinite(r.moneyness)) continue;
+      // Срок берётся из окна начисления, а не из метки продукта: метка живёт
+      // одни сутки, окно начисления — это и есть сам срок.
+      const tenor = Number.isFinite(r.timing?.yieldDays) ? r.timing.yieldDays : parseDuration(r.duration);
+      const k = bucketKey(tenor, r.isVip, r.direction, r.moneyness);
+      if (!k) continue;
+      points.push({ ts: now, k, a: r.apy });
+    }
     if (!points.length) return false;
 
     try {
@@ -139,29 +146,29 @@ export class Archive {
     }
     if (!rows.length) return null;
 
-    const byKey = new Map();
     let earliest = Infinity;
     const stamps = new Set();
+    const obs = [];
     for (const r of rows) {
       earliest = Math.min(earliest, r.ts);
       stamps.add(r.ts);
-      let arr = byKey.get(r.k);
-      if (!arr) byKey.set(r.k, (arr = []));
-      arr.push(r.a);
+      obs.push({ key: r.k, value: r.a, day: utcDay(r.ts) });
     }
 
-    const buckets = {};
-    for (const [key, values] of byKey) {
-      if (values.length < MIN_BUCKET_N) continue;
-      values.sort((a, b) => a - b);
-      buckets[key] = { n: values.length, q: quantiles(values, QUANTILE_LEVELS) };
-    }
+    // Сборка соседних сроков в одну корзину живёт в summarizeBuckets: там же,
+    // где её видит и scripts/record.mjs, чтобы два источника сводки не разошлись.
+    const buckets = summarizeBuckets(obs, {
+      levels: QUANTILE_LEVELS,
+      minN: MIN_BUCKET_N,
+      minDays: MIN_BUCKET_DAYS,
+    });
 
     this.cache = {
       source: 'local',
       updated: Date.now(),
       snapshots: stamps.size,
       spanDays: (Date.now() - earliest) / 86_400_000,
+      days: new Set(rows.map((r) => utcDay(r.ts))).size,
       quantileLevels: QUANTILE_LEVELS,
       buckets,
     };
@@ -177,12 +184,3 @@ export class Archive {
   }
 }
 
-/** Квантили по порядковым статистикам с линейной интерполяцией. */
-export function quantiles(sorted, levels) {
-  return levels.map((q) => {
-    const pos = (sorted.length - 1) * q;
-    const lo = Math.floor(pos);
-    const hi = Math.ceil(pos);
-    return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
-  });
-}

@@ -212,11 +212,22 @@ function fmtHist(row) {
 }
 
 /** Перцентиль текущей ставки относительно собранного архива. */
+// Подпись перцентиля. Упор шкалы помечается знаком «≤» или «≥»: за краем сетки
+// квантилей вернуть можно только сам край, и выдавать его за ранг нельзя.
+// Охват берётся фактический, а не «за месяц», как было зашито раньше.
+function percentileLabel(row) {
+  const p = Math.round(row.aprPercentile * 100);
+  const sign = row.aprPercentileClamp === 'low' ? '≤' : row.aprPercentileClamp === 'high' ? '≥' : '';
+  const n = row.aprBucketN;
+  const word = n % 10 === 1 && n % 100 !== 11 ? 'наблюдению' : 'наблюдениям';
+  const span = row.aprBucketDays ? `${n} ${word} за ${row.aprBucketDays} сут` : `${n} ${word}`;
+  return { p, sign, tone: p >= 75 ? 'pos' : p <= 25 ? 'neg' : '', title: `по ${span}` };
+}
+
 function fmtPercentile(row) {
   if (row.aprPercentile == null) return '<span class="muted">—</span>';
-  const p = Math.round(row.aprPercentile * 100);
-  const tone = p >= 75 ? 'pos' : p <= 25 ? 'neg' : '';
-  return `<span class="${tone}" title="по ${row.aprBucketN} наблюдениям за месяц">${p}</span>`;
+  const { p, sign, tone, title } = percentileLabel(row);
+  return `<span class="${tone}" title="${title}">${sign}${p}</span>`;
 }
 
 const cls = (x) => (x == null || !Number.isFinite(x) ? 'muted' : x > 0 ? 'pos' : x < 0 ? 'neg' : '');
@@ -477,8 +488,9 @@ function cardFor(row) {
   else if (row.volEdge < 0) tags.push(`<span class="tag warn">σ ${(row.volEdge * 100).toFixed(1)}</span>`);
   if (!row.exactExpiry) tags.push('<span class="tag">σ интерп.</span>');
   if (row.aprPercentile != null) {
-    const p = Math.round(row.aprPercentile * 100);
-    tags.push(`<span class="tag ${p >= 75 ? 'good' : p <= 25 ? 'warn' : ''}">${p}-й перцентиль</span>`);
+    const { p, sign, title } = percentileLabel(row);
+    const tone = p >= 75 ? 'good' : p <= 25 ? 'warn' : '';
+    tags.push(`<span class="tag ${tone}" title="${title}">${sign}${p}-й перцентиль</span>`);
   }
 
   return `
@@ -1272,9 +1284,13 @@ function renderDiag() {
   parts.push(`режим: ${ui.mode === 'strategy' ? `стратегия до ${ui.horizon} дней` : 'текущая подписка'}`);
   if (state.stats) {
     const where = state.stats.source === 'local' ? 'в браузере' : 'на ветке data';
+    const nBuckets = Object.keys(state.stats.buckets).length;
+    // Пустая сводка в первые дни — это не поломка, а порог в разных сутках.
+    // Без пояснения ноль корзин читается как «архив не работает».
+    const why = nBuckets === 0 ? ' — перцентиль появится, когда наберётся 3 разных дня наблюдений' : '';
     parts.push(
       `архив ставок ${where}: ${state.stats.spanDays.toFixed(1)} сут, ` +
-        `${state.stats.snapshots} снимков, корзин ${Object.keys(state.stats.buckets).length}`,
+        `${state.stats.snapshots} снимков, корзин ${nBuckets}${why}`,
     );
   } else {
     parts.push(state.archive ? 'архив ставок: копится в браузере' : 'архив ставок: недоступен');

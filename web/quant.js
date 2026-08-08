@@ -460,22 +460,146 @@ export function empiricalMeanGross(sorted) {
 
 /**
  * Положение значения в распределении, заданном набором квантилей.
- * Между узлами интерполируем линейно, за краями возвращаем 0 или 1:
- * утверждать «сегодняшняя ставка в 99-м перцентиле» на основании месяца
- * наблюдений всё равно нельзя точнее.
+ *
+ * Возвращает `{ p, clamp }` либо null, если сказать нечего.
+ *
+ * Два места, где раньше выдавалась уверенность на пустом месте:
+ *
+ * 1. Вырожденный ряд. Если ставка за всё время наблюдений ни разу не сдвинулась,
+ *    все квантили равны между собой, и прежнее `x <= values[0]` возвращало
+ *    нижний уровень шкалы. То есть «оферта на минимуме за месяц» печаталось
+ *    ровно там, где на самом деле «сравнивать не с чем». Замерено на живой
+ *    доске: у оферт со ставкой ниже 0.5% годовых так вырождено до 40% корзин —
+ *    далёкие страйки стоят на минимальной котировке биржи и не двигаются.
+ *    Теперь такой ряд честно даёт null.
+ *
+ * 2. Упоры шкалы. За краями сетки квантилей вернуть можно только сам край,
+ *    и «5» там означает «пятый перцентиль или ниже», а не ранг. Признак
+ *    `clamp` доносит это до подписи, чтобы упор не выдавался за измерение.
  */
 export function percentileFromQuantiles(levels, values, x) {
   if (!levels?.length || !values?.length || levels.length !== values.length) return null;
-  if (x <= values[0]) return levels[0];
-  if (x >= values[values.length - 1]) return levels[levels.length - 1];
+  const lo = values[0];
+  const hi = values[values.length - 1];
+  // Ряд без разброса не задаёт распределения: любое значение в нём и минимум,
+  // и максимум одновременно.
+  if (!(hi > lo)) return null;
+  if (x <= lo) return { p: levels[0], clamp: 'low' };
+  if (x >= hi) return { p: levels[levels.length - 1], clamp: 'high' };
   for (let k = 1; k < values.length; k++) {
     if (x <= values[k]) {
       const span = values[k] - values[k - 1];
       const w = span > 0 ? (x - values[k - 1]) / span : 0;
-      return levels[k - 1] + w * (levels[k] - levels[k - 1]);
+      return { p: levels[k - 1] + w * (levels[k] - levels[k - 1]), clamp: '' };
     }
   }
-  return levels[levels.length - 1];
+  return { p: levels[levels.length - 1], clamp: 'high' };
+}
+
+// ────────────────────────────────────────────── корзины архива ставок
+
+/** Уровни, по которым считается сводка. */
+export const QUANTILE_LEVELS = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95];
+
+/** Квантили по порядковым статистикам с линейной интерполяцией. */
+export function quantiles(sorted, levels = QUANTILE_LEVELS) {
+  return levels.map((q) => {
+    const pos = (sorted.length - 1) * q;
+    const lo = Math.floor(pos);
+    const hi = Math.ceil(pos);
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+  });
+}
+
+/**
+ * Ключ корзины сводки перцентилей — ОДНА реализация на весь проект.
+ *
+ * Раньше их было три (web/archive.js, web/model.js, scripts/record.mjs) с
+ * припиской «должны совпадать побайтово». Совпадение, которое держится на
+ * дисциплине, рано или поздно ломается молча: сводка просто не находится.
+ *
+ * Срок берётся В СУТКАХ, а не меткой продукта, и это не косметика. Метка
+ * `duration` — это дни до ФИКСИРОВАННОЙ даты сеттлмента, а дедлайн подписки
+ * общий и сдвигается каждые сутки. Наблюдение на перекате 2026-08-08: из
+ * десяти меток семь сменились за один такт (6d→5d, 13d→12d, 20d→19d, 48d→47d,
+ * 83d→82d, 139d→138d, 230d→229d). На строковом ключе весь накопленный архив
+ * этих продуктов осиротевал ежесуточно и сравнивать было не с чем.
+ */
+export function bucketKey(tenorDays, isVip, direction, moneyness) {
+  const t = Number(tenorDays);
+  if (!Number.isFinite(t) || t <= 0) return null;
+  const half = Math.max(-60, Math.min(60, Math.round(moneyness * 200)));
+  const dir = direction === 'BuyLow' || direction === 'B' ? 'B' : 'S';
+  return `${t.toFixed(3)}|${isVip ? 1 : 0}|${dir}|${half}`;
+}
+
+/** Срок из ключа корзины — нужен, чтобы собирать соседние сроки вместе. */
+export function tenorFromKey(key) {
+  const t = Number(String(key).split('|')[0]);
+  return Number.isFinite(t) ? t : null;
+}
+
+/**
+ * Допуск по сроку при сборке корзины, в логарифме отношения.
+ *
+ * Замерено на живой доске (500 строк, снимок 2026-08-08): при ±15% в корзину
+ * не подмешивается НИ ОДНОГО чужого продукта, а при ±20% подмешивание идёт у
+ * 36 строк с разбросом ставки до ×2.41. При этом суточный сдвиг метки покрыт
+ * с запасом: 20d→19d это 5.1%, 13d→12d 8.0%, 83d→82d 1.2%.
+ *
+ * Проверялись и более широкие постановки — полосы срока и переход с ставки на
+ * σ-премию. Обе отвергнуты замером: полоса 3–7d смешивает 3d/5d/6d с разбросом
+ * до ×5.7, а σ-премия внутри такой корзины расходится на 3–22 пункта
+ * волатильности при медиане по доске −5.1. Узкая корзина плюс сбор соседних
+ * сроков на сводке оказались единственным вариантом, который остаётся
+ * однородным.
+ */
+export const TENOR_TOLERANCE = 0.15;
+
+/**
+ * Сводка перцентилей из сырых наблюдений.
+ *
+ * obs: [{ key, value, day }], где day — номер суток (UTC), чтобы порог считался
+ * в РАЗНЫХ днях, а не в наблюдениях. Двадцать наблюдений подряд — это двадцать
+ * минут открытой вкладки, и перцентиль по ним меряет не щедрость оферты, а то,
+ * куда качнулся спот: замерено, что весь путь от 5-го до 95-го перцентиля на
+ * таком архиве составляет 17 базисных пунктов ставки.
+ */
+export function summarizeBuckets(obs, { levels = QUANTILE_LEVELS, minN = 30, minDays = 3, tol = TENOR_TOLERANCE } = {}) {
+  // Группируем по всему, кроме срока: внутри группы сроки соседствуют.
+  const groups = new Map();
+  for (const o of obs) {
+    if (!o?.key || !Number.isFinite(o.value)) continue;
+    const t = tenorFromKey(o.key);
+    if (t == null) continue;
+    const rest = o.key.slice(o.key.indexOf('|'));
+    let g = groups.get(rest);
+    if (!g) groups.set(rest, (g = []));
+    g.push({ t, value: o.value, day: o.day, key: o.key });
+  }
+
+  const buckets = {};
+  for (const list of groups.values()) {
+    for (const key of new Set(list.map((o) => o.key))) {
+      const t0 = tenorFromKey(key);
+      const values = [];
+      const days = new Set();
+      for (const o of list) {
+        if (Math.abs(Math.log(o.t / t0)) > tol) continue;
+        values.push(o.value);
+        days.add(o.day);
+      }
+      if (values.length < minN || days.size < minDays) continue;
+      values.sort((a, b) => a - b);
+      buckets[key] = { n: values.length, days: days.size, q: quantiles(values, levels) };
+    }
+  }
+  return buckets;
+}
+
+/** Номер суток UTC — единица счёта «разных дней» в пороге корзины. */
+export function utcDay(ts) {
+  return Math.floor(ts / 86_400_000);
 }
 
 // ─────────────────────────────────────────────────────────────── ранжирование

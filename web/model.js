@@ -18,6 +18,7 @@ import {
   rnLossProfile,
   martingaleShift,
   percentileFromQuantiles,
+  bucketKey,
   paretoFront,
   apyFromE8,
   basisFromConversion,
@@ -576,14 +577,10 @@ export function sampleCagr(history) {
   return Math.exp(acc / n / barYears) - 1;
 }
 
-/**
- * Ключ корзины сводки перцентилей. Должен побайтово совпадать с
- * bucketKey из scripts/record.mjs — иначе сводка молча не найдётся.
- */
-export function statsBucketKey(duration, isVip, direction, moneyness) {
-  const half = Math.max(-60, Math.min(60, Math.round(moneyness * 200)));
-  return `${duration}|${isVip ? 1 : 0}|${direction === 'BuyLow' ? 'B' : 'S'}|${half}`;
-}
+// Ключ корзины сводки перцентилей теперь один на весь проект — bucketKey из
+// quant.js. Три независимые копии «которые обязаны совпадать побайтово» жили
+// в этом файле, в web/archive.js и в scripts/record.mjs.
+export { bucketKey as statsBucketKey };
 
 /**
  * Полный расчёт одной оферты (страйк + направление внутри продукта).
@@ -683,16 +680,27 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
   const expNetApr = expNetFrom(shortfall, hist?.sorted);
   const expNetAprScaled = expNetFrom(shortfallScaled, scaledSorted);
 
-  // Где текущая ставка стоит относительно того, что предлагалось за последний
-  // месяц на таком же сроке и таком же расстоянии от спота.
+  // Где текущая ставка стоит относительно того, что предлагалось раньше на
+  // таком же сроке и таком же расстоянии от спота. Величина справочная: в отбор
+  // оптимальных она не входит ни одной строкой.
   const moneyness = strike / spot - 1;
   let aprPercentile = null;
+  let aprPercentileClamp = '';
   let aprBucketN = null;
+  let aprBucketDays = null;
   if (stats?.buckets) {
-    const bucket = stats.buckets[statsBucketKey(product.duration, product.isVipProduct, direction, moneyness)];
+    const key = bucketKey(timing.yieldDays, product.isVipProduct, direction, moneyness);
+    const bucket = key ? stats.buckets[key] : null;
     if (bucket) {
-      aprPercentile = percentileFromQuantiles(stats.quantileLevels, bucket.q, apy);
-      aprBucketN = bucket.n;
+      const at = percentileFromQuantiles(stats.quantileLevels, bucket.q, apy);
+      // null здесь означает «сравнивать не с чем» — ряд без разброса. Раньше
+      // такой случай молча печатался как нижний край шкалы.
+      if (at) {
+        aprPercentile = at.p;
+        aprPercentileClamp = at.clamp;
+        aprBucketN = bucket.n;
+        aprBucketDays = bucket.days ?? null;
+      }
     }
   }
 
@@ -733,7 +741,9 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
     z: moneynessZ(spot, strike, sigma, Teff),
     moneyness,
     aprPercentile,
+    aprPercentileClamp,
     aprBucketN,
+    aprBucketDays,
     offerVol: valued.offerVol,
     volEdge: valued.volEdge,
     edgeApr: valued.edgeApr,

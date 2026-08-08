@@ -12,7 +12,9 @@ import { gzipSync, gunzipSync } from 'node:zlib';
 import path from 'node:path';
 import { fetchProducts, fetchQuote, fetchOptionTickers, fetchSpot, fetchRiskFree } from '../web/feeds.js';
 import { buildSurface, volAt, forwardAt } from '../web/surface.js';
-import { apyFromE8 } from '../web/quant.js';
+import { apyFromE8, bucketKey, summarizeBuckets, utcDay, QUANTILE_LEVELS } from '../web/quant.js';
+
+export { bucketKey };
 
 const argOut = (() => {
   const k = process.argv.indexOf('--out');
@@ -25,30 +27,20 @@ const STATS_DAYS = 30;
 // Сколько суток сырого архива держим на ветке: сводке хватает тридцати,
 // запас нужен бэктесту и на случай пропущенных запусков.
 const KEEP_DAYS = 45;
-// Порог, ниже которого корзина не публикуется: при частоте раз в четверть часа
-// он набирается меньше чем за сутки, зато случайные единичные страйки отсеиваются.
+// Пороги публикации корзины. К числу наблюдений добавлен порог в РАЗНЫХ сутках:
+// перцентиль по наблюдениям одного дня меряет дрожание спота внутри ячейки,
+// а не условия оферты.
 const MIN_BUCKET_N = 30;
-const QUANTILES = [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95];
+const MIN_BUCKET_DAYS = 3;
 
 function dayKey(ts) {
   return new Date(ts).toISOString().slice(0, 10);
 }
 
-/**
- * Ключ корзины: срок, статус VIP, направление и расстояние до спота
- * с шагом половина процента.
- *
- * Нормализовать по расстоянию до спота, а не по самому страйку, обязательно:
- * страйки Bybit стоят на круглых числах, а спот движется, поэтому «62 000»
- * вчера и сегодня — это разные по риску оферты. Шаг в полпроцента выбран как
- * компромисс: ставка резко падает с удалением от спота (на −1% она была 114%,
- * на −4% уже 32%), и слишком широкая корзина мерила бы наклон кривой,
- * а не изменение условий во времени.
- */
-export function bucketKey(duration, isVip, direction, moneyness) {
-  const half = Math.max(-60, Math.min(60, Math.round(moneyness * 200)));
-  return `${duration}|${isVip ? 1 : 0}|${direction === 'BuyLow' ? 'B' : 'S'}|${half}`;
-}
+// Ключ корзины и сборка сводки живут в web/quant.js — одной реализацией на
+// страницу и на этот скрипт. Нормировать по расстоянию до спота, а не по самому
+// страйку, обязательно: страйки Bybit стоят на круглых числах, а спот движется,
+// поэтому «62 000» вчера и сегодня — это разные по риску оферты.
 
 async function collect() {
   const now = Date.now();
@@ -152,17 +144,6 @@ async function prune(dir) {
   return removed;
 }
 
-/** Квантили выборки методом линейной интерполяции по порядковым статистикам. */
-export function quantiles(sorted, qs = QUANTILES) {
-  if (!sorted.length) return null;
-  return qs.map((q) => {
-    const pos = (sorted.length - 1) * q;
-    const lo = Math.floor(pos);
-    const hi = Math.ceil(pos);
-    return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
-  });
-}
-
 async function rebuildStats(dir) {
   const histDir = path.join(dir, 'history');
   let files = [];
@@ -172,7 +153,7 @@ async function rebuildStats(dir) {
     return null;
   }
   const cutoff = Date.now() - STATS_DAYS * 86_400_000;
-  const buckets = new Map();
+  const obs = [];
   let snapshots = 0;
   let earliest = Infinity;
 
@@ -189,28 +170,29 @@ async function rebuildStats(dir) {
       if (!snap.t || snap.t < cutoff || !(snap.s > 0)) continue;
       snapshots++;
       earliest = Math.min(earliest, snap.t);
-      const meta = new Map((snap.p || []).map((row) => [String(row[0]), { duration: row[1], vip: row[2] }]));
+      // Срок берётся из окна начисления снимка, а не из метки продукта: метка
+      // считает дни до фиксированной экспирации и потому меняется каждые сутки.
+      const meta = new Map(
+        (snap.p || []).map((row) => [String(row[0]), { vip: row[2], tenor: (Number(row[4]) - Number(row[3])) / 86_400_000 }]),
+      );
       for (const [pid, dirFlag, strike, apyE8] of snap.o || []) {
         const m = meta.get(String(pid));
-        if (!m) continue;
-        const key = bucketKey(m.duration, m.vip, dirFlag === 0 ? 'BuyLow' : 'SellHigh', strike / snap.s - 1);
-        let arr = buckets.get(key);
-        if (!arr) buckets.set(key, (arr = []));
-        arr.push(apyFromE8(apyE8));
+        if (!m || !(m.tenor > 0)) continue;
+        const key = bucketKey(m.tenor, m.vip, dirFlag === 0 ? 'BuyLow' : 'SellHigh', strike / snap.s - 1);
+        if (!key) continue;
+        obs.push({ key, value: apyFromE8(apyE8), day: utcDay(snap.t) });
       }
     }
   }
 
+  const buckets = summarizeBuckets(obs, {
+    levels: QUANTILE_LEVELS,
+    minN: MIN_BUCKET_N,
+    minDays: MIN_BUCKET_DAYS,
+  });
   const out = {};
-  for (const [key, values] of buckets) {
-    if (values.length < MIN_BUCKET_N) continue; // на горстке наблюдений перцентиль бессмыслен
-    values.sort((a, b) => a - b);
-    out[key] = {
-      n: values.length,
-      q: quantiles(values).map((v) => Number(v.toFixed(6))),
-      min: Number(values[0].toFixed(6)),
-      max: Number(values[values.length - 1].toFixed(6)),
-    };
+  for (const [key, b] of Object.entries(buckets)) {
+    out[key] = { n: b.n, days: b.days, q: b.q.map((v) => Number(v.toFixed(6))) };
   }
 
   return {
@@ -218,7 +200,8 @@ async function rebuildStats(dir) {
     windowDays: STATS_DAYS,
     snapshots,
     spanDays: Number.isFinite(earliest) ? (Date.now() - earliest) / 86_400_000 : 0,
-    quantileLevels: QUANTILES,
+    days: new Set(obs.map((o) => o.day)).size,
+    quantileLevels: QUANTILE_LEVELS,
     buckets: out,
   };
 }
