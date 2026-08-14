@@ -1464,14 +1464,19 @@ function bindControls() {
     render();
   };
 
-  if (ui.theme) document.documentElement.dataset.theme = ui.theme;
+  // Тема уже стоит: её ставит ранний скрипт из <head> вместе с вечерним правилом
+  // (с 20:00 до 07:00 — тёмная). Присваивать её из ui.theme здесь нельзя — это
+  // отменило бы правило.
   $('theme-toggle').onclick = () => {
     const dark = document.documentElement.dataset.theme
       ? document.documentElement.dataset.theme === 'dark'
       : matchMedia('(prefers-color-scheme: dark)').matches;
-    ui.theme = dark ? 'light' : 'dark';
-    document.documentElement.dataset.theme = ui.theme;
-    savePrefs();
+    const next = dark ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    // Вечерний выбор НЕ попадает в ui: настройки сохраняются целиком и при любой
+    // другой правке — сменил бы часовой пояс, и вечерняя тема уехала бы в постоянную
+    // память заодно с ним.
+    if (window.__theme.remember(next)) { ui.theme = next; savePrefs(); }
     render();
   };
 

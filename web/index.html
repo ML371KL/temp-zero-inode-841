@@ -6,7 +6,45 @@
     <title>Dual Assets BTC/USDT — радар</title>
     <link rel="stylesheet" href="style.css" />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>₿</text></svg>" />
-  </head>
+    <script>
+    /* Тема ДО первой отрисовки — и вечернее правило.
+
+       С 20:00 до 07:00 по часам устройства панель открывается тёмной, что бы ни было
+       выбрано раньше, а постоянный выбор при этом НЕ затирается: утром вернётся он.
+       Запиши мы навязанную тёмную в память — один вечер сделал бы её «последней темой»
+       навсегда, и правило съело бы себя. Переключение в эти часы живёт в sessionStorage:
+       переживает перезагрузку страницы, исчезает с закрытием вкладки.
+
+       Скрипт стоит здесь, а не в app.js: тот подключён модулем в конце body, то есть
+       выполняется после отрисовки, и страница успела бы моргнуть светлым — заметнее
+       всего ночью, ровно тогда, когда её и открывают.
+
+       Правило лежит одной копией: app.js берёт его отсюда через window.__theme. */
+    (function () {
+      var NIGHT_KEY = 'dual-assets-radar-tonight', NIGHT_FROM = 20, NIGHT_TO = 7;
+      function isNight(d) { var h = (d || new Date()).getHours(); return h >= NIGHT_FROM || h < NIGHT_TO; }
+      function ok(v) { return v === 'light' || v === 'dark' ? v : null; }
+      function session() {
+        try { return ok(window.sessionStorage.getItem(NIGHT_KEY)); } catch (e) { return null; }
+      }
+      function stored() { try { return ok((JSON.parse(window.localStorage.getItem('dual-assets-radar-ui') || '{}') || {}).theme); } catch (e) { return null; } }
+      function system() { return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'; }
+      function resolve() {
+        if (isNight()) return session() || 'dark';
+        return stored() || system();
+      }
+      function remember(theme) {
+        try {
+          if (isNight()) { window.sessionStorage.setItem(NIGHT_KEY, theme); return false; }
+        } catch (e) { return false; }
+        return true;  /* день — постоянный выбор пишет сам app.js, он знает куда */
+      }
+      document.documentElement.dataset.theme = resolve();
+      window.__theme = { isNight: isNight, stored: stored, resolve: resolve, remember: remember,
+                         NIGHT_FROM: NIGHT_FROM, NIGHT_TO: NIGHT_TO };
+    })();
+  </script>
+</head>
   <body>
     <header class="top">
       <div class="brand">
