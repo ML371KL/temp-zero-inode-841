@@ -1007,32 +1007,59 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     }
     ok('шанс выхода убывает со страйком', mono === 0, `нарушений ${mono}`);
 
-    // Зависимость соседних циклов обязана снижать оценку против формулы
-    // независимых попыток. Сравнение должно быть однородным по мере: рабочая
-    // вероятность строки взята из рынка опционов, а траекторная оценка — из
-    // истории, поэтому для формулы берём историческую же частоту за цикл.
+    // Зависимость соседних циклов обязана снижать оценку против границы
+    // независимости. Тонкость, стоившая ложного провала 2026-09-01: прежняя
+    // граница 1-(1-p₁)ⁿ подставляла вероятность ПЕРВОГО цикла во все циклы,
+    // то есть молча предполагала стационарность маргиналов. Сырой ряд BTC
+    // дрейфует вверх, и вероятность касания верхнего страйка растёт от цикла
+    // к циклу (замер на 23d/92500: 11.1% → 20.6% → 28.7%), поэтому объединение
+    // законно превышало такую границу — вычисление при этом было верным,
+    // лобовой пересчёт union по тем же траекториям совпадает до 1e-12.
+    // Корректная граница для положительно зависимых величин — независимость
+    // с НАСТОЯЩИМИ маргиналами каждой контрольной точки (неравенство
+    // ассоциированности): P(union) ≤ 1 − Π(1 − mₖ). Маргиналы берутся из тех
+    // же сценарных траекторий, что и сама оценка.
+    const spBase = history.scenarioPaths(H);
+    // Отсортированные значения контрольной точки k для данной сетки (τ, цикл):
+    // считаются один раз на сетку, дальше каждая строка стоит n бинарных поисков.
+    const pointDists = new Map();
+    const pointsFor = (tauDays, cycleDays, n) => {
+      const firstBars = Math.max(1, Math.round(tauDays / spBase.barDays));
+      const cycleBars = Math.max(1, Math.round(cycleDays / spBase.barDays));
+      const key = `${firstBars}:${cycleBars}:${n}`;
+      let dists = pointDists.get(key);
+      if (!dists) {
+        dists = [];
+        for (let k = 0; k < n; k++) {
+          const bar = Math.min(spBase.bars, firstBars + k * cycleBars);
+          const vals = new Float64Array(spBase.paths);
+          for (let p = 0; p < spBase.paths; p++) vals[p] = spBase.ratio[p * spBase.width + bar];
+          vals.sort();
+          dists.push(vals);
+        }
+        pointDists.set(key, dists);
+      }
+      return dists;
+    };
     let cmp = 0;
     let higher = 0;
     let worst = 0;
     for (const r of withH) {
       const n = r.horizonInfo?.cycles ?? 0;
       if (n < 2 || !(r.pExitHorizon > 0)) continue;
-      // Вероятность за один цикл берётся из ТОГО ЖЕ набора траекторий — это
-      // распределение первой контрольной точки. Раньше здесь стояла частота из
-      // history.returns, то есть из другой выборки и другого ряда, и сравнение
-      // ловило не зависимость циклов, а шум между двумя оценками.
-      const ext = history.pathExtremes(r.timing.tauDays, r.timing.cycleDays, H);
-      if (!ext?.running?.length) continue;
-      const pCycleHist = 1 - empiricalCdf(ext.running[0], r.strike / spot);
-      if (!(pCycleHist > 0)) continue;
-      const indep = 1 - (1 - pCycleHist) ** n;
+      const dists = pointsFor(r.timing.tauDays, r.timing.cycleDays, n);
+      const ratio = r.strike / spot;
+      let survive = 1;
+      for (let k = 0; k < n; k++) survive *= empiricalCdf(dists[k], ratio);
+      const bound = 1 - survive;
+      if (!(bound > 0)) continue;
       cmp++;
-      const gap = r.pExitHorizon - indep;
+      const gap = r.pExitHorizon - bound;
       if (gap > 1e-9) higher++;
       worst = Math.min(worst, gap);
     }
     ok(
-      'оценка по траекториям не выше формулы независимых попыток',
+      'оценка по траекториям не выше независимой границы с маргиналами циклов',
       higher === 0,
       `сравнено ${cmp}, выше у ${higher}, максимальное занижение ${(worst * 100).toFixed(1)} п.п.`,
     );
