@@ -29,7 +29,22 @@ import {
   STRESS_LEVEL,
   YEAR_DAYS,
 } from './quant.js';
-import { volAt, forwardAt, hasExactExpiry, forwardVol } from './surface.js';
+import { volAt, forwardAt, hasExactExpiry, forwardVol, surfaceAt } from './surface.js';
+
+/**
+ * Снимок опционов старше этого — такие же протухшие данные, как истёкшая
+ * котировка: σ, форвард и вероятность стоят на рынке момента загрузки. Опционы
+ * перезагружаются раз в минуту, три минуты — это два пропущенных обновления.
+ */
+export const OPTIONS_MAX_AGE_MS = 180_000;
+
+/**
+ * Строка непригодна для рекомендаций: истекла её котировка или устарел снимок
+ * опционов, на котором она посчитана. Одна проверка на все места отбора.
+ */
+export function isStale(r) {
+  return Boolean(r?.quoteStale || r?.optionsStale);
+}
 
 /**
  * Первый цикл, на котором нарастающий максимум траектории дотянулся до цели.
@@ -903,6 +918,12 @@ export function buildRows({
   horizonDays = 0,
 }) {
   const rows = [];
+  // Поверхность на текущий момент: время до экспираций — от now, а не от
+  // момента загрузки. Снимок старше трёх минут (или его отсутствие) делает
+  // непригодными все строки сразу — так же, как истёкшая котировка.
+  const surf = surface ? surfaceAt(surface, now) : null;
+  const optionsAge = surface ? now - (surface.builtAt ?? surface.now) : Infinity;
+  const optionsStale = !(optionsAge <= OPTIONS_MAX_AGE_MS);
   for (const product of products) {
     if (product.status !== 'Available') continue;
     if (product.isVipProduct && !vip) continue;
@@ -916,7 +937,8 @@ export function buildRows({
     if (!quote) continue;
     const levels = direction === 'BuyLow' ? quote.buyLowPrice : quote.sellHighPrice;
     for (const level of levels || []) {
-      const row = buildRow({ product, level, direction, now, spot, surface, history, riskFree, riskFreeBtc, amount, stats });
+      const row = buildRow({ product, level, direction, now, spot, surface: surf, history, riskFree, riskFreeBtc, amount, stats });
+      row.optionsStale = optionsStale;
       row.pConv = pickProbability(row, measure);
       row.depth = pickDepth(row, measure);
       row.expNet = pickExpNet(row, measure);
@@ -930,11 +952,14 @@ export function buildRows({
   // Фронт строится только по живым котировкам: он питает и карточки, и якоря,
   // и график, поэтому протухшая строка, попав на него, расползлась бы по всем
   // рекомендательным блокам сразу. В полных таблицах она остаётся, приглушённая.
-  const fresh = rows.filter((r) => !r.quoteStale);
+  const fresh = rows.filter((r) => !isStale(r));
   const front = paretoFront(fresh, 'aprEff', 'pConv');
   for (const r of rows) r.pareto = front.has(r);
   markLadderInversions(rows);
-  rows.staleCount = rows.length - fresh.length;
+  // Счётчик — по котировкам: устаревшие опционы показываются отдельной строкой.
+  rows.staleCount = rows.filter((r) => r.quoteStale).length;
+  rows.optionsStale = optionsStale;
+  rows.optionsAgeMs = optionsAge;
   return rows;
 }
 
@@ -975,7 +1000,7 @@ export function markLadderInversions(rows) {
  * набор, который нельзя улучшить по доходности, не увеличив риск.
  */
 export function pickBest({ rows, maxP, limit = 6 }) {
-  const eligible = rows.filter((r) => !r.quoteStale && r.pConv != null && r.pConv <= maxP && r.aprEff != null);
+  const eligible = rows.filter((r) => !isStale(r) && r.pConv != null && r.pConv <= maxP && r.aprEff != null);
   const front = paretoFront(eligible, 'aprEff', 'pConv');
   // Только фронт и ничего кроме фронта. Добор доминируемых оферт «для полноты»
   // противоречил самому назначению блока: показанная там оферта заведомо хуже
@@ -1178,7 +1203,7 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
 
   // Режим определяется по живым офертам: если безубыточный выход есть только в
   // протухшей котировке, его на самом деле нет.
-  const profitable = out.filter((r) => r.profitable && !r.quoteStale);
+  const profitable = out.filter((r) => r.profitable && !isStale(r));
   const exitMode = profitable.length > 0;
 
   // Осторожная оценка вероятности меняет направление вместе со смыслом
@@ -1304,7 +1329,7 @@ export function pickAnchors(allRows) {
   // Не допускаются и оферты ниже альтернативной ставки: их доминирует простое
   // «держать деньги под эту ставку», и называть такую оферту лучшей по какому
   // угодно критерию нельзя.
-  const rows = allRows.filter((r) => !r.quoteStale && !r.belowRiskFree);
+  const rows = allRows.filter((r) => !isStale(r) && !r.belowRiskFree);
   const top = (key) => {
     const pool = rows.filter((r) => Number.isFinite(r[key]));
     return pool.length ? pool.reduce((a, b) => (b[key] > a[key] ? b : a)) : null;
@@ -1374,7 +1399,7 @@ export function exitFrontier(rows, { limit = 0 } = {}) {
  * именно якорь побит.
  */
 export function pickExitAnchors(rows) {
-  const pool = rows.filter((r) => r.profitable && !r.quoteStale);
+  const pool = rows.filter((r) => r.profitable && !isStale(r));
   const top = (key) => {
     const p = pool.filter((r) => Number.isFinite(r[key]));
     return p.length ? p.reduce((a, b) => (b[key] > a[key] ? b : a)) : null;
@@ -1477,7 +1502,7 @@ export function pickBestSell({ rows, limit = 6 }) {
     }
   };
 
-  const profitable = rows.filter((r) => r.profitable && !r.quoteStale && Number.isFinite(r.profitAxis));
+  const profitable = rows.filter((r) => r.profitable && !isStale(r) && Number.isFinite(r.profitAxis));
   if (profitable.length) {
     // Сортируем по вероятности продажи от большей к меньшей: сверху самый
     // реалистичный выход, ниже — всё более дорогие, но всё менее вероятные.
@@ -1501,7 +1526,7 @@ export function pickBestSell({ rows, limit = 6 }) {
   // напрямую, а это величины разной размерности. Здесь срабатывание страйка —
   // принудительная продажа ниже себестоимости, поэтому шанс минимизируется.
   const axis = rows.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
-  const usable = rows.filter((r) => !r.quoteStale && Number.isFinite(r.aprEff) && Number.isFinite(r[axis]));
+  const usable = rows.filter((r) => !isStale(r) && Number.isFinite(r.aprEff) && Number.isFinite(r[axis]));
   const front = paretoFront(usable, 'aprEff', axis, true);
   const ranked = usable.filter((r) => front.has(r)).sort((a, b) => a[axis] - b[axis]);
   for (const r of ranked) r.waitPareto = true;
@@ -1621,7 +1646,7 @@ export function computeStrategy({ rows, history, spot, horizonDays, riskFree = 0
   // Фронт стратегии — рекомендация, поэтому строится только по живым котировкам.
   // Ось доходности — геометрическая: капитал складывается по периодам, а не
   // усредняется по эпизодам.
-  const usable = rows.filter((r) => !r.quoteStale && Number.isFinite(r.stratGeo) && Number.isFinite(r.stratRisk));
+  const usable = rows.filter((r) => !isStale(r) && Number.isFinite(r.stratGeo) && Number.isFinite(r.stratRisk));
   const front = paretoFront(usable, 'stratGeo', 'stratRisk');
   for (const r of usable) r.stratPareto = front.has(r);
 
@@ -1646,6 +1671,6 @@ export function computeStrategy({ rows, history, spot, horizonDays, riskFree = 0
       : null,
     btcInfo: hold ? { n: hold.n, series: hold.series, spanDays: hold.spanDays } : null,
     counted: usable.length,
-    stale: rows.filter((r) => r.quoteStale).length,
+    stale: rows.filter((r) => isStale(r)).length,
   };
 }

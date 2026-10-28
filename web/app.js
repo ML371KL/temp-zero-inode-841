@@ -14,7 +14,7 @@ import {
   SpotStream,
   normalizeWsOffer,
 } from './feeds.js';
-import { buildSurface, atmVarianceCurve, forwardVol } from './surface.js';
+import { buildSurface, atmVarianceCurve, forwardVol, surfaceAt } from './surface.js';
 import { Archive } from './archive.js';
 import {
   History,
@@ -28,6 +28,8 @@ import {
   pickExitAnchors,
   computeStrategy,
   sampleCagr,
+  isStale,
+  OPTIONS_MAX_AGE_MS,
   MIN_INDEPENDENT_WINDOWS,
 } from './model.js';
 import { basisFromConversion, interestRate, cyclesToRecover, rnLossProfile, STRESS_LEVEL, MS_DAY } from './quant.js';
@@ -354,7 +356,7 @@ function applyScenario() {
   // вырождается. Сверху ограничиваем десятикратным ростом — дальше это уже не
   // предпосылка, а опечатка.
   const cagr = Number.isFinite(typed) ? Math.min(Math.max(typed, -0.95), 10) : auto;
-  state.varCurve = state.surface ? atmVarianceCurve(state.surface) : null;
+  state.varCurve = state.surface ? atmVarianceCurve(surfaceAt(state.surface, Date.now())) : null;
   // Ключ сценария включает момент пересборки поверхности: кривая живёт минуту,
   // и без этого траектории остались бы на позавчерашней волатильности.
   state.history.useScenario({
@@ -398,6 +400,8 @@ function currentRows(direction) {
   // массиве, а filter отдаёт голый новый массив.
   const kept = rows.filter((r) => allowed.has(r.duration));
   kept.staleCount = kept.filter((r) => r.quoteStale).length;
+  kept.optionsStale = rows.optionsStale;
+  kept.optionsAgeMs = rows.optionsAgeMs;
   return kept;
 }
 
@@ -487,13 +491,16 @@ function renderHead() {
   // быть открыт, а часть ставок уже пересчитана биржей. Оранжевый означает
   // ровно это, и тогда подробности ждут в блоке статуса внизу страницы.
   const stale = state.stale?.count ?? 0;
+  const optionsOld = Boolean(state.stale?.options);
   if (state.wsStatus === 'open' && age != null && age < 30) {
-    dot.className = stale ? 'dot warn' : 'dot live';
-    text.textContent = stale
-      ? `устарели ${stale} из ${state.stale.total}`
-      : `котировки живые · ${age.toFixed(0)} с назад`;
+    dot.className = stale || optionsOld ? 'dot warn' : 'dot live';
+    text.textContent = optionsOld
+      ? 'опционы устарели'
+      : stale
+        ? `устарели ${stale} из ${state.stale.total}`
+        : `котировки живые · ${age.toFixed(0)} с назад`;
   } else if (state.wsStatus === 'open') {
-    dot.className = stale ? 'dot warn' : 'dot';
+    dot.className = stale || optionsOld ? 'dot warn' : 'dot';
     text.textContent = stale ? `поток тих · устарели ${stale} из ${state.stale.total}` : 'поток тих';
   } else {
     dot.className = 'dot bad';
@@ -773,7 +780,7 @@ function renderBuy(rows) {
         'который платит не меньше — то есть строго безопаснее и не хуже по доходности'
       : '');
   renderLimitedTable('buy', $('buy-table'), BUY_COLUMNS, sorted, (r) =>
-    [r.pareto ? 'pareto' : '', r.quoteStale ? 'dim' : ''].filter(Boolean).join(' '),
+    [r.pareto ? 'pareto' : '', isStale(r) ? 'dim' : ''].filter(Boolean).join(' '),
   );
   renderAnchors(rows);
   renderFrontier(rows);
@@ -1251,7 +1258,7 @@ function renderSell(rows) {
     : '<div class="empty">нет доступных оферт Sell High при текущих фильтрах</div>';
 
   renderLimitedTable('sell', $('sell-table'), SELL_COLUMNS, analyzed, (r) =>
-    r.quoteStale ? 'dim' : r.profitable ? (r.sellPareto ? 'pareto' : '') : 'dim',
+    isStale(r) ? 'dim' : r.profitable ? (r.sellPareto ? 'pareto' : '') : 'dim',
   );
 }
 
@@ -1268,11 +1275,29 @@ function renderStale(buy, sell) {
   const box = $('stale-banner');
   const stale = (buy.staleCount || 0) + (sell.staleCount || 0);
   const total = buy.length + sell.length;
-  state.stale = { count: stale, total };
+  // Устаревший снимок опционов — такая же порча, как истёкшие котировки: σ,
+  // форвард и вероятность стоят на рынке момента загрузки.
+  const optionsOld = Boolean(buy.optionsStale || sell.optionsStale) && total > 0;
+  state.stale = { count: stale, total, options: optionsOld };
 
   const age = state.lastQuoteAt ? Math.round((Date.now() - state.lastQuoteAt) / 1000) : null;
   const all = total > 0 && stale >= total;
-  box.className = `status-panel ${stale ? 'stale' : 'ok'}`;
+  box.className = `status-panel ${stale || optionsOld ? 'stale' : 'ok'}`;
+
+  // Строка про опционы стоит первой: при ней рекомендаций нет ни у одной строки.
+  const optAge = state.lastOptionsAt ? Math.round((Date.now() - state.lastOptionsAt) / 60_000) : null;
+  const optionsLine = optionsOld
+    ? `<b>Опционы устарели: ${optAge == null ? 'снимка нет' : `снимок ${optAge} мин назад`} — рекомендации ` +
+      `приостановлены.</b> Порог ${OPTIONS_MAX_AGE_MS / 60_000} мин. `
+    : '';
+  if (optionsOld && !stale) {
+    box.innerHTML = optionsLine + (age == null ? '' : `Котировки живые, снимок ${age} с назад.`);
+    return;
+  }
+  if (optionsOld) {
+    box.innerHTML = optionsLine + `Устарели и ${stale} котировок из ${total}.`;
+    return;
+  }
 
   if (!stale) {
     box.innerHTML =

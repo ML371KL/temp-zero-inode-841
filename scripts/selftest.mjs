@@ -39,7 +39,7 @@ import {
   MS_DAY,
 } from '../web/quant.js';
 import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr } from '../web/model.js';
-import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry, atmVarianceCurve, totalVariance, forwardVol } from '../web/surface.js';
+import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry, atmVarianceCurve, totalVariance, forwardVol, surfaceAt } from '../web/surface.js';
 import { fetchProducts, fetchQuote, fetchOptionTickers, fetchSpot } from '../web/feeds.js';
 
 let failed = 0;
@@ -1001,6 +1001,51 @@ section('Свежесть котировок');
     measure: 'rn',
   });
   ok('уровень без срока истечения считается живым', noField.every((r) => !r.quoteStale));
+
+  // Устаревший снимок опционов — та же порча, что истёкшая котировка.
+  const liveQuotes = new Map([['1', { productId: '1', buyLowPrice: [level(60000, 40e8, now + 600_000), level(58000, 10e8, now + 600_000)], sellHighPrice: [] }]]);
+  const args = { products: [product], quotes: liveQuotes, direction: 'BuyLow', spot: 61000, history: null, riskFree: 0.02, amount: 1000, vip: false, measure: 'rn' };
+  const fresh2 = buildRows({ ...args, now: now + 170_000, surface });
+  ok('снимок опционов младше трёх минут годен', fresh2.every((r) => !r.optionsStale) && fresh2.some((r) => r.pareto));
+  const old = buildRows({ ...args, now: now + 181_000, surface });
+  ok('снимок старше трёх минут помечает все строки', old.length === 2 && old.every((r) => r.optionsStale) && old.optionsStale === true);
+  ok('и выводит их из фронта', old.every((r) => !r.pareto));
+  ok('и из карточек', pickBest({ rows: old, maxP: 0.99 }).length === 0);
+  ok('и из якорей', Object.values(pickAnchors(old)).every((a) => !a));
+  ok('счётчик котировок при этом не трогается', old.staleCount === 0);
+  const none = buildRows({ ...args, now, surface: null });
+  ok('без снимка опционов рекомендаций нет', none.every((r) => r.optionsStale && !r.pareto));
+}
+
+// ────────────────────────────────────────────── 8g. Форвард от индекса снимка
+
+section('Форвард следует за живым спотом');
+{
+  const t0 = Date.UTC(2026, 6, 31, 8, 0);
+  const expiry = Date.UTC(2026, 7, 10, 8, 0);
+  const tickers = [55000, 60000, 65000].map((K) => ({
+    symbol: `BTC-10AUG26-${K}-P-USDT`,
+    markIv: '0.4',
+    underlyingPrice: '61500',
+    indexPrice: '61000',
+  }));
+  const surface = buildSurface(tickers, t0);
+  ok('момент снимка сохранён', surface.builtAt === t0);
+  const T0 = (expiry - t0) / MS_DAY / 365;
+  // Ожидание выписано руками: на экспирации форвард = живой спот × (F/индекс) снимка.
+  near('на экспирации при том же споте — форвард снимка', forwardAt(surface, 61000, T0), 61500, 1e-6);
+  near('спот +0.3% двигает форвард на те же +0.3%', forwardAt(surface, 61000 * 1.003, T0), 61500 * 1.003, 1e-6);
+  // Половина срока: та же ставка базиса, половина её вклада.
+  near('на половине срока — половина базиса', forwardAt(surface, 61183, T0 / 2), 61183 * Math.sqrt(61500 / 61000), 1e-6);
+  // Без индекса — прежнее поведение: базис от переданного спота.
+  const noIndex = { ...surface, index: null };
+  near('без индекса базис считается от спота', forwardAt(noIndex, 61183, T0), 61500, 1e-6);
+
+  // Время до экспирации считается от текущего момента, а не от загрузки.
+  const later = surfaceAt(surface, t0 + 2 * MS_DAY);
+  near('срок экспирации пересчитан от текущего момента', later.expiries[0].T, (expiry - t0 - 2 * MS_DAY) / MS_DAY / 365, 1e-15);
+  ok('исходный снимок не изменён', surface.expiries[0].T === T0);
+  ok('прошедшая экспирация отброшена', surfaceAt(surface, expiry + 1).expiries.length === 0);
 }
 
 // ────────────────────────────────────────────── 9. Разбор символов опционов

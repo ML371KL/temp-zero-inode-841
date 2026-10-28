@@ -67,7 +67,25 @@ export function buildSurface(tickers, now) {
     })
     .sort((a, b) => a.T - b.T);
 
-  return { expiries, index, now };
+  // builtAt — момент снимка. По нему судят о свежести опционов, и от него же
+  // отсчитано время до экспирации в e.T; на кадре оно пересчитывается от
+  // текущего момента (surfaceAt), иначе срок застывал бы до следующей загрузки.
+  return { expiries, index, now, builtAt: now };
+}
+
+/**
+ * Та же поверхность на текущий момент: время до экспирации отсчитано от now,
+ * прошедшие экспирации отброшены. Улыбки и форварды снимка не копируются —
+ * одиннадцать маленьких объектов на кадр.
+ */
+export function surfaceAt(surface, now) {
+  if (!surface || !Number.isFinite(now) || surface.now === now) return surface;
+  const expiries = [];
+  for (const e of surface.expiries) {
+    if (!(e.expiry > now)) continue;
+    expiries.push({ ...e, T: (e.expiry - now) / MS_DAY / YEAR_DAYS });
+  }
+  return { ...surface, expiries, now };
 }
 
 // Линейная интерполяция улыбки по log-moneyness, плоская экстраполяция по краям.
@@ -88,14 +106,21 @@ function ivAtMoneyness(expiry, x) {
 }
 
 /**
- * Форвард на произвольную дату: ставка ln(F/S)/T интерполируется по сроку.
+ * Форвард на произвольную дату: ставка базиса интерполируется по сроку.
  * За пределами котируемых экспираций держим ставку ближайшей — это
  * консервативнее, чем экстраполировать её наклон.
+ *
+ * Базис берётся от индекса ТОГО ЖЕ снимка опционов: ln(F/индекс)/T. Прежде он
+ * считался от живого спота, и на точной экспирации форвард оставался форвардом
+ * последнего снимка при любом движении цены — вероятность и глубина потери
+ * стояли на цене момента загрузки до следующей загрузки. Теперь живой спот
+ * переносит базис снимка: F = спот·e^{r(T)·T}.
  */
 export function forwardAt(surface, spot, T) {
   const ex = surface.expiries;
   if (!ex.length || !(T > 0)) return spot;
-  const rateOf = (e) => (e.T > 0 ? Math.log(e.forward / spot) / e.T : 0);
+  const ref = surface.index > 0 ? surface.index : spot;
+  const rateOf = (e) => (e.T > 0 ? Math.log(e.forward / ref) / e.T : 0);
   if (T <= ex[0].T) return spot * Math.exp(rateOf(ex[0]) * T);
   if (T >= ex[ex.length - 1].T) return spot * Math.exp(rateOf(ex[ex.length - 1]) * T);
   for (let k = 1; k < ex.length; k++) {
