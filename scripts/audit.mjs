@@ -278,26 +278,44 @@ console.log('\n── 3. Волатильность оферты и премия
 {
   let bad = 0;
   let worstResidual = 0;
+  // Дисконт за срок блокировки по альтернативной ставке — тот же, что в оценке.
+  const dfOf = (r, rate) => Math.exp((-(rate ?? 0) * r.timing.lockDays) / YEAR_DAYS);
   for (const r of buy) {
-    if (!(r.offerVol > 0) || !(r.i > 0)) continue;
-    // По определению: цена пута при волатильности оферты равна K·i/(1+i).
-    const target = (r.strike * r.i) / (1 + r.i);
+    if (!(r.offerVol > 0)) continue;
+    // По определению: Put(σ оферты)/K = DF − 1/(1+i). Часть процента — просто
+    // стоимость денег за срок блокировки, за опцион платится только остаток.
+    const target = r.strike * (dfOf(r, riskFree) - 1 / (1 + r.i));
     const price = black76Put(r.forward, r.strike, r.offerVol, r.Teff);
     const residual = Math.abs(price - target) / r.strike;
     worstResidual = Math.max(worstResidual, residual);
     if (residual > 1e-6) bad++;
   }
   ok('волатильность оферты решает своё уравнение', bad === 0, `максимальная невязка ${worstResidual.toExponential(2)}`);
+  // Оферта ниже альтернативной ставки: правая часть уравнения не превышает
+  // внутреннюю стоимость, и σ у неё нет. Признак обязан совпадать с прямым счётом.
+  const belowBad = buy.filter((r) => {
+    const rhs = r.strike * (dfOf(r, riskFree) - 1 / (1 + r.i));
+    const want = !(rhs > Math.max(0, r.strike - r.forward) + 1e-12);
+    return Boolean(r.belowRiskFree) !== want || (want && r.offerVol != null);
+  });
+  ok(
+    'признак «ниже альт. ставки» совпадает с прямым счётом',
+    belowBad.length === 0,
+    `помечено ${buy.filter((r) => r.belowRiskFree).length} из ${buy.length}, нарушений ${belowBad.length}`,
+  );
 
   let signBad = [];
   for (const r of buy) {
     if (r.volEdge == null || r.edgeApr == null) continue;
-    // Знаки премии по волатильности и по доходности обязаны совпадать:
-    // и то и другое — «оферта щедрее или скупее рынка».
-    const rf = riskFree ?? 0;
-    const edgeNoRf = r.edgeApr + rf;
-    if (Math.sign(r.volEdge) !== Math.sign(edgeNoRf) && Math.abs(edgeNoRf) > 1e-9 && Math.abs(r.volEdge) > 1e-9) {
-      signBad.push(`${r.duration}/${r.strike}: σ ${pc(r.volEdge)} против APR ${pc(edgeNoRf)}`);
+    // Знаки премии по волатильности и по доходности обязаны совпадать: обе
+    // теперь учитывают стоимость денег. Расхождение допустимо только в полосе
+    // второго порядка: премия в деньгах дисконтирует и опционную ногу,
+    // (1+i)·DF·(1−P/K), а уравнение σ берёт цену опциона как выручку сегодня.
+    // Ширина полосы — (1+i)·P/K·(1−DF) в годовых на срок блокировки.
+    const df = dfOf(r, riskFree);
+    const band = ((1 + r.i) * (black76Put(r.forward, r.strike, r.sigma, r.Teff) / r.strike) * (1 - df) * YEAR_DAYS) / r.timing.lockDays;
+    if (Math.sign(r.volEdge) !== Math.sign(r.edgeApr) && Math.abs(r.edgeApr) > band + 1e-9 && Math.abs(r.volEdge) > 1e-9) {
+      signBad.push(`${r.duration}/${r.strike}: σ ${pc(r.volEdge)} против APR ${pc(r.edgeApr)}`);
     }
   }
   ok('знаки премии по волатильности и по доходности согласованы', signBad.length === 0, signBad.slice(0, 3).join('; ') || 'ок');
@@ -310,7 +328,7 @@ console.log('\n── 3. Волатильность оферты и премия
   for (const r of buy) {
     if (!Number.isFinite(r.fairAprEff) || !(r.sigma > 0)) continue;
     const iFair = (r.fairAprEff * r.timing.lockDays) / YEAR_DAYS;
-    const priceFromRate = (r.strike * iFair) / (1 + iFair);
+    const priceFromRate = r.strike * (dfOf(r, riskFree) - 1 / (1 + iFair));
     const priceDirect = black76Put(r.forward, r.strike, r.sigma, r.Teff);
     const rel = Math.abs(priceFromRate - priceDirect) / r.strike;
     fairWorst = Math.max(fairWorst, rel);
@@ -331,8 +349,8 @@ console.log('\n── 3. Волатильность оферты и премия
   ok('положение кривых согласовано со знаком премии', orderBad.length === 0, `расхождений ${orderBad.length}`);
 
   const sellSign = sell.filter((r) => {
-    if (r.offerVol == null || !(r.i > 0)) return false;
-    const target = (r.forward * r.i) / (1 + r.i);
+    if (r.offerVol == null) return false;
+    const target = r.forward * (dfOf(r, riskFreeBtc) - 1 / (1 + r.i));
     return Math.abs(black76Call(r.forward, r.strike, r.offerVol, r.Teff) - target) / r.forward > 1e-6;
   });
   ok('волатильность оферты Sell High решает своё уравнение', sellSign.length === 0, `нарушений ${sellSign.length}`);

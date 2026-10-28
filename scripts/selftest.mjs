@@ -16,6 +16,7 @@ import {
   effectiveApr,
   chainedApr,
   valueOffer,
+  fairAprEffective,
   logReturns,
   empiricalCdf,
   empiricalShortfall,
@@ -270,6 +271,102 @@ section('Оценка оферты и премия сверх справедли
   // А у Buy Low всё наоборот: долларовая ставка входит, ставка по монете — нет.
   const blBtc = valueOffer({ direction: 'BuyLow', strike: K, apy: apyFair, timing, forward: F, sigma, riskFreeBtc: 0.05 });
   near('ставка по биткоину не входит в оценку Buy Low', blBtc.fairValue, fair.fairValue, 1e-15);
+}
+
+// ────────────────────────────────────────────── 5a. σ оферты со стоимостью денег
+
+section('σ оферты и справедливая ставка со стоимостью денег');
+{
+  // Независимый источник: свой Блэк-76 на функции распределения Абрамовица —
+  // Стиган 26.2.17 (ошибка до 7.5e-8) и своя бисекция. Ни normCdf, ни
+  // impliedVol панели здесь не используются.
+  const phiAS = (x) => {
+    const z = Math.abs(x);
+    const t = 1 / (1 + 0.2316419 * z);
+    const poly = t * (0.31938153 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    const tail = (Math.exp((-z * z) / 2) / Math.sqrt(2 * Math.PI)) * poly;
+    return x >= 0 ? 1 - tail : tail;
+  };
+  const putAS = (F, K, s, T) => {
+    const v = s * Math.sqrt(T);
+    const d1 = (Math.log(F / K) + (v * v) / 2) / v;
+    return K * phiAS(-(d1 - v)) - F * phiAS(-d1);
+  };
+  const callAS = (F, K, s, T) => putAS(F, K, s, T) + F - K;
+  const solve = (fn, target) => {
+    let lo = 1e-4;
+    let hi = 5;
+    for (let k = 0; k < 200; k++) {
+      const mid = (lo + hi) / 2;
+      if (fn(mid) < target) lo = mid;
+      else hi = mid;
+    }
+    return (lo + hi) / 2;
+  };
+
+  const now = Date.UTC(2026, 6, 31, 8, 0);
+  const p = {
+    subscribeStartAt: String(now),
+    subscribeEndAt: String(now),
+    settlementTime: String(now + 30 * MS_DAY),
+    expectReceiveAt: String(now + 30 * MS_DAY + 20 * 60_000),
+    duration: '30d',
+  };
+  const timing = productTiming(p, now);
+  const F = 63000;
+  const K = 55000;
+  const sigma = 0.45;
+  const Teff = twapEffectiveT(timing.tauDays / 365);
+  const rf = 0.05;
+  const DF = Math.exp((-rf * timing.lockDays) / 365);
+
+  // Оферта, справедливая при σ с учётом ставки: 1/(1+i) = DF − Put/K.
+  const put = putAS(F, K, sigma, Teff);
+  const iFair = 1 / (DF - put / K) - 1;
+  const apy = (iFair * 365) / timing.yieldDays;
+  const v = valueOffer({ direction: 'BuyLow', strike: K, apy, timing, forward: F, sigma, riskFree: rf });
+  near('σ оферты решает Put/K = DF − 1/(1+i) (отдельный решатель)', v.offerVol, sigma, 2e-5);
+  ok('справедливая со ставкой оферта не помечена «ниже альт. ставки»', v.belowRiskFree === false);
+
+  // Та же оферта без учёта ставки выглядела бы дороже рынка: часть процента —
+  // просто стоимость денег. Это и был дефект.
+  const v0 = valueOffer({ direction: 'BuyLow', strike: K, apy, timing, forward: F, sigma, riskFree: 0 });
+  ok('без ставки та же оферта кажется щедрее рынка', v0.volEdge > 0.01, `σ-премия без ставки ${(v0.volEdge * 100).toFixed(2)} п.`);
+  const indep0 = solve((s) => putAS(F, K, s, Teff), (K * iFair) / (1 + iFair));
+  near('при нулевой ставке уравнение прежнее: Put/K = i/(1+i)', v0.offerVol, indep0, 2e-5);
+
+  // Оферта, которая платит меньше ставки за свой срок: σ не существует.
+  const iLow = Math.exp((rf * timing.lockDays) / 365) - 1 - 1e-5;
+  const low = valueOffer({ direction: 'BuyLow', strike: K, apy: (iLow * 365) / timing.yieldDays, timing, forward: F, sigma, riskFree: rf });
+  ok('оферта ниже альт. ставки помечена', low.belowRiskFree === true);
+  ok('у неё нет σ оферты и σ-премии', low.offerVol === null && low.volEdge === null);
+  const justAbove = valueOffer({ direction: 'BuyLow', strike: K, apy: ((iLow + 2e-5) * 365) / timing.yieldDays, timing, forward: F, sigma, riskFree: rf });
+  ok('чуть выше альт. ставки σ уже есть', justAbove.belowRiskFree === false && justAbove.offerVol > 0);
+
+  // Справедливая ставка восстанавливает цену опциона по тому же уравнению.
+  const fairApr = fairAprEffective({ direction: 'BuyLow', optionPrice: v.optionPrice, strike: K, forward: F, df: v.df, lockDays: timing.lockDays });
+  const iBack = (fairApr * timing.lockDays) / 365;
+  near('справедливая ставка: K·(DF − 1/(1+i)) = Put (независимая цена)', K * (DF - 1 / (1 + iBack)), put, 0.02, ' USDT');
+  near('у справедливой оферты эффективный APR равен справедливому', (apy * timing.yieldDays) / timing.lockDays, fairApr, 1e-6);
+
+  // Sell High: та же логика со ставкой по биткоину и базой F.
+  const Ks = 70000;
+  const rfb = 0.01;
+  const DFb = Math.exp((-rfb * timing.lockDays) / 365);
+  const call = callAS(F, Ks, sigma, Teff);
+  const iFs = 1 / (DFb - call / F) - 1;
+  const vs = valueOffer({ direction: 'SellHigh', strike: Ks, apy: (iFs * 365) / timing.yieldDays, timing, forward: F, sigma, riskFreeBtc: rfb });
+  near('σ оферты Sell High решает Call/F = DF_btc − 1/(1+i)', vs.offerVol, sigma, 2e-5);
+  const fairS = fairAprEffective({ direction: 'SellHigh', optionPrice: vs.optionPrice, strike: Ks, forward: F, df: vs.df, lockDays: timing.lockDays });
+  near('справедливая ставка Sell High', fairS, (iFs * 365) / timing.lockDays, 1e-6);
+
+  // Якорь не берёт оферту ниже альт. ставки, даже если по другой мере она лучшая.
+  const anchors = pickAnchors([
+    { productId: 'a', duration: '30d', strike: 1, aprEff: 0.03, pConv: 0.01, volEdge: null, edgeApr: -0.001, expNet: 0.02, belowRiskFree: true },
+    { productId: 'b', duration: '1d', strike: 2, aprEff: 0.5, pConv: 0.3, volEdge: -0.05, edgeApr: -0.2, expNet: -0.1, belowRiskFree: false },
+  ]);
+  ok('якорь «в деньгах» не берёт оферту ниже альт. ставки', anchors.money?.row.productId === 'b');
+  ok('и якорь матожидания тоже', anchors.expected?.row.productId === 'b');
 }
 
 // ────────────────────────────────────────────── 6. Эмпирика

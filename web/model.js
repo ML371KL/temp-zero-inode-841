@@ -8,6 +8,7 @@ import {
   effectiveApr,
   chainedApr,
   valueOffer,
+  fairAprEffective,
   moneynessZ,
   twapEffectiveT,
   logReturns,
@@ -598,10 +599,9 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
   const sigma = surface ? volAt(surface, spot, strike, T) : null;
   const forward = surface ? forwardAt(surface, spot, T) : spot;
 
-  const valued =
-    sigma > 0
-      ? valueOffer({ direction, strike, apy, timing, forward, sigma, riskFree, riskFreeBtc })
-      : { pTriggerRN: null, offerVol: null, volEdge: null, edgeApr: null, fairValue: null, optionPrice: null };
+  // Оценка зовётся и без волатильности: признак «ниже альтернативной ставки»
+  // от σ не зависит, а цены и премии без неё просто остаются пустыми.
+  const valued = valueOffer({ direction, strike, apy, timing, forward, sigma, riskFree, riskFreeBtc });
 
   // Глубина конвертации под мерой рынка опционов. Это та же цена опциона, но
   // выраженная не как вероятность события, а как доля капитала: сколько теряется
@@ -649,11 +649,15 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
 
   // Ставка, которую платил бы рынок опционов за тот же риск, в тех же единицах
   // (эффективный APR). Разница с фактической офертой — это и есть премия Bybit.
-  let fairAprEff = null;
-  if (valued.optionPrice != null && timing.lockDays > 0) {
-    const ratio = direction === 'BuyLow' ? valued.optionPrice / strike : valued.optionPrice / forward;
-    if (ratio < 1) fairAprEff = ((ratio / (1 - ratio)) * YEAR_DAYS) / timing.lockDays;
-  }
+  // Со стоимостью денег: деньги за срок блокировки заработали бы и без риска.
+  const fairAprEff = fairAprEffective({
+    direction,
+    optionPrice: valued.optionPrice,
+    strike,
+    forward,
+    df: valued.df,
+    lockDays: timing.lockDays,
+  });
 
   // Ожидаемая чистая доходность по историческому распределению.
   //
@@ -745,6 +749,8 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
     aprBucketN,
     aprBucketDays,
     offerVol: valued.offerVol,
+    // Оферта платит меньше альтернативной ставки за свой срок: σ оферты нет.
+    belowRiskFree: valued.belowRiskFree,
     volEdge: valued.volEdge,
     edgeApr: valued.edgeApr,
     fairValue: valued.fairValue,
@@ -1295,7 +1301,10 @@ export function frontierWithMargins(rows, riskFree = 0) {
  */
 export function pickAnchors(allRows) {
   // Якорь — это рекомендация, поэтому протухшие котировки сюда не допускаются.
-  const rows = allRows.filter((r) => !r.quoteStale);
+  // Не допускаются и оферты ниже альтернативной ставки: их доминирует простое
+  // «держать деньги под эту ставку», и называть такую оферту лучшей по какому
+  // угодно критерию нельзя.
+  const rows = allRows.filter((r) => !r.quoteStale && !r.belowRiskFree);
   const top = (key) => {
     const pool = rows.filter((r) => Number.isFinite(r[key]));
     return pool.length ? pool.reduce((a, b) => (b[key] > a[key] ? b : a)) : null;

@@ -288,12 +288,24 @@ export function valueOffer({ direction, strike, apy, timing, forward, sigma, ris
 
   // Оферта, переведённая в волатильность: при какой sigma премия ровно справедлива.
   // Сравнение с рыночной sigma — самый чистый ответ на вопрос «дорого или дёшево».
+  //
+  // Процент оферты — не только плата за проданный опцион: часть его те же деньги
+  // заработали бы и без риска за срок блокировки. Альтернатива оферте — продать
+  // тот же опцион по его цене и положить выручку вместе с суммой под ту же
+  // ставку, что и в df. Отсюда уравнение
+  //   Buy Low:   Put(σ)/K  = DF − 1/(1+i),
+  //   Sell High: Call(σ)/F = DF_btc − 1/(1+i).
+  // Если правая часть не превышает внутреннюю стоимость (у оферты вне денег —
+  // не больше нуля), оферта платит меньше альтернативной ставки, и никакая σ
+  // её не оправдывает: σ нет, а строка помечается belowRiskFree.
   let offerVol = null;
-  if (Teff > 0 && i > 0) {
-    offerVol =
-      direction === 'BuyLow'
-        ? impliedVol((K * i) / (1 + i), F, K, Teff, false)
-        : impliedVol((F * i) / (1 + i), F, K, Teff, true);
+  let belowRiskFree = false;
+  if (Teff > 0 && K > 0 && F > 0) {
+    const rhs = df - 1 / (1 + i);
+    const unit = direction === 'BuyLow' ? K : F;
+    const intrinsic = direction === 'BuyLow' ? Math.max(0, K - F) : Math.max(0, F - K);
+    if (!(rhs * unit > intrinsic + 1e-12)) belowRiskFree = true;
+    else offerVol = impliedVol(rhs * unit, F, K, Teff, direction !== 'BuyLow');
   }
 
   const fairValue = fairPerUnit == null ? null : fairPerUnit * df;
@@ -307,14 +319,30 @@ export function valueOffer({ direction, strike, apy, timing, forward, sigma, ris
     i,
     T,
     Teff,
+    df,
     optionPrice,
     pTriggerRN: pTrigger,
     offerVol,
+    belowRiskFree,
     marketVol: sigma ?? null,
     volEdge: offerVol != null && sigma > 0 ? offerVol - sigma : null,
     fairValue,
     edgeApr,
   };
+}
+
+/**
+ * Ставка, которую платил бы рынок опционов за тот же риск, в единицах
+ * эффективного APR — то же уравнение, что у σ оферты, решённое относительно i:
+ *   1/(1+i) = DF − цена/база  ⇒  i = 1/(DF − цена/база) − 1,
+ * где база — страйк у Buy Low и форвард у Sell High. Пунктир на графике лестницы.
+ */
+export function fairAprEffective({ direction, optionPrice, strike, forward, df, lockDays }) {
+  if (optionPrice == null || !(lockDays > 0) || !(df > 0)) return null;
+  const ratio = direction === 'BuyLow' ? optionPrice / strike : optionPrice / forward;
+  const den = df - ratio;
+  if (!(den > 0)) return null;
+  return ((1 / den - 1) * YEAR_DAYS) / lockDays;
 }
 
 // Расстояние до страйка в стандартных отклонениях. Отрицательное для Buy Low.

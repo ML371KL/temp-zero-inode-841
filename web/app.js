@@ -232,6 +232,27 @@ function fmtPercentile(row) {
 
 const cls = (x) => (x == null || !Number.isFinite(x) ? 'muted' : x > 0 ? 'pos' : x < 0 ? 'neg' : '');
 
+// Оферта платит меньше альтернативной ставки за свой срок: σ оферты у неё нет,
+// и вместо премии σ показывается это.
+const BELOW_RF = '<span class="neg">ниже альт. ставки</span>';
+
+function fmtVolEdge(r, digits = 1) {
+  if (r.belowRiskFree) return BELOW_RF;
+  return `<span class="${cls(r.volEdge)}">${fmtSigned(r.volEdge, digits)}</span>`;
+}
+
+function fmtOfferVol(r) {
+  return r.belowRiskFree ? BELOW_RF : fmtPct(r.offerVol, 1);
+}
+
+/** Плашка σ на карточке. */
+function volTag(row) {
+  if (row.belowRiskFree) return '<span class="tag warn">ниже альт. ставки</span>';
+  if (row.volEdge > 0) return `<span class="tag good">σ +${(row.volEdge * 100).toFixed(1)}</span>`;
+  if (row.volEdge < 0) return `<span class="tag warn">σ ${(row.volEdge * 100).toFixed(1)}</span>`;
+  return '';
+}
+
 /**
  * Глубина конвертации. Вероятность отвечает «как часто», глубина — «сколько»,
  * и без второго числа порог вероятности не ограничивает деньги: при одинаковых
@@ -508,8 +529,7 @@ function cardFor(row) {
   // там не было вовсе.
   tags.push(...pickTags(row));
   if (row.pareto) tags.push('<span class="tag good">Парето</span>');
-  if (row.volEdge > 0) tags.push(`<span class="tag good">σ +${(row.volEdge * 100).toFixed(1)}</span>`);
-  else if (row.volEdge < 0) tags.push(`<span class="tag warn">σ ${(row.volEdge * 100).toFixed(1)}</span>`);
+  tags.push(volTag(row));
   if (!row.exactExpiry) tags.push('<span class="tag">σ интерп.</span>');
   if (row.aprPercentile != null) {
     const { p, sign, title } = percentileLabel(row);
@@ -557,8 +577,8 @@ const BUY_COLUMNS = [
   ['Потеря при конв.', (r) => fmtDepth(r, 'conditional')],
   [`Стресс ${Math.round(STRESS_LEVEL * 100)}%`, (r) => `<span class="${r.depth?.stress > 0 ? 'neg' : 'muted'}">${fmtDepth(r, 'stress')}</span>`],
   ['σ рынок', (r) => fmtPct(r.sigma, 1)],
-  ['σ оферты', (r) => fmtPct(r.offerVol, 1)],
-  ['Премия σ', (r) => `<span class="${cls(r.volEdge)}">${fmtSigned(r.volEdge, 1)}</span>`],
+  ['σ оферты', (r) => fmtOfferVol(r)],
+  ['Премия σ', (r) => fmtVolEdge(r)],
   ['Премия APR', (r) => `<span class="${cls(r.edgeApr)}">${fmtSigned(r.edgeApr, 1)}</span>`],
   ['Ожид. чистый', (r) => `<span class="${cls(r.expNet)}">${fmtSigned(r.expNet, 1)}</span>`],
   ['Доход, USDT', (r) => (r.money ? fmtUsd(r.money.interest, 2) : '—')],
@@ -586,7 +606,7 @@ const STRATEGY_COLUMNS = [
   ['APR в цикле', (r) => `<span class="muted">${fmtPct(r.aprChained, 2)}</span>`],
   ['P за сделку', (r) => `<span class="muted">${fmtPct(r.pConv, 2)}</span>`],
   ['Ожид. потеря', (r) => fmtDepth(r, 'expected', 3)],
-  ['Премия σ', (r) => `<span class="${cls(r.volEdge)}">${fmtSigned(r.volEdge, 1)}</span>`],
+  ['Премия σ', (r) => fmtVolEdge(r)],
   ['Лимит, USDT', (r) => fmtLimit(r)],
 ];
 
@@ -600,7 +620,7 @@ const FRONTIER_COLUMNS = [
   ['Прибавка APR', (r) => `<span class="${cls(r.gainApr)}">${fmtSigned(r.gainApr, 2)}</span>`],
   ['Ценой риска', (r) => `<span class="muted">${fmtSigned(r.gainP, 2)}</span>`],
   ['Цена шага', (r) => fmtMarginal(r.marginal)],
-  ['Премия σ', (r) => `<span class="${cls(r.volEdge)}">${fmtSigned(r.volEdge, 2)}</span>`],
+  ['Премия σ', (r) => fmtVolEdge(r, 2)],
   ['Доход, USDT', (r) => (r.money ? fmtUsd(r.money.interest, 2) : '—')],
   ['Сеттлмент', (r) => fmtTime(r.timing.settle)],
 ];
@@ -655,7 +675,7 @@ const SELL_COLUMNS = [
   ['Ждать', (r) => fmtSpan(r.expExitDays)],
   ['Скорость выхода', (r) => `<span class="${cls(r.exitSpeed)}">${fmtPct(r.exitSpeed, 1)}</span>`],
   ['Полное матожид.', (r) => `<span class="${cls(r.fullRate)}">${fmtSigned(r.fullRate, 1)}</span>`],
-  ['Премия σ', (r) => `<span class="${cls(r.volEdge)}">${fmtSigned(r.volEdge, 1)}</span>`],
+  ['Премия σ', (r) => fmtVolEdge(r)],
   ['Циклов до б/у', (r) => fmtRecovery(r.recovery)],
   ['Сеттлмент', (r) => fmtTime(r.timing.settle)],
 ];
@@ -884,8 +904,7 @@ function strategyCardFor(row) {
   const tags = [];
   if (row.isVip) tags.push('<span class="tag vip">VIP</span>');
   tags.push(...pickTags(row));
-  if (row.volEdge > 0) tags.push(`<span class="tag good">σ +${(row.volEdge * 100).toFixed(1)}</span>`);
-  else if (row.volEdge < 0) tags.push(`<span class="tag warn">σ ${(row.volEdge * 100).toFixed(1)}</span>`);
+  tags.push(volTag(row));
 
   return `
     <article class="card${row.stratPareto ? ' pareto' : ''}" data-product="${row.productId}">
@@ -1404,7 +1423,7 @@ function showTip(row, event) {
     <b>${row.duration}${row.isVip ? ' · VIP' : ''}</b> · страйк <b>${fmtUsd(row.strike, 2)}</b><br />
     эффективный APR <b>${fmtPct(row.aprEff, 2)}</b> (заявлен ${fmtPct(row.apy, 2)})<br />
     P рыночная ${fmtPct(row.pRN, 2)} · историческая ${fmtPct(row.pHist, 2)}<br />
-    σ рынка ${fmtPct(row.sigma, 1)}${row.exactExpiry ? '' : ' (интерполяция)'} · σ оферты ${fmtPct(row.offerVol, 1)}<br />
+    σ рынка ${fmtPct(row.sigma, 1)}${row.exactExpiry ? '' : ' (интерполяция)'} · σ оферты ${row.belowRiskFree ? 'нет: ниже альт. ставки' : fmtPct(row.offerVol, 1)}<br />
     блокировка ${fmtSpan(row.timing.lockDays)}, из них мёртвых ${fmtSpan(row.timing.idleDays)}${
       row.histInfo
         ? `<br />история: ряд ${row.histInfo.series}, ${Math.round(row.histInfo.spanDays)} дней, ` +
