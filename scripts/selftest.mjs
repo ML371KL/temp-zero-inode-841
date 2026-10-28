@@ -1725,6 +1725,33 @@ section('Отбор за горизонт: оферты, которые не р�
   ok('безубыточный выход за горизонт есть — режим выхода с карточками', e.mode === 'exit' && e.rows.length > 0 && e.rows.every((r) => settles(r) && r.pExitHorizon > 0), `карточек ${e.rows.length}`);
 }
 
+section('Фильтр сроков: фронт подписки среди оставшихся строк');
+{
+  const snap = JSON.parse(gunzipSync(readFileSync(new URL('../docs/snapshot.json.gz', import.meta.url))).toString());
+  const quotes = new Map(Object.entries(snap.quotes));
+  for (const q of quotes.values()) for (const l of [...(q.buyLowPrice || []), ...(q.sellHighPrice || [])]) l.expiredAt = String(snap.now + 3_600_000);
+  const fs = createFrameState();
+  const inp = {
+    products: snap.products, quotes, now: snap.now, spot: snap.spot, surface: buildSurface(snap.options, snap.now), optionsAt: snap.now,
+    history: new History(snap.klines), riskFree: 0.04, riskFreeBtc: snap.riskFreeBtc, stats: null, basis: null,
+    ui: { vip: false, amount: 1000, maxP: 0.3, measure: 'max', mode: 'single', horizon: '90', cagr: '', durations: ['26d'], convQty: '' },
+  };
+  let f = computeFrame(fs, inp);
+  while (fs.job) runPathSlice(fs, 1e9);
+  f = computeFrame(fs, inp);
+  ok('после фильтра остались строки одного срока', f.ready && f.buy.length > 5 && f.buy.every((r) => r.duration === '26d'), `${f.buy.length}`);
+  // Перебор: недоминируемые по (APR ↑, P ↓) среди живых строк не ниже альт. ставки.
+  const pool = f.buy.filter((r) => !r.quoteStale && !r.optionsStale && !r.belowAlt && Number.isFinite(r.aprEff) && Number.isFinite(r.pConv));
+  const dom = (a) => pool.some((b) => b !== a && b.aprEff >= a.aprEff && b.pConv <= a.pConv && (b.aprEff > a.aprEff || b.pConv < a.pConv));
+  const brute = pool.filter((r) => !dom(r));
+  ok(
+    'фронт подписки пересчитан среди отфильтрованных — совпадает с перебором',
+    brute.length > 1 && brute.length === f.buy.filter((r) => r.pareto).length && brute.every((r) => r.pareto),
+    `перебор ${brute.length}, помечено ${f.buy.filter((r) => r.pareto).length}`,
+  );
+  ok('таблица фронта не пуста и равна перебору', f.frontier.length === brute.length, `${f.frontier.length}`);
+}
+
 // ────────────────────────────────────────────── 8h. Кадр панели и кэш траекторного слоя
 
 section('Кадр панели: траекторный слой не каждый кадр');

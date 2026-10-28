@@ -1375,17 +1375,29 @@ export function buildRows({
   // платит меньше неё, доминирует простое «держать USDT». Такая строка не идёт
   // ни на фронт, ни в карточки, а в полной таблице приглушена.
   for (const r of rows) r.belowAlt = belowAltRate(r, riskFree);
-  // Фронт строится только по живым котировкам: он питает и карточки, и якоря,
-  // и график, поэтому протухшая строка, попав на него, расползлась бы по всем
-  // рекомендательным блокам сразу. В полных таблицах она остаётся, приглушённая.
-  const fresh = rows.filter((r) => !isStale(r) && !r.belowAlt);
-  const front = paretoFront(fresh, 'aprEff', 'pConv');
-  for (const r of rows) r.pareto = front.has(r);
+  markSubscriptionFront(rows);
   markLadderInversions(rows);
   // Счётчик — по котировкам: устаревшие опционы показываются отдельной строкой.
   rows.staleCount = rows.filter((r) => r.quoteStale).length;
   rows.optionsStale = optionsStale;
   rows.optionsAgeMs = optionsAge;
+  return rows;
+}
+
+/**
+ * Фронт подписки: (эффективный APR ↑, P(конв) ↓) среди живых строк не ниже
+ * альт. ставки (r.belowAlt проставляет buildRows). Отдельной функцией, потому
+ * что панель зовёт её второй раз после фильтра сроков: фронт, посчитанный до
+ * фильтра, среди оставшихся строк мог не найти ни одной своей точки.
+ *
+ * Фронт строится только по живым котировкам: он питает и карточки, и якоря,
+ * и график, поэтому протухшая строка, попав на него, расползлась бы по всем
+ * рекомендательным блокам сразу. В полных таблицах она остаётся, приглушённая.
+ */
+export function markSubscriptionFront(rows) {
+  const fresh = rows.filter((r) => !isStale(r) && !r.belowAlt);
+  const front = paretoFront(fresh, 'aprEff', 'pConv');
+  for (const r of rows) r.pareto = front.has(r);
   return rows;
 }
 

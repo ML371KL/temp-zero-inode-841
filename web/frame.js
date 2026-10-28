@@ -30,6 +30,7 @@ import {
   sampleCagr,
   laddersFrom,
   runProduct,
+  markSubscriptionFront,
 } from './model.js';
 import { settlementSchedule } from './quant.js';
 import { atmVarianceCurve, surfaceAt } from './surface.js';
@@ -222,6 +223,10 @@ export function computeFrame(fs, inp) {
     if (!allowed.size) return rows;
     // Фильтр по срокам не должен терять счётчики: они висят на массиве.
     const kept = rows.filter((r) => allowed.has(r.duration));
+    // Фронт подписки — заново среди оставшихся строк: посчитанный до фильтра,
+    // он мог не иметь ни одной точки среди них, и таблица фронта, линия на
+    // графике и плашки «Парето» пропадали.
+    markSubscriptionFront(kept);
     kept.staleCount = kept.filter((r) => r.quoteStale).length;
     kept.optionsStale = rows.optionsStale;
     kept.optionsAgeMs = rows.optionsAgeMs;
