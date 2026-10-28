@@ -135,7 +135,11 @@ function monteCarloLoss({ F, K, sigma, T, n = 400_000, seed = 777 }) {
     loss += Math.max(0, K - s);
   }
   prices.sort();
-  return { loss: loss / n / K, quantile: prices[Math.floor(0.05 * (n - 1))] };
+  // Средняя потеря в худших 5% исходов — прямо по смоделированным ценам.
+  const worst = Math.floor(0.05 * n);
+  let tail = 0;
+  for (let k = 0; k < worst; k++) tail += Math.max(0, K - prices[k]);
+  return { loss: loss / n / K, quantile: prices[Math.floor(0.05 * (n - 1))], es: tail / worst / K };
 }
 
 const DUR_RE = /^(\d+(?:\.\d+)?)([hd])$/i;
@@ -504,7 +508,9 @@ console.log('\n── 5. Фронт Парето: сверка с полным �
 console.log('\n── 6. Якоря: сверка с полным перебором');
 {
   const anchors = pickAnchors(buy);
-  const maxBy = (key) => buy.filter((r) => Number.isFinite(r[key])).reduce((a, b) => (b[key] > a[key] ? b : a));
+  // Якорь не берёт оферту ниже альтернативной ставки: её доминирует «держать USDT».
+  const maxBy = (key) =>
+    buy.filter((r) => Number.isFinite(r[key]) && !r.belowRiskFree).reduce((a, b) => (b[key] > a[key] ? b : a));
 
   for (const [id, key] of [
     ['market', 'volEdge'],
@@ -585,9 +591,11 @@ console.log('\n── 7. Отбор в блок «Оптимальные Buy Low
       const priced = onFront.filter((r) => Number.isFinite(r.volEdge));
       if (priced.length) {
         const topVol = priced.reduce((a, b) => (b.volEdge > a.volEdge ? b : a));
+        // При отрицательной лучшей премии ярлык — «наименьшая недоплата».
+        const tag = topVol.volEdge < 0 ? 'наименьшая недоплата' : 'лучшая цена риска';
         ok(
-          `порог ${pc(maxP, 0)}: лучшая цена риска показана и подписана`,
-          best.includes(topVol) && (topVol.bestTag ?? '').includes('лучшая цена риска'),
+          `порог ${pc(maxP, 0)}: ${tag} показана и подписана`,
+          best.includes(topVol) && (topVol.bestTag ?? '').includes(tag),
           `${topVol.duration}/${topVol.strike} ${pc(topVol.volEdge)}`,
         );
       }
@@ -1020,12 +1028,14 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     const thin = r.histInfo != null && r.histInfo.independent < MIN_INDEPENDENT_WINDOWS;
     return thin ? r.pRN : exit ? Math.min(r.pRN, b) : Math.max(r.pRN, b);
   };
-  const exitRows = analyzed.filter((r) => cautious(r, true) != null);
+  // Знак осторожности построчный: безубыточная строка берёт меньшую из двух,
+  // убыточная — большую, даже если рядом есть безубыточные.
+  const exitRows = analyzed.filter((r) => cautious(r, r.profitable) != null);
   const waitRows = deep.filter((r) => cautious(r, false) != null);
   ok(
-    'в режиме выхода осторожная вероятность — меньшая из двух',
-    exitRows.every((r) => Math.abs(r.pConv - cautious(r, true)) < 1e-12),
-    `проверено ${exitRows.length}`,
+    'осторожная вероятность Sell High построчная: безубыточная — меньшая, убыточная — большая',
+    exitRows.every((r) => Math.abs(r.pConv - cautious(r, r.profitable)) < 1e-12),
+    `проверено ${exitRows.length}, убыточных среди них ${exitRows.filter((r) => !r.profitable).length}`,
   );
   ok(
     'в режиме ожидания осторожная вероятность — большая из двух',
@@ -1244,7 +1254,8 @@ console.log('\n── 11. Глубина конвертации: величин�
     `${withDepth.length} из ${buy.length}`,
   );
 
-  // Тождество меры: условная потеря — это безусловная, делённая на вероятность.
+  // Тождество меры: условная потеря — это безусловная, делённая на вероятность
+  // той же меры (из улыбки).
   let idBad = 0;
   for (const r of buy) {
     if (!r.lossRN?.conditional || !(r.pRN > 1e-9)) continue;
@@ -1259,14 +1270,25 @@ console.log('\n── 11. Глубина конвертации: величин�
   for (const r of probe) {
     const mc = monteCarloLoss({ F: r.forward, K: r.strike, sigma: r.sigma, T: r.Teff });
     maxLossErr = Math.max(maxLossErr, Math.abs(mc.loss - r.lossRN.expected));
-    const want = Math.max(0, (r.strike - mc.quantile) / r.strike);
-    maxStressErr = Math.max(maxStressErr, Math.abs(want - r.lossRN.stress));
+    maxStressErr = Math.max(maxStressErr, Math.abs(mc.es - r.lossRN.stress));
   }
   ok('ожидаемая потеря против Монте-Карло', maxLossErr < 1e-3, `максимум расхождения ${(maxLossErr * 100).toFixed(4)} п.п.`);
-  ok('стресс-квантиль против Монте-Карло', maxStressErr < 5e-3, `максимум расхождения ${(maxStressErr * 100).toFixed(3)} п.п.`);
+  ok('потеря в худших 5% против Монте-Карло', maxStressErr < 5e-3, `максимум расхождения ${(maxStressErr * 100).toFixed(3)} п.п.`);
+  // У осторожных оферт (P ≤ 5%) прежний квантиль был нулём всегда; средняя
+  // потеря в худших 5% — ожидаемая потеря / 5%, то есть число со смыслом.
+  const cautiousRows = buy.filter((r) => r.lossRN && r.pLognormal <= 0.05);
+  ok(
+    'у оферт с P ≤ 5% потеря в худших 5% = ожидаемая / 5%',
+    cautiousRows.every((r) => Math.abs(r.lossRN.stress - r.lossRN.expected / 0.05) < 1e-12),
+    `строк ${cautiousRows.length}`,
+  );
 
-  // Внутри продукта потеря обязана расти со страйком — как и вероятность.
+  // Внутри продукта потеря обязана расти со страйком в каждой серии — как и
+  // вероятность. Рабочая глубина берётся целиком из той серии, где хуже
+  // вероятность, и на страйке, где серия меняется, может сделать шаг назад:
+  // это свойство правила «одна серия на строку», а не ошибка счёта.
   let mono = 0;
+  let switches = 0;
   const grp = new Map();
   for (const r of buy) {
     if (!r.depth) continue;
@@ -1275,20 +1297,31 @@ console.log('\n── 11. Глубина конвертации: величин�
   }
   for (const list of grp.values()) {
     const srt = [...list].sort((a, b) => a.strike - b.strike);
-    for (let k = 1; k < srt.length; k++) if (srt[k].depth.expected < srt[k - 1].depth.expected - 1e-12) mono++;
+    for (let k = 1; k < srt.length; k++) {
+      for (const key of ['lossRN', 'lossHistScaled']) {
+        const a = srt[k - 1][key];
+        const b = srt[k][key];
+        if (a && b && b.expected < a.expected - 1e-12) mono++;
+      }
+      if ((srt[k].depth === srt[k].lossRN) !== (srt[k - 1].depth === srt[k - 1].lossRN)) switches++;
+    }
   }
-  ok('ожидаемая потеря растёт со страйком внутри продукта', mono === 0, `нарушений ${mono}`);
+  ok('ожидаемая потеря растёт со страйком внутри продукта в каждой серии', mono === 0, `нарушений ${mono}, смен серии вдоль лестниц ${switches}`);
 
-  // Осторожный режим берёт худшее по каждому полю, а на тонкой выборке — рынок.
+  // Осторожный режим: глубина целиком из той серии, откуда взята рабочая
+  // вероятность (худшая из двух по вероятности), на тонкой выборке — рынок.
   let pickBad = 0;
   for (const r of buy) {
     if (!r.depth || !r.lossRN) continue;
     const thin = r.histInfo != null && r.histInfo.independent < MIN_INDEPENDENT_WINDOWS;
     const h = r.lossHistScaled ?? r.lossHist;
-    const want = thin || !h ? r.lossRN.expected : Math.max(r.lossRN.expected, h.expected);
-    if (Math.abs(r.depth.expected - want) > 1e-12) pickBad++;
+    const hp = r.pHistScaled ?? r.pHist;
+    const useHist = !thin && h && hp != null && hp > r.pRN;
+    const want = useHist ? h : r.lossRN;
+    if (r.depth !== want) pickBad++;
+    if (Math.abs(r.pConv - (useHist ? hp : r.pRN)) > 1e-15) pickBad++;
   }
-  ok('осторожная глубина = худшая из двух мер с учётом веса выборки', pickBad === 0, `нарушений ${pickBad}`);
+  ok('осторожная глубина — из той же серии, что и вероятность', pickBad === 0, `нарушений ${pickBad}`);
 
   // Ради чего всё затевалось: при одной вероятности глубина разная.
   const band = buy.filter((r) => r.pRN > 0.05 && r.pRN < 0.1 && r.depth);

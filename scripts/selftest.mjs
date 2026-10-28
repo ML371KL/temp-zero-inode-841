@@ -43,7 +43,7 @@ import {
   QUANTILE_LEVELS,
   MS_DAY,
 } from '../web/quant.js';
-import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr } from '../web/model.js';
+import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr, pickDepth, pickProbability } from '../web/model.js';
 import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry, atmVarianceCurve, totalVariance, forwardVol, surfaceAt, smileSlope, volSlopeAt } from '../web/surface.js';
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
@@ -646,11 +646,55 @@ section('Глубина конвертации');
   near('безусловная потеря = Put/K', p.expected, put / K, 1e-15);
   near('условная потеря = безусловная / P(конв)', p.conditional, put / K / normCdf(-d2), 1e-12);
   ok('условная потеря больше безусловной', p.conditional > p.expected);
-  ok('стресс-потеря не меньше условной', p.stress >= p.conditional, `${(p.stress * 100).toFixed(2)}% против ${(p.conditional * 100).toFixed(2)}%`);
+  ok('потеря в худших 5% не меньше условной при P(конв) > 5%', p.stress >= p.conditional, `${(p.stress * 100).toFixed(2)}% против ${(p.conditional * 100).toFixed(2)}%`);
 
   // Далёкий страйк: в худших 5% исходов цена до него всё равно не доходит.
   const far = rnLossProfile({ direction: 'BuyLow', forward: F, strike: 30000, sigma, Teff: T, spot: 62000 });
-  ok('на далёком страйке стресс-потери нет', far.stress === 0, `${far.stress}`);
+  // Далёкий страйк: P(конв) < 5%, поэтому все потери лежат в худших 5% исходов,
+  // и средняя потеря там — ожидаемая потеря / 5%. Квантиль здесь давал ноль.
+  near('на далёком страйке потеря в худших 5% = ожидаемая / 5%', far.stress, far.expected / 0.05, 1e-18);
+  ok('и она не нулевая, в отличие от квантиля', far.stress > 0);
+
+  // Независимая сверка средней потери в худших 5% под логнормальной мерой:
+  // численное интегрирование по нормальной переменной, без формул ES. Худшие
+  // 5% — это z ниже N⁻¹(0.05) у Buy Low и выше N⁻¹(0.95) у Sell High,
+  // S(z) = F·exp(σ√T·z − σ²T/2); ES = ∫ потеря·φ(z) dz / 0.05.
+  const esNumeric = (dir, Kx) => {
+    const n = 400000;
+    const a = dir === 'BuyLow' ? -14 : normInv(0.95);
+    const b = dir === 'BuyLow' ? normInv(0.05) : 14;
+    const h = (b - a) / n;
+    let acc = 0;
+    for (let j = 0; j < n; j++) {
+      const z = a + (j + 0.5) * h;
+      const S = F * Math.exp(v * z - (v * v) / 2);
+      const loss = dir === 'BuyLow' ? Math.max(0, Kx - S) / Kx : Math.max(0, S - Kx) / 62000;
+      acc += (loss * Math.exp((-z * z) / 2)) / Math.sqrt(2 * Math.PI);
+    }
+    return (acc * h) / 0.05;
+  };
+  near('ES Buy Low против численного интегрирования', p.stress, esNumeric('BuyLow', K), 2e-6);
+  near('ES далёкого страйка против интегрирования', far.stress, esNumeric('BuyLow', 30000), 1e-10);
+  const shES = rnLossProfile({ direction: 'SellHigh', forward: F, strike: 66000, sigma, Teff: T, spot: 62000 });
+  near('ES Sell High против численного интегрирования', shES.stress, esNumeric('SellHigh', 66000), 2e-6);
+  // Эмпирическая: подготовленная выборка против прямого перебора (свой код).
+  {
+    let seed = 99;
+    const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5);
+    const sample = Array.from({ length: 1999 }, () => 0.25 * rnd()).sort((a, b) => a - b);
+    const prep = prepareSample(sample);
+    for (const [dir, Kx] of [['BuyLow', 90], ['BuyLow', 70], ['SellHigh', 110], ['SellHigh', 140]]) {
+      const losses = sample
+        .map((r) => (dir === 'BuyLow' ? Math.max(0, Kx - 100 * Math.exp(r)) : Math.max(0, 100 * Math.exp(r) - Kx)))
+        .sort((a, b) => b - a);
+      const m = 0.05 * losses.length;
+      let acc = 0;
+      for (let j = 0; j < Math.floor(m); j++) acc += losses[j];
+      acc += (m - Math.floor(m)) * losses[Math.floor(m)];
+      const want = acc / m / (dir === 'BuyLow' ? Kx : 100);
+      near(`эмпирическая ES ${dir} ${Kx}: выборка против перебора`, sampleLossProfile(prep, 100, Kx, dir).stress, want, 1e-12);
+    }
+  }
 
   // Чем ближе страйк к рынку, тем больше теряется в среднем.
   const near_ = rnLossProfile({ direction: 'BuyLow', forward: F, strike: 62000, sigma, Teff: T, spot: 62000 });
@@ -667,6 +711,19 @@ section('Глубина конвертации');
   ok('на растущем ряду ниже страйка потерь нет', emp.expected === 0 && emp.stress === 0);
   const emp2 = empiricalLossProfile(r5, 100, 200, 'BuyLow');
   ok('выше страйка потери есть и условная больше безусловной', emp2.expected > 0 && emp2.conditional >= emp2.expected);
+
+  // Мера «худшая из двух»: все три числа глубины — из той серии, откуда взята
+  // рабочая вероятность, а не покомпонентный максимум двух распределений.
+  const lossA = { expected: 0.01, conditional: 0.2, stress: 0.05 };
+  const lossB = { expected: 0.02, conditional: 0.1, stress: 0.3 };
+  const rowHistWorse = { pRN: 0.05, pHistScaled: 0.08, lossRN: lossA, lossHistScaled: lossB, histInfo: { independent: 100 } };
+  ok('история хуже по вероятности — глубина целиком из истории', pickDepth(rowHistWorse, 'max') === lossB && pickProbability(rowHistWorse, 'max') === 0.08);
+  const rowRnWorse = { ...rowHistWorse, pRN: 0.09 };
+  ok('рынок хуже — глубина целиком рыночная', pickDepth(rowRnWorse, 'max') === lossA && pickProbability(rowRnWorse, 'max') === 0.09);
+  const rowThin = { ...rowHistWorse, histInfo: { independent: 5 } };
+  ok('на тонкой выборке — рыночная', pickDepth(rowThin, 'max') === lossA && pickProbability(rowThin, 'max') === 0.05);
+  // Знак осторожности 'min' — для желанного срабатывания (выход Sell High).
+  ok('осторожно для желанного выхода — меньшая и её серия', pickProbability(rowHistWorse, 'max', 'min') === 0.05 && pickDepth(rowHistWorse, 'max', 'min') === lossA);
 }
 
 // ────────────────────────────────────────────── 8b. Мартингальное центрирование
@@ -866,7 +923,12 @@ section('Отбор карточек');
   const best = pickBest({ rows, maxP: 0.5 });
   ok('карточек не больше лимита', best.length <= 6, `${best.length}`);
   ok('максимум доходности показан и подписан', best.some((r) => (r.bestTag ?? '').includes('максимум доходности') && r.aprEff === 0.14));
-  ok('лучшая цена риска показана и подписана', best.some((r) => (r.bestTag ?? '').includes('лучшая цена риска') && r.productId === 'p2'));
+  // Все σ-премии здесь отрицательны, и ярлык обязан это сказать.
+  ok('наименьшая недоплата показана и подписана', best.some((r) => (r.bestTag ?? '').includes('наименьшая недоплата') && r.productId === 'p2'));
+  ok('ярлык «лучшая цена риска» при отрицательной премии не ставится', !best.some((r) => (r.bestTag ?? '').includes('лучшая цена риска')));
+  const rich = rows.map((r) => ({ ...r, volEdge: r.volEdge + 0.2 }));
+  const bestRich = pickBest({ rows: rich, maxP: 0.5 });
+  ok('при положительной премии — «лучшая цена риска»', bestRich.some((r) => (r.bestTag ?? '').includes('лучшая цена риска') && r.productId === 'p2'));
   // Главное: блок больше не состоит из одного края фронта.
   const span = Math.max(...best.map((r) => r.pConv)) - Math.min(...best.map((r) => r.pConv));
   const full = Math.max(...rows.map((r) => r.pConv)) - Math.min(...rows.map((r) => r.pConv));

@@ -450,15 +450,26 @@ export function rnLossProfile({ direction, forward, strike, sigma, Teff, spot, l
   const base = direction === 'BuyLow' ? strike : spot > 0 ? spot : forward;
   const price = direction === 'BuyLow' ? black76Put(forward, strike, sigma, Teff) : black76Call(forward, strike, sigma, Teff);
   const p = Number.isFinite(pGiven) ? pGiven : direction === 'BuyLow' ? normCdf(-d2) : normCdf(d2);
-  // Квантиль цены сеттлмента под Q: S = F·exp(σ√T·z − σ²T/2).
-  // Для Buy Low плохой исход — низкая цена, для Sell High — высокая.
+  // Потеря в худших level исходов — средняя, а не квантиль (ожидаемый дефицит).
+  // Квантиль у осторожных оферт всегда нуль: при P(конв) ≤ 5% в худшие 5% исходов
+  // страйк не попадает вовсе, и число ничего не говорило. Логнормально, как
+  // прежний квантиль: граница худших исходов q = F·exp(σ√T·z − σ²T/2).
+  //   Buy Low, K ≤ q (P(конв) ≤ level): ES = Put/K / level;
+  //            K > q: ES = (K·level − F·N(z − σ√T)) / (level·K);
+  //   Sell High зеркально: ES = Call/base / level или (F·N(σ√T − z) − K·level) / (level·base).
   const z = normInv(direction === 'BuyLow' ? level : 1 - level);
-  const sq = forward * Math.exp(v * z - (v * v) / 2);
-  const stress = direction === 'BuyLow' ? Math.max(0, (strike - sq) / base) : Math.max(0, (sq - strike) / base);
+  const q = forward * Math.exp(v * z - (v * v) / 2);
+  let tail;
+  if (direction === 'BuyLow') {
+    tail = strike <= q ? price : strike * level - forward * normCdf(z - v);
+  } else {
+    tail = strike >= q ? price : forward * normCdf(v - z) - strike * level;
+  }
   return {
     expected: price / base,
     conditional: p > 1e-9 ? price / base / p : null,
-    stress,
+    // Поле по-прежнему зовётся stress, но это средняя потеря в худших level.
+    stress: Math.max(0, tail) / level / base,
   };
 }
 
@@ -476,16 +487,20 @@ export function empiricalLossProfile(sorted, spot, strike, direction, level = ST
   }
   const mean = acc / sorted.length;
   const p = hits / sorted.length;
-  // Выборка отсортирована по возрастанию, поэтому нижний квантиль лежит слева,
-  // верхний — справа. Индекс зажимаем: на короткой выборке края вырождаются.
-  const idx = clamp(
-    Math.floor((direction === 'BuyLow' ? level : 1 - level) * (sorted.length - 1)),
-    0,
-    sorted.length - 1,
-  );
-  const sq = spot * Math.exp(sorted[idx]);
-  const stress = direction === 'BuyLow' ? Math.max(0, (strike - sq) / base) : Math.max(0, (sq - strike) / base);
-  return { expected: mean / base, conditional: p > 1e-9 ? mean / base / p : null, stress };
+  // Средняя потеря в худших level исходов выборки: потери по убыванию, сумма
+  // первых level·n (с дробной долей следующей), делённая на level·n. Если
+  // конвертаций меньше level·n, это просто ожидаемая потеря / level.
+  const losses = sorted.map((r) => {
+    const s = spot * Math.exp(r);
+    return direction === 'BuyLow' ? Math.max(0, strike - s) : Math.max(0, s - strike);
+  });
+  losses.sort((a, b) => b - a);
+  const m = level * sorted.length;
+  const whole = Math.floor(m);
+  let worst = 0;
+  for (let j = 0; j < whole; j++) worst += losses[j];
+  if (whole < losses.length) worst += (m - whole) * losses[whole];
+  return { expected: mean / base, conditional: p > 1e-9 ? mean / base / p : null, stress: worst / m / base };
 }
 
 /**
@@ -528,11 +543,12 @@ export function sampleCdf(prep, x) {
 
 /**
  * Профиль глубины по подготовленной выборке — то же, что empiricalLossProfile:
- * ожидаемая потеря, условная (на случаи с потерей) и стресс-квантиль.
+ * ожидаемая потеря, условная (на случаи с потерей) и средняя потеря в худших
+ * level исходов.
  */
 export function sampleLossProfile(prep, spot, strike, direction, level = STRESS_LEVEL) {
   if (!prep || !(spot > 0) || !(strike > 0)) return null;
-  const { gross, cum, n, logs } = prep;
+  const { gross, cum, n } = prep;
   const k = strike / spot;
   let acc;
   let hits;
@@ -548,10 +564,22 @@ export function sampleLossProfile(prep, spot, strike, direction, level = STRESS_
   const base = direction === 'BuyLow' ? strike : spot;
   const mean = Math.max(0, acc) / n;
   const p = hits / n;
-  const idx = clamp(Math.floor((direction === 'BuyLow' ? level : 1 - level) * (n - 1)), 0, n - 1);
-  const sq = spot * Math.exp(logs[idx]);
-  const stress = direction === 'BuyLow' ? Math.max(0, (strike - sq) / base) : Math.max(0, (sq - strike) / base);
-  return { expected: mean / base, conditional: p > 1e-9 ? mean / base / p : null, stress };
+  // Средняя потеря в худших level исходов: худшие — с нижнего края выборки у
+  // Buy Low и с верхнего у Sell High; суммы берутся из нарастающих сумм.
+  const m = level * n;
+  const whole = Math.min(Math.floor(m), n);
+  const w = Math.min(whole, hits);
+  let worst;
+  let next = 0;
+  if (direction === 'BuyLow') {
+    worst = w * strike - spot * cum[w];
+    if (whole < hits) next = strike - spot * gross[whole];
+  } else {
+    worst = spot * (cum[n] - cum[n - w]) - w * strike;
+    if (whole < hits) next = spot * gross[n - 1 - whole] - strike;
+  }
+  worst += (m - whole) * Math.max(0, next);
+  return { expected: mean / base, conditional: p > 1e-9 ? mean / base / p : null, stress: Math.max(0, worst) / m / base };
 }
 
 /**

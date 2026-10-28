@@ -28,6 +28,7 @@ import {
   pickExitAnchors,
   computeStrategy,
   sampleCagr,
+  priceTag,
   isStale,
   OPTIONS_MAX_AGE_MS,
   MIN_INDEPENDENT_WINDOWS,
@@ -526,6 +527,16 @@ function pickTags(row) {
     .map((t) => `<span class="tag pick">${t}</span>`);
 }
 
+/**
+ * Мера «Риска за N дней» на карточке подписки другая, чем у P(конвертации):
+ * траектории сценария с ростом BTC, а не цены опционов без дрейфа. На самой
+ * карточке это не пишется — только во всплывающей подсказке.
+ */
+function horizonRiskTitle() {
+  const g = state.scenarioInfo?.cagr;
+  return `мера — траектории сценария: рост BTC ${fmtPct(g, 1)} в год, волатильность по кривой опционов; P(конвертации) выше — без роста, по выбранной мере`;
+}
+
 function cardFor(row) {
   const t = row.timing;
   const closeIn = (t.subEnd - Date.now()) / MS_DAY;
@@ -557,8 +568,8 @@ function cardFor(row) {
         <dt>APR в непрерывном цикле</dt><dd>${fmtPct(row.aprChained, 2)}</dd>
         <dt>P(конвертации)</dt><dd class="${row.pConv > 0.15 ? 'neg' : ''}">${fmtPct(row.pConv, 2)}</dd>
         <dt>Потеря при конвертации</dt><dd>${fmtDepth(row, 'conditional')} <span class="muted">в среднем ${fmtDepth(row, 'expected', 3)}</span></dd>
-        <dt>Стресс ${Math.round(STRESS_LEVEL * 100)}%</dt><dd class="${row.depth?.stress > 0 ? 'neg' : ''}">${fmtDepth(row, 'stress')}</dd>
-        <dt>Риск за ${ui.horizon} дней</dt><dd>${fmtPct(row.pHorizon, 1)}</dd>
+        <dt>Потеря в худших ${Math.round(STRESS_LEVEL * 100)}%</dt><dd class="${row.depth?.stress > 0 ? 'neg' : ''}">${fmtDepth(row, 'stress')}</dd>
+        <dt title="${horizonRiskTitle()}">Риск за ${ui.horizon} дней</dt><dd>${fmtPct(row.pHorizon, 1)}</dd>
         <dt>Премия к опционам</dt><dd class="${cls(row.edgeApr)}">${fmtSigned(row.edgeApr, 1)}</dd>
         <dt>Доход на сумму</dt><dd>${row.money ? fmtUsd(row.money.interest, 2) : '—'} USDT</dd>
         <dt>Окно закроется</dt><dd>${fmtSpan(closeIn)}</dd>
@@ -582,7 +593,7 @@ const BUY_COLUMNS = [
   ['P за гориз.', (r) => `<span class="muted">${fmtPct(r.pHorizon, 1)}</span>`],
   ['Ожид. потеря', (r) => fmtDepth(r, 'expected', 3)],
   ['Потеря при конв.', (r) => fmtDepth(r, 'conditional')],
-  [`Стресс ${Math.round(STRESS_LEVEL * 100)}%`, (r) => `<span class="${r.depth?.stress > 0 ? 'neg' : 'muted'}">${fmtDepth(r, 'stress')}</span>`],
+  [`Потеря в худших ${Math.round(STRESS_LEVEL * 100)}%`, (r) => `<span class="${r.depth?.stress > 0 ? 'neg' : 'muted'}">${fmtDepth(r, 'stress')}</span>`],
   ['σ рынок', (r) => fmtPct(r.sigma, 1)],
   ['σ оферты', (r) => fmtOfferVol(r)],
   ['Премия σ', (r) => fmtVolEdge(r)],
@@ -891,7 +902,10 @@ function renderStrategy(rows) {
     'максимум стоимости',
   );
   const priced = byRisk.filter((r) => Number.isFinite(r.volEdge));
-  if (priced.length) take(priced.reduce((a, b) => (b.volEdge > a.volEdge ? b : a)), 'лучшая цена риска');
+  if (priced.length) {
+    const top = priced.reduce((a, b) => (b.volEdge > a.volEdge ? b : a));
+    take(top, priceTag(top.volEdge));
+  }
   for (let k = 0; picks.length < 6 && k < byRisk.length; k++) {
     take(byRisk[Math.round((k * (byRisk.length - 1)) / 5)], null);
   }
@@ -977,11 +991,14 @@ function sellCardFor(row, mode) {
 const ANCHOR_META = {
   market: {
     title: 'Лучшая цена риска',
+    // Когда лучшая премия всё равно отрицательна, это не выгода, а недоплата.
+    negTitle: 'Наименьшая недоплата',
     key: 'volEdge',
     hint: 'премия оферты против цены опциона на тот же риск с той же датой экспирации. Единственный критерий, которому не нужны ваши предпочтения',
   },
   money: {
     title: 'Лучшая премия в деньгах',
+    negTitle: 'Наименьшая недоплата в деньгах',
     key: 'edgeApr',
     hint: 'та же премия, но выраженная в годовой доходности на вложенный капитал, а не в пунктах волатильности. Учитывает, сколько мисприсинг стоит в деньгах и как долго заперты средства',
   },
@@ -1012,7 +1029,7 @@ function renderAnchors(rows) {
           d
             ? ` title="Вне фронта Парето: ${d.duration} со страйком ${fmtUsd(d.strike, 2)} даёт ${fmtPct(d.aprEff, 1)} против ${fmtPct(r.aprEff, 1)} при вероятности ${fmtPct(d.pConv, 2)} против ${fmtPct(r.pConv, 2)}. Якорь всё равно осмыслен: его страйк глубже, и при конвертации BTC достаётся дешевле."`
             : ''
-        }>${meta.title}${d ? ' <span class="muted">(вне фронта Парето)</span>' : ''}</div>
+        }>${meta.negTitle && a.value < 0 ? meta.negTitle : meta.title}${d ? ' <span class="muted">(вне фронта Парето)</span>' : ''}</div>
         <div class="anchor-value">${
           meta.key === 'volEdge' || meta.key === 'edgeApr' ? fmtSigned(a.value, 2) : fmtPct(a.value, 1)
         }</div>
@@ -1081,6 +1098,7 @@ const EXIT_ANCHOR_META = {
   },
   market: {
     title: 'Лучшая цена риска',
+    negTitle: 'Наименьшая недоплата',
     hint: 'насколько ставка оферты отличается от цены колла с той же датой экспирации, в пунктах волатильности. Единственная величина здесь, которой не нужны ваши предпочтения',
   },
 };
@@ -1110,7 +1128,7 @@ function renderExitAnchors(analyzed) {
           d
             ? ` title="Вне фронта выхода: ${d.duration} со страйком ${fmtUsd(d.strike, 2)} даёт прибыль ${fmtSigned(d.profitAtExit, 2)} против ${fmtSigned(r.profitAtExit, 2)} при шансе выйти ${fmtPct(d[a.axis], 1)} против ${fmtPct(r[a.axis], 1)}. Якорь всё равно осмыслен: он отвечает на вопрос об обеих ветвях, а фронт считает только ветвь выхода."`
             : ''
-        }>${meta.title}${d ? ' <span class="muted">(вне фронта выхода)</span>' : ''}</div>
+        }>${meta.negTitle && a.value < 0 ? meta.negTitle : meta.title}${d ? ' <span class="muted">(вне фронта выхода)</span>' : ''}</div>
         <div class="anchor-value ${cls(a.value)}">${fmtSigned(a.value, 1)}</div>
         <div class="anchor-line">
           ${r.duration}${r.isVip ? ' · VIP' : ''} · страйк <b>${fmtUsd(r.strike, 2)}</b> (${fmtSigned(r.moneyness, 2)})

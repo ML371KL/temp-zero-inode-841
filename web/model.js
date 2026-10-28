@@ -861,39 +861,45 @@ function histSide(row, measure) {
   return { raw, thin };
 }
 
-/** Какую вероятность считать рабочей. */
-export function pickProbability(row, measure) {
-  const a = row.pRN;
+/**
+ * Какая серия рабочая: рынок опционов ('rn') или историческая выборка ('hist').
+ *
+ * В мере «худшая из двух» серия выбирается по вероятности, и из неё же берутся
+ * все три числа глубины. Прежде глубина собиралась покомпонентным максимумом из
+ * двух распределений и описывала мир, которого нет ни в одной из мер.
+ *
+ * cautious — в какую сторону осторожно: 'max' (конвертация — риск) или 'min'
+ * (срабатывание желанно: безубыточный выход Sell High).
+ */
+export function pickSeries(row, measure, cautious = 'max') {
+  if (measure === 'rn') return 'rn';
+  if (measure === 'hist' || measure === 'hist-scaled') return 'hist';
   const { raw, thin } = histSide(row, measure);
+  const a = row.pRN;
   const b = raw ? row.pHist : (row.pHistScaled ?? row.pHist);
-  if (measure === 'rn') return a;
-  if (measure === 'hist' || measure === 'hist-scaled') return b;
-  if (a == null) return b;
-  if (b == null) return a;
-  return thin ? a : Math.max(a, b);
+  if (a == null) return b == null ? 'rn' : 'hist';
+  if (b == null || thin) return 'rn';
+  return (cautious === 'min' ? b < a : b > a) ? 'hist' : 'rn';
+}
+
+/** Какую вероятность считать рабочей. */
+export function pickProbability(row, measure, cautious = 'max') {
+  const { raw } = histSide(row, measure);
+  return pickSeries(row, measure, cautious) === 'rn' ? row.pRN : raw ? row.pHist : (row.pHistScaled ?? row.pHist);
 }
 
 /**
- * Глубина конвертации в той же мере, что и рабочая вероятность.
+ * Глубина конвертации в той же мере и той же серии, что и рабочая вероятность.
  *
  * Без неё порог вероятности не ограничивает деньги: при одной и той же
  * вероятности около 7% суточная оферта теряет 0.11% капитала, а 236-дневная —
  * 1.57%, то есть в пятнадцать раз больше. Частота говорит «как часто», глубина —
  * «сколько», и решение требует обеих.
  */
-export function pickDepth(row, measure) {
-  const { raw, thin } = histSide(row, measure);
+export function pickDepth(row, measure, cautious = 'max') {
+  const { raw } = histSide(row, measure);
   const h = raw ? row.lossHist : (row.lossHistScaled ?? row.lossHist);
-  if (measure === 'rn') return row.lossRN;
-  if (measure === 'hist' || measure === 'hist-scaled') return h;
-  if (!row.lossRN) return thin ? null : h;
-  if (!h || thin) return row.lossRN;
-  const worse = (x, y) => (x == null ? y : y == null ? x : Math.max(x, y));
-  return {
-    expected: worse(row.lossRN.expected, h.expected),
-    conditional: worse(row.lossRN.conditional, h.conditional),
-    stress: worse(row.lossRN.stress, h.stress),
-  };
+  return pickSeries(row, measure, cautious) === 'rn' ? row.lossRN : h;
 }
 
 /**
@@ -1033,6 +1039,15 @@ export function markLadderInversions(rows) {
 }
 
 /**
+ * Ярлык лучшей σ-премии. Когда отрицательна даже лучшая, «лучшая цена риска»
+ * вводит в заблуждение: это не выгода, а самая малая недоплата.
+ */
+export function priceTag(value, money = false) {
+  if (value < 0) return money ? 'наименьшая недоплата в деньгах' : 'наименьшая недоплата';
+  return money ? 'лучшая премия в деньгах' : 'лучшая цена риска';
+}
+
+/**
  * Отбор в блок «оптимальные варианты».
  * Порог риска задаёт пользователь; внутри порога берём фронт Парето —
  * набор, который нельзя улучшить по доходности, не увеличив риск.
@@ -1074,10 +1089,8 @@ export function pickBest({ rows, maxP, limit = 6 }) {
   );
   const priced = list.filter((r) => Number.isFinite(r.volEdge));
   if (priced.length) {
-    take(
-      priced.reduce((a, b) => (b.volEdge > a.volEdge ? b : a)),
-      'лучшая цена риска',
-    );
+    const top = priced.reduce((a, b) => (b.volEdge > a.volEdge ? b : a));
+    take(top, priceTag(top.volEdge));
   }
   // Равномерный срез по фронту от осторожного к доходному; уже взятые точки
   // пропускаем, поэтому срез не вырождается в дубликаты.
@@ -1242,23 +1255,19 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
   // Режим определяется по живым офертам: если безубыточный выход есть только в
   // протухшей котировке, его на самом деле нет.
   const profitable = out.filter((r) => r.profitable && !isStale(r));
-  const exitMode = profitable.length > 0;
 
   // Осторожная оценка вероятности меняет направление вместе со смыслом
-  // срабатывания. Пока выход безубыточен, продажа — желанный исход, и
-  // осторожно предполагать меньшую из двух вероятностей. Как только выхода
-  // нет, срабатывание означает продажу в убыток, и осторожно предполагать
-  // большую. Режим «худшая из двух» брал максимум всегда и в первом случае
-  // выдавал желаемое за действительное.
+  // срабатывания — у каждой строки свой. Безубыточная строка (страйк не ниже
+  // порога): продажа — желанный исход, осторожно брать меньшую из двух
+  // вероятностей. Убыточная: срабатывание — продажа в убыток, осторожно брать
+  // большую. Прежде знак был один на весь блок (есть ли где-то безубыток), и
+  // убыточные строки рядом с безубыточными получали оптимистичную оценку.
+  // Глубина берётся из той же серии, что и вероятность.
   if (measure === 'max') {
     for (const r of out) {
-      // Историческая нога — нормированная серия, та же, что и на стороне Buy Low.
-      // Сырая описывает волатильность пятилетней давности, и брать её здесь
-      // означало бы мерить сегодняшний выход прошлым режимом рынка.
-      const b = r.pHistScaled ?? r.pHist;
-      if (r.pRN == null || b == null) continue;
-      const thin = r.histInfo != null && r.histInfo.independent < MIN_INDEPENDENT_WINDOWS;
-      r.pConv = thin ? r.pRN : exitMode ? Math.min(r.pRN, b) : Math.max(r.pRN, b);
+      const cautious = r.profitable ? 'min' : 'max';
+      r.pConv = pickProbability(r, measure, cautious);
+      r.depth = pickDepth(r, measure, cautious);
     }
   }
 
