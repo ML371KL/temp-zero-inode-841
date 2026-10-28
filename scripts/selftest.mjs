@@ -44,9 +44,10 @@ import {
   QUANTILE_LEVELS,
   MS_DAY,
 } from '../web/quant.js';
-import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr, pickDepth, pickProbability, markHorizonRisk } from '../web/model.js';
+import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr, pickDepth, pickProbability, markHorizonRisk, pickStrategyCards } from '../web/model.js';
 import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry, atmVarianceCurve, totalVariance, forwardVol, surfaceAt, smileSlope, volSlopeAt } from '../web/surface.js';
 import { readFileSync } from 'node:fs';
+import { computeFrame, createFrameState, runPathSlice, PATH_REFRESH_MS } from '../web/frame.js';
 import { gunzipSync } from 'node:zlib';
 import { fetchProducts, fetchQuote, fetchOptionTickers, fetchSpot } from '../web/feeds.js';
 
@@ -1559,6 +1560,152 @@ section('Форвард следует за живым спотом');
   near('срок экспирации пересчитан от текущего момента', later.expiries[0].T, (expiry - t0 - 2 * MS_DAY) / MS_DAY / 365, 1e-15);
   ok('исходный снимок не изменён', surface.expiries[0].T === T0);
   ok('прошедшая экспирация отброшена', surfaceAt(surface, expiry + 1).expiries.length === 0);
+}
+
+// ────────────────────────────────────────────── 8g2. Альтернативная ставка — точка фронта
+
+section('Альтернативная ставка — точка фронта при нулевом риске');
+{
+  const snap = JSON.parse(gunzipSync(readFileSync(new URL('../docs/snapshot.json.gz', import.meta.url))).toString());
+  const surface = buildSurface(snap.options, snap.now);
+  const history = new History(snap.klines);
+  // Высокая альтернативная ставка, чтобы на срезе нашлись оферты ниже неё.
+  const rf = 0.08;
+  const rows = buildRows({
+    products: snap.products, quotes: new Map(Object.entries(snap.quotes)), direction: 'BuyLow', now: snap.now, spot: snap.spot,
+    surface, history, riskFree: rf, riskFreeBtc: snap.riskFreeBtc, amount: 1000, vip: true, measure: 'max', horizonDays: 90,
+  });
+  const below = rows.filter((r) => r.aprEff < rf);
+  ok('на срезе есть оферты ниже альт. ставки', below.length > 5, `${below.length} из ${rows.length}`);
+  ok('они не на фронте', below.every((r) => !r.pareto));
+  ok('и не в карточках', pickBest({ rows, maxP: 1 }).every((r) => r.aprEff >= rf));
+  // Перебор: фронт = недоминируемые среди живых строк вместе с точкой «USDT»
+  // (P = 0, APR = альт. ставка); саму точку из ответа выкидываем.
+  const usdt = { aprEff: rf, pConv: 0, belowRiskFree: false };
+  const pool = [usdt, ...rows.filter((r) => Number.isFinite(r.aprEff) && Number.isFinite(r.pConv) && !r.belowRiskFree)];
+  const dom = (a) => pool.some((b) => b !== a && b.aprEff >= a.aprEff && b.pConv <= a.pConv && (b.aprEff > a.aprEff || b.pConv < a.pConv));
+  const brute = pool.filter((r) => r !== usdt && !dom(r));
+  ok('фронт совпадает с перебором вместе с точкой USDT', brute.length === rows.filter((r) => r.pareto).length && brute.every((r) => r.pareto), `перебор ${brute.length}`);
+
+  // Стратегия: строки дешевле USDT за горизонт (в геометрическом эквиваленте)
+  // не на фронте; «минимум риска» не хуже USDT.
+  // Ставка пониже, чтобы фронт стратегии не был пуст, но часть строк ушла под неё.
+  const H = 90;
+  const rfS = 0.005;
+  const res = computeStrategy({ rows, history, spot: snap.spot, horizonDays: H, riskFree: rfS });
+  const usdtGeo = (1 + (rfS * H) / 365) ** (365 / H) - 1;
+  near('база USDT — геометрический эквивалент альт. ставки за горизонт', res.usdtGeo, usdtGeo, 1e-15);
+  ok('на фронте стратегии нет строк дешевле USDT', res.rows.length > 0 && res.rows.every((r) => r.stratGeo >= usdtGeo), `фронт ${res.rows.length}`);
+  ok('такие строки на срезе есть и помечены', rows.some((r) => r.stratBelowUsdt) && rows.filter((r) => r.stratBelowUsdt).every((r) => r.stratGeo < usdtGeo));
+  const cards = pickStrategyCards(res.rows);
+  const safest = cards.find((r) => (r.bestTag ?? '').includes('минимум риска'));
+  ok('«минимум риска» не хуже USDT', safest && safest.stratGeo >= usdtGeo, safest ? `${safest.duration} ${safest.strike}: ${(safest.stratGeo * 100).toFixed(2)}%` : 'фронт пуст');
+  // Склейка ярлыков: одна строка — два ответа.
+  const one = [{ productId: 'a', stratRisk: 0.1, stratGeo: 0.2, volEdge: -0.01 }];
+  const c1 = pickStrategyCards(one);
+  ok('ярлыки стратегии склеиваются', c1.length === 1 && c1[0].bestTag.includes('минимум риска') && c1[0].bestTag.includes('максимум стоимости') && c1[0].bestTag.includes('наименьшая недоплата'), c1[0]?.bestTag);
+}
+
+// ────────────────────────────────────────────── 8h. Кадр панели и кэш траекторного слоя
+
+section('Кадр панели: траекторный слой не каждый кадр');
+{
+  const snap = JSON.parse(gunzipSync(readFileSync(new URL('../docs/snapshot.json.gz', import.meta.url))).toString());
+  const quotes = new Map(Object.entries(snap.quotes));
+  // Котировки живут, пока идут кадры.
+  for (const q of quotes.values()) for (const l of [...(q.buyLowPrice || []), ...(q.sellHighPrice || [])]) l.expiredAt = String(snap.now + 3_600_000);
+  const surface = buildSurface(snap.options, snap.now);
+  const history = new History(snap.klines);
+  const ui = { vip: true, amount: 1000, maxP: 0.15, measure: 'max', mode: 'strategy', horizon: '90', cagr: '', durations: [], convQty: '0.1' };
+  const inputAt = (t, extra = {}) => ({
+    products: snap.products,
+    quotes,
+    now: t,
+    spot: snap.spot,
+    surface,
+    optionsAt: snap.now,
+    history,
+    riskFree: 0.04,
+    riskFreeBtc: snap.riskFreeBtc,
+    stats: null,
+    ui,
+    basis: snap.spot * 1.03,
+    ...extra,
+  });
+  const fs = createFrameState();
+  const drain = () => {
+    let n = 0;
+    while (fs.job) {
+      runPathSlice(fs, 1e9);
+      n++;
+    }
+    return n;
+  };
+
+  const first = computeFrame(fs, inputAt(snap.now));
+  ok('первый кадр не готов, пока слой не посчитан', first.ready === false && fs.job != null);
+  drain();
+  const t1 = snap.now + 1000;
+  const f1 = computeFrame(fs, inputAt(t1));
+  ok('после фоновой задачи кадр готов', f1.ready === true && !fs.job);
+
+  // Эталон: те же строки, но траекторный слой посчитан напрямую, без кэша.
+  // Кэш построен по строкам момента snap.now, эталон — по ним же.
+  const direct = buildRows({
+    products: snap.products, quotes, direction: 'BuyLow', now: snap.now, spot: snap.spot, surface, history,
+    riskFree: 0.04, riskFreeBtc: snap.riskFreeBtc, amount: 1000, vip: true, measure: 'max', horizonDays: 90,
+  });
+  computeStrategy({ rows: direct, history, spot: snap.spot, horizonDays: 90, riskFree: 0.04 });
+  let diff = 0;
+  let compared = 0;
+  for (const r of f1.buy) {
+    const d = direct.find((x) => x.productId === r.productId && x.strike === r.strike);
+    if (!d?.strategy || !r.strategy) continue;
+    compared++;
+    diff = Math.max(diff, Math.abs(d.strategy.value - r.strategy.value), Math.abs(d.pHorizon - r.pHorizon), Math.abs(d.strategy.valueGeo - r.strategy.valueGeo));
+  }
+  ok('слой из кэша совпадает с прямым расчётом на тех же входах', compared > 50 && diff < 1e-12, `строк ${compared}, расхождение ${diff.toExponential(2)}`);
+
+  // Секунды идут — слой не пересчитывается, пока не прошло 10 с.
+  let jobs = fs.stats.jobs;
+  for (let k = 2; k < 9; k++) computeFrame(fs, inputAt(snap.now + k * 1000, { spot: snap.spot * (1 + k * 1e-4) }));
+  ok('в пределах 10 с слой не пересчитывается', fs.stats.jobs === jobs && !fs.job);
+  computeFrame(fs, inputAt(snap.now + PATH_REFRESH_MS + 1000));
+  ok('через 10 с ставится фоновый пересчёт', fs.stats.jobs === jobs + 1 && fs.job != null);
+  const fWhile = computeFrame(fs, inputAt(snap.now + PATH_REFRESH_MS + 2000));
+  ok('пока он идёт, кадр показывает прошлый результат', fWhile.ready === true && fWhile.buy.some((r) => r.strategy));
+  drain();
+
+  // Смена горизонта — входа, от которого слой зависит целиком: прошлый
+  // результат не годится, кадр не готов до конца задачи.
+  ui.horizon = '180';
+  const fH = computeFrame(fs, inputAt(snap.now + 13_000));
+  ok('смена горизонта: кадр не готов, ставится пересчёт', fH.ready === false && fs.job != null);
+  const slices = drain();
+  const fH2 = computeFrame(fs, inputAt(snap.now + 13_500));
+  ok('после пересчёта слой — на новом горизонте', fH2.ready && fH2.buy.some((r) => r.strategy && r.horizonInfo?.cycles > 0) && fH2.strategy?.horizonDays === 180, `кусков ${slices}`);
+  ui.horizon = '90';
+  computeFrame(fs, inputAt(snap.now + 14_000));
+  drain();
+
+  // Новый страйк в лестнице досчитывается сразу, без фоновой задачи.
+  const pid = snap.products.find((p) => p.status === 'Available' && !p.isVipProduct && Number(p.subscribeEndAt) > snap.now)?.productId;
+  const q0 = quotes.get(String(pid));
+  const extra = { ...q0.buyLowPrice[q0.buyLowPrice.length - 1] };
+  extra.selectPrice = String(Number(extra.selectPrice) - 250);
+  const quotes2 = new Map(quotes);
+  quotes2.set(String(pid), { ...q0, buyLowPrice: [...q0.buyLowPrice, extra] });
+  const syncBefore = fs.stats.syncRows;
+  const fNew = computeFrame(fs, inputAt(snap.now + 15_000, { quotes: quotes2 }));
+  const added = fNew.buy.find((r) => r.productId === pid && r.strike === Number(extra.selectPrice));
+  ok('новый страйк досчитан сразу и кадр готов', fNew.ready && added?.path != null && fs.stats.syncRows === syncBefore + 1);
+
+  // Кэш не растёт от кадра к кадру: в нём ровно строки последнего пересчёта.
+  for (let k = 0; k < 40; k++) computeFrame(fs, inputAt(snap.now + 16_000 + k * 1000, { spot: snap.spot * (1 + Math.sin(k) * 1e-3) }));
+  drain();
+  const sizes = Object.values(fs.sides).map((x) => x?.results.size ?? 0);
+  ok('кэш слоя не растёт с кадрами', sizes.every((n) => n <= 600), `строк в кэше по сторонам: ${sizes.join(', ')}`);
+  ok('кэш History не растёт с кадрами', history.cache.size < 30, `${history.cache.size}`);
 }
 
 // ────────────────────────────────────────────── 9. Разбор символов опционов

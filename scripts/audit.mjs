@@ -481,10 +481,13 @@ console.log('\n── 4. Поверхность волатильности');
 
 console.log('\n── 5. Фронт Парето: сверка с полным перебором');
 {
-  const usable = buy.filter((r) => Number.isFinite(r.pConv) && Number.isFinite(r.aprEff));
+  // Альтернативная ставка — точка фронта при нулевом риске: «держать USDT».
+  // Оферты ниже неё (или без σ из-за неё) доминированы бездействием.
+  const usdtPoint = { aprEff: riskFree ?? 0, pConv: 0 };
+  const usable = buy.filter((r) => Number.isFinite(r.pConv) && Number.isFinite(r.aprEff) && !r.belowRiskFree);
   // Доминирование: строго не хуже по обоим и строго лучше хотя бы по одному.
   const dominated = (a) =>
-    usable.some((b) => b !== a && b.aprEff >= a.aprEff && b.pConv <= a.pConv && (b.aprEff > a.aprEff || b.pConv < a.pConv));
+    [usdtPoint, ...usable].some((b) => b !== a && b.aprEff >= a.aprEff && b.pConv <= a.pConv && (b.aprEff > a.aprEff || b.pConv < a.pConv));
 
   const bruteFront = usable.filter((r) => !dominated(r));
   const modelFront = usable.filter((r) => r.pareto);
@@ -498,9 +501,9 @@ console.log('\n── 5. Фронт Парето: сверка с полным �
     missing.length ? `пропущено ${missing.length}: ${missing.slice(0, 3).map((r) => `${r.duration}/${r.strike}`).join(', ')}` : `${modelFront.length} строк`,
   );
 
-  // Каждая оферта вне фронта обязана быть побита кем-то из фронта.
+  // Каждая оферта вне фронта обязана быть побита кем-то из фронта или USDT.
   const uncovered = usable.filter(
-    (a) => !a.pareto && !modelFront.some((b) => b.aprEff >= a.aprEff && b.pConv <= a.pConv),
+    (a) => !a.pareto && ![usdtPoint, ...modelFront].some((b) => b.aprEff >= a.aprEff && b.pConv <= a.pConv),
   );
   ok('каждая оферта вне фронта побита офертой с фронта', uncovered.length === 0, `непокрытых ${uncovered.length}`);
 
@@ -1599,7 +1602,10 @@ console.log('\n── 14. Стратегия до выбранной даты');
 
   // Фронт стратегии — полным перебором.
   // Фронт строится по геометрическому: капитал складывается по периодам.
-  const usable = rows.filter((r) => Number.isFinite(r.stratGeo) && Number.isFinite(r.stratRisk));
+  // USDT — точка фронта при нулевом риске, в геометрическом эквиваленте за горизонт.
+  const usdtGeo = (1 + ((riskFree ?? 0) * HS) / YEAR_DAYS) ** (YEAR_DAYS / HS) - 1;
+  const usable = rows.filter((r) => Number.isFinite(r.stratGeo) && Number.isFinite(r.stratRisk) && r.stratGeo >= usdtGeo);
+  ok('на фронте стратегии нет строк дешевле USDT', res.rows.every((r) => r.stratGeo >= usdtGeo), `USDT ${pc(usdtGeo)}`);
   const dominated = (a) =>
     usable.some(
       (b) =>
@@ -1639,10 +1645,13 @@ console.log('\n── 14. Стратегия до выбранной даты');
     `       фронт подписки: ${durOf(single).join(' ')} (${single.length} строк) · ` +
       `фронт стратегии: ${durOf(res.rows).join(' ')} (${res.rows.length} строк) · общих ${same}`,
   );
-  ok(
-    'две постановки дают существенно разные ответы',
-    same < Math.min(single.length, res.rows.length) * 0.7,
-    `совпадает ${same} оферт из ${Math.min(single.length, res.rows.length)}`,
+  // Насколько расходятся ответы — свойство рынка, а не кода: при альт. ставке
+  // как точке фронта (строки дешевле USDT на фронт не идут) фронт стратегии на
+  // сыром ряду бывает из двух строк, и обе — на фронте подписки. Поэтому это
+  // информационная строка, а не проверка (как и плоская срочная структура).
+  console.log(
+    `  инфо две постановки: совпадает ${same} оферт из ${Math.min(single.length, res.rows.length)} ` +
+      `(${same < Math.min(single.length, res.rows.length) * 0.7 ? 'ответы существенно разные' : 'ответы близки'})`,
   );
 }
 

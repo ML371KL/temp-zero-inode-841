@@ -44,6 +44,17 @@ import { volAt, volSlopeAt, forwardAt, hasExactExpiry, forwardVol, surfaceAt } f
 export const OPTIONS_MAX_AGE_MS = 180_000;
 
 /**
+ * Оферта хуже бездействия: её эффективный APR ниже альтернативной ставки, или
+ * за свой срок она платит меньше этой ставки с учётом начисления (σ оферты
+ * нет). Второе — то же сравнение со сложным процентом за срок блокировки; оба
+ * признака берутся, чтобы строка не оказалась на фронте с пометкой «ниже альт.
+ * ставки».
+ */
+export function belowAltRate(r, riskFree) {
+  return Boolean(r?.belowRiskFree) || (Number.isFinite(riskFree) && Number.isFinite(r?.aprEff) && r.aprEff < riskFree);
+}
+
+/**
  * Строка непригодна для рекомендаций: истекла её котировка или устарел снимок
  * опционов, на котором она посчитана. Одна проверка на все места отбора.
  */
@@ -1239,6 +1250,9 @@ export function pathLayer(rows, { history, spot, horizonDays, riskFree = 0 }) {
     // Ключ строки — входы слоя и сама оферта: копия строки с другим страйком не
     // должна унаследовать чужой прогон.
     const rowKey = `${key}|${r.productId}|${r.direction}|${r.strike}|${r.apy}|${r.timing?.tauDays}`;
+    // Прогон, приложенный панелью из своего кэша (frame.js), не пересчитывается:
+    // там он обновляется не каждый кадр, а раз в несколько секунд.
+    if (r.pathPinned && r.path !== undefined) continue;
     if (r.pathKey === rowKey && r.path !== undefined) continue;
     r.pathKey = rowKey;
     r.path = null;
@@ -1340,10 +1354,14 @@ export function buildRows({
   // Риск за горизонт нужен обеим сторонам, но на стороне Sell High его считает
   // analyzeSellHigh вместе с остальной механикой выхода — здесь не дублируем.
   if (horizonDays > 0 && history && direction === 'BuyLow' && paths) markHorizonRisk(rows, history, spot, horizonDays, riskFree ?? 0);
+  // Альтернативная ставка — точка фронта при нулевом риске: оферту, которая
+  // платит меньше неё, доминирует простое «держать USDT». Такая строка не идёт
+  // ни на фронт, ни в карточки, а в полной таблице приглушена.
+  for (const r of rows) r.belowAlt = belowAltRate(r, riskFree);
   // Фронт строится только по живым котировкам: он питает и карточки, и якоря,
   // и график, поэтому протухшая строка, попав на него, расползлась бы по всем
   // рекомендательным блокам сразу. В полных таблицах она остаётся, приглушённая.
-  const fresh = rows.filter((r) => !isStale(r));
+  const fresh = rows.filter((r) => !isStale(r) && !r.belowAlt);
   const front = paretoFront(fresh, 'aprEff', 'pConv');
   for (const r of rows) r.pareto = front.has(r);
   markLadderInversions(rows);
@@ -1400,7 +1418,7 @@ export function priceTag(value, money = false) {
  * набор, который нельзя улучшить по доходности, не увеличив риск.
  */
 export function pickBest({ rows, maxP, limit = 6 }) {
-  const eligible = rows.filter((r) => !isStale(r) && r.pConv != null && r.pConv <= maxP && r.aprEff != null);
+  const eligible = rows.filter((r) => !isStale(r) && !r.belowAlt && r.pConv != null && r.pConv <= maxP && r.aprEff != null);
   const front = paretoFront(eligible, 'aprEff', 'pConv');
   // Только фронт и ничего кроме фронта. Добор доминируемых оферт «для полноты»
   // противоречил самому назначению блока: показанная там оферта заведомо хуже
@@ -1453,6 +1471,43 @@ export function pickBest({ rows, maxP, limit = 6 }) {
     }
   }
   return out.sort((a, b) => a.pConv - b.pConv).slice(0, limit);
+}
+
+/**
+ * Карточки режима стратегии: самый осторожный, самый доходный, наименьшая
+ * недоплата (или лучшая цена риска) и равномерный срез фронта. Одна оферта
+ * может отвечать на два вопроса — тогда карточка одна, а ярлыки склеиваются.
+ * Берутся только строки фронта: строки дешевле USDT на него не попадают.
+ */
+export function pickStrategyCards(frontRows, limit = 6) {
+  const byRisk = [...frontRows].sort((a, b) => a.stratRisk - b.stratRisk);
+  for (const r of byRisk) r.bestTag = null;
+  const picks = [];
+  const take = (r, tag) => {
+    if (!r) return;
+    if (picks.includes(r)) {
+      if (tag && r.bestTag && !r.bestTag.includes(tag)) r.bestTag += ` · ${tag}`;
+      else if (tag && !r.bestTag) r.bestTag = tag;
+      return;
+    }
+    r.bestTag = tag;
+    picks.push(r);
+  };
+  if (!byRisk.length) return [];
+  take(byRisk[0], 'минимум риска');
+  take(
+    byRisk.reduce((a, b) => (b.stratGeo > a.stratGeo ? b : a)),
+    'максимум стоимости',
+  );
+  const priced = byRisk.filter((r) => Number.isFinite(r.volEdge));
+  if (priced.length) {
+    const top = priced.reduce((a, b) => (b.volEdge > a.volEdge ? b : a));
+    take(top, priceTag(top.volEdge));
+  }
+  for (let k = 0; picks.length < limit && k < byRisk.length; k++) {
+    take(byRisk[Math.round((k * (byRisk.length - 1)) / (limit - 1))], null);
+  }
+  return picks.sort((a, b) => a.stratRisk - b.stratRisk);
 }
 
 /**
@@ -1966,7 +2021,15 @@ export function computeStrategy({ rows, history, spot, horizonDays, riskFree = 0
   // Фронт стратегии — рекомендация, поэтому строится только по живым котировкам.
   // Ось доходности — геометрическая: капитал складывается по периодам, а не
   // усредняется по эпизодам.
-  const usable = rows.filter((r) => !isStale(r) && Number.isFinite(r.stratGeo) && Number.isFinite(r.stratRisk));
+  // Держать USDT — точка фронта при нулевом риске: та же альтернативная ставка
+  // в геометрическом эквиваленте за горизонт. Строка дешевле неё доминирована
+  // бездействием и на фронт и в карточки не идёт; «минимум риска» поэтому не
+  // может оказаться хуже USDT.
+  const usdtGeo = annualize(1 + (riskFree * horizonDays) / YEAR_DAYS, horizonDays);
+  for (const r of rows) r.stratBelowUsdt = Number.isFinite(r.stratGeo) && usdtGeo != null && r.stratGeo < usdtGeo;
+  const usable = rows.filter(
+    (r) => !isStale(r) && !r.stratBelowUsdt && Number.isFinite(r.stratGeo) && Number.isFinite(r.stratRisk),
+  );
   const front = paretoFront(usable, 'stratGeo', 'stratRisk');
   for (const r of usable) r.stratPareto = front.has(r);
 
@@ -1976,6 +2039,7 @@ export function computeStrategy({ rows, history, spot, horizonDays, riskFree = 0
     horizonDays,
     rows: usable.filter((r) => front.has(r)).sort((a, b) => a.stratRisk - b.stratRisk),
     usdtAnnual: riskFree,
+    usdtGeo,
     btcAnnual: hold ? annualize(hold.gross, horizonDays) : null,
     btcAnnualMedian: hold ? annualize(hold.grossMedian, horizonDays) : null,
     btcAnnualGeo: hold ? annualize(hold.grossGeo, horizonDays) : null,

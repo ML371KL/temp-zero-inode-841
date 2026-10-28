@@ -14,21 +14,13 @@ import {
   SpotStream,
   normalizeWsOffer,
 } from './feeds.js';
-import { buildSurface, atmVarianceCurve, forwardVol, surfaceAt } from './surface.js';
+import { buildSurface, forwardVol } from './surface.js';
+import { computeFrame, createFrameState, runPathSlice } from './frame.js';
 import { Archive } from './archive.js';
 import {
   History,
-  buildRows,
-  pickBest,
-  pickBestSell,
-  analyzeSellHigh,
-  exitFrontier,
-  frontierWithMargins,
   pickAnchors,
-  pickExitAnchors,
   computeStrategy,
-  sampleCagr,
-  priceTag,
   isStale,
   OPTIONS_MAX_AGE_MS,
   MIN_INDEPENDENT_WINDOWS,
@@ -67,6 +59,9 @@ const state = {
   errors: [],
   ladderProduct: null,
 };
+
+// Кэш траекторного слоя и фоновая задача его пересчёта (frame.js).
+const frameState = createFrameState();
 
 const PREF_KEY = 'dual-assets-radar-ui';
 const ui = {
@@ -336,39 +331,6 @@ function pushError(msg) {
 
 const horizonDays = () => Number(ui.horizon) || 90;
 
-/**
- * Предпосылки о рынке, которые панель больше не принимает молча.
- *
- * Рост центральной линии и срочная структура волатильности — это взгляд на
- * будущее, а не факт из прошлого. Раньше траекторный слой брал и то и другое
- * из пятилетней выборки: дрейф 13% годовых и волатильность 52.5%, тогда как
- * рынок опционов сегодня оценивает ближайшую неделю в 33%, а год в 42%.
- * Теперь оба параметра явные, с разумными умолчаниями и с полями ввода.
- */
-function applyScenario() {
-  const H = horizonDays();
-  if (!state.history) return null;
-  // Горизонта у оценки дрейфа больше нет: она одна на всю историю. Прежде окно
-  // усреднения равнялось горизонту, и переключение 90 → 365 меняло предпосылку
-  // о рынке (10.2% → 18.9%), а не только срок расчёта.
-  const auto = sampleCagr(state.history);
-  const typed = ui.cagr === '' ? null : Number(ui.cagr) / 100;
-  // Ниже −95% годовых считать нечего: цена обращается в ноль, и весь расчёт
-  // вырождается. Сверху ограничиваем десятикратным ростом — дальше это уже не
-  // предпосылка, а опечатка.
-  const cagr = Number.isFinite(typed) ? Math.min(Math.max(typed, -0.95), 10) : auto;
-  state.varCurve = state.surface ? atmVarianceCurve(surfaceAt(state.surface, Date.now())) : null;
-  // Ключ сценария включает момент пересборки поверхности: кривая живёт минуту,
-  // и без этого траектории остались бы на позавчерашней волатильности.
-  state.history.useScenario({
-    cagr,
-    curve: state.varCurve,
-    id: `${state.lastOptionsAt}|${state.varCurve?.points.length ?? 0}`,
-  });
-  state.scenarioInfo = { cagr, auto, typed: Number.isFinite(typed) };
-  return state.scenarioInfo;
-}
-
 /** Альтернативная стоимость доллара на срок вашего горизонта. */
 function opportunityRate() {
   const typed = ui.rfOpp === '' ? null : Number(ui.rfOpp) / 100;
@@ -377,33 +339,58 @@ function opportunityRate() {
   return t ? t.rate : (state.bybitUsdt ?? 0);
 }
 
-function currentRows(direction) {
-  if (!state.spot || !state.products.length) return [];
-  const rows = buildRows({
+/**
+ * Кадр: все вычисления без DOM — в frame.js. Предпосылки о рынке (рост BTC и
+ * кривая волатильности) там же; траекторный слой — из кэша, который
+ * обновляется фоновой задачей (runPathJob).
+ */
+function computeCurrentFrame() {
+  const info = conversionBasis();
+  const frame = computeFrame(frameState, {
     products: state.products,
     quotes: state.quotes,
-    direction,
     now: Date.now(),
     spot: state.spot,
     surface: state.surface,
+    optionsAt: state.lastOptionsAt,
     history: state.history,
     riskFree: state.riskFree,
     riskFreeBtc: state.riskFreeBtc,
-    amount: direction === 'BuyLow' ? Number(ui.amount) || 0 : Number(ui.convQty) || 0,
-    vip: ui.vip,
-    measure: ui.measure,
     stats: state.stats,
-    horizonDays: horizonDays(),
+    ui,
+    basis: info?.basis ?? null,
   });
-  const allowed = new Set(ui.durations);
-  if (!allowed.size) return rows;
-  // Фильтр по срокам не должен терять счётчик протухших: он висит свойством на
-  // массиве, а filter отдаёт голый новый массив.
-  const kept = rows.filter((r) => allowed.has(r.duration));
-  kept.staleCount = kept.filter((r) => r.quoteStale).length;
-  kept.optionsStale = rows.optionsStale;
-  kept.optionsAgeMs = rows.optionsAgeMs;
-  return kept;
+  state.scenarioInfo = frame.scenarioInfo;
+  state.varCurve = frame.varCurve;
+  if (frameState.job) schedulePathJob();
+  return frame;
+}
+
+/**
+ * Фоновый пересчёт траекторного слоя — кусками через setTimeout, вне кадра.
+ * Закончив, задача перерисовывает панель.
+ */
+let pathJobScheduled = false;
+function schedulePathJob() {
+  if (pathJobScheduled) return;
+  pathJobScheduled = true;
+  setTimeout(function step() {
+    let done = false;
+    try {
+      done = runPathSlice(frameState);
+    } catch (e) {
+      pushError(`траектории: ${e.message}`);
+      console.error('траектории', e);
+      frameState.job = null;
+      done = true;
+    }
+    if (!done) {
+      setTimeout(step, 0);
+      return;
+    }
+    pathJobScheduled = false;
+    render();
+  }, 0);
 }
 
 function sortRows(rows) {
@@ -764,8 +751,9 @@ function syncCollapse() {
   }
 }
 
-function renderBuy(rows) {
-  const best = pickBest({ rows, maxP: ui.maxP });
+function renderBuy(frame) {
+  const rows = frame.buy;
+  const best = frame.best;
   if (best.length) {
     $('best').innerHTML = best.map(cardFor).join('');
   } else {
@@ -791,13 +779,21 @@ function renderBuy(rows) {
       ? ` · <span class="flag">⚠</span> ${laddered}: у этих оферт в той же лестнице есть страйк дальше от рынка, ` +
         'который платит не меньше — то есть строго безопаснее и не хуже по доходности'
       : '');
+  // Приглушены протухшие и те, что хуже бездействия: в режиме подписки — ниже
+  // альт. ставки, в режиме стратегии — дешевле USDT за горизонт.
+  const strategyMode = ui.mode === 'strategy';
   renderLimitedTable('buy', $('buy-table'), BUY_COLUMNS, sorted, (r) =>
-    [r.pareto ? 'pareto' : '', isStale(r) ? 'dim' : ''].filter(Boolean).join(' '),
+    [
+      r.pareto ? 'pareto' : '',
+      isStale(r) || (strategyMode ? r.stratBelowUsdt : r.belowAlt) ? 'dim' : '',
+    ]
+      .filter(Boolean)
+      .join(' '),
   );
-  renderAnchors(rows);
-  renderFrontier(rows);
+  renderAnchors(frame.anchors);
+  renderFrontier(frame);
 
-  const strategy = ui.mode === 'strategy' ? renderStrategy(rows) : null;
+  const strategy = strategyMode ? renderStrategy(frame) : null;
   const durations = [...new Set(state.products.map((p) => p.duration))].sort((a, b) => durationDays(a) - durationDays(b));
   if (strategy) {
     $('scatter-title').textContent = 'Геометрическая стоимость стратегии против риска остаться в BTC';
@@ -836,9 +832,9 @@ function renderBuy(rows) {
  *
  * Возвращает результат расчёта, чтобы вызывающий знал, чем рисовать рассеяние.
  */
-function renderStrategy(rows) {
-  const H = horizonDays();
-  const res = computeStrategy({ rows, history: state.history, spot: state.spot, horizonDays: H, riskFree: state.riskFree ?? 0 });
+function renderStrategy(frame) {
+  const H = frame.horizonDays;
+  const res = frame.strategy;
   const note = $('strategy-note');
   const hint = $('strategy-hint');
   hint.innerHTML =
@@ -870,7 +866,8 @@ function renderStrategy(rows) {
     `<b>${fmtPct(near, 0)}</b>, а вторую половину горизонта в <b>${fmtPct(far, 0)}</b>, тогда как ` +
     `реализованная за пять лет — ${fmtPct(sc?.histVol, 0)}. Каждый участок траектории масштабируется под ту ` +
     `изменчивость, которую рынок ждёт именно до этой даты, и все оферты считаются на одном наборе траекторий.<br />` +
-    `<b>Базы сравнения на тех же траекториях:</b> держать USDT — <b>${fmtPct(res.usdtAnnual, 2)}</b> годовых, ` +
+    `<b>Базы сравнения на тех же траекториях:</b> держать USDT — <b>${fmtPct(res.usdtGeo, 2)}</b> геометрических ` +
+    `(строки дешевле на фронт не попадают), ` +
     `держать BTC — <b>${fmtSigned(res.btcAnnualGeo, 1)}</b> геометрических, <b>${fmtSigned(res.btcAnnual, 1)}</b> в среднем, ` +
     `<b>${fmtSigned(res.btcAnnualMedian, 1)}</b> по медиане. Фронт строится по <b>геометрическому</b>: именно оно ` +
     `складывается по периодам, если политику повторять. Среднее отвечает на другой вопрос — сколько даст один ` +
@@ -882,38 +879,10 @@ function renderStrategy(rows) {
     ` Лестница ставок — сегодняшняя, как функция удаления страйка от цены; обратная нога Sell High после ` +
     `конвертации консервативно не учитывается.`;
 
-  // Карточки: самый осторожный, самый доходный и лучший по цене риска.
+  // Карточки отобраны в model.js (pickStrategyCards): самый осторожный, самый
+  // доходный, наименьшая недоплата и равномерный срез фронта.
   const byRisk = [...res.rows].sort((a, b) => a.stratRisk - b.stratRisk);
-  const picks = [];
-  // Одна оферта может отвечать на два вопроса сразу — тогда карточка одна, а
-  // ярлыки склеиваются, как в pickBest: вторая причина не должна пропадать.
-  const take = (r, tag) => {
-    if (!r) return;
-    if (picks.includes(r)) {
-      if (tag && r.bestTag && !r.bestTag.includes(tag)) r.bestTag += ` · ${tag}`;
-      else if (tag && !r.bestTag) r.bestTag = tag;
-      return;
-    }
-    r.bestTag = tag;
-    picks.push(r);
-  };
-  take(byRisk[0], 'минимум риска');
-  take(
-    byRisk.reduce((a, b) => (b.stratGeo > a.stratGeo ? b : a)),
-    'максимум стоимости',
-  );
-  const priced = byRisk.filter((r) => Number.isFinite(r.volEdge));
-  if (priced.length) {
-    const top = priced.reduce((a, b) => (b.volEdge > a.volEdge ? b : a));
-    take(top, priceTag(top.volEdge));
-  }
-  for (let k = 0; picks.length < 6 && k < byRisk.length; k++) {
-    take(byRisk[Math.round((k * (byRisk.length - 1)) / 5)], null);
-  }
-  $('strategy-best').innerHTML = picks
-    .sort((a, b) => a.stratRisk - b.stratRisk)
-    .map(strategyCardFor)
-    .join('');
+  $('strategy-best').innerHTML = (frame.strategyCards ?? []).map(strategyCardFor).join('');
 
   renderLimitedTable('strategy', $('strategy-table'), STRATEGY_COLUMNS, byRisk);
   return res;
@@ -1015,8 +984,7 @@ const ANCHOR_META = {
   },
 };
 
-function renderAnchors(rows) {
-  const anchors = pickAnchors(rows);
+function renderAnchors(anchors) {
   const box = $('anchors');
   const cards = [];
   for (const [id, meta] of Object.entries(ANCHOR_META)) {
@@ -1046,13 +1014,13 @@ function renderAnchors(rows) {
   box.innerHTML = cards.join('') || '<div class="empty">нет данных для оценки</div>';
 }
 
-function renderFrontier(rows) {
-  const rf = state.riskFree ?? 0;
-  const steps = frontierWithMargins(rows, rf);
-  // Оферта ниже безрисковой ставки формально на фронте, но экономически
-  // бессмысленна: тот же результат даёт гибкий депозит без всякого риска.
+function renderFrontier(frame) {
+  const rf = frame.riskFree ?? 0;
+  const steps = frame.frontier;
+  // Оферты ниже альтернативной ставки на фронт не допускаются вовсе: их
+  // доминирует «держать USDT» — точка фронта при нулевом риске.
   renderLimitedTable('frontier', $('frontier-table'), FRONTIER_COLUMNS, steps, (r) =>
-    [r.aprEff < rf ? 'dim' : '', r.pConv <= ui.maxP ? 'within' : ''].filter(Boolean).join(' '),
+    r.pConv <= ui.maxP ? 'within' : '',
   );
 
   const note = $('frontier-note');
@@ -1074,12 +1042,10 @@ function renderFrontier(rows) {
   const upper = slope(steps[mid], steps[steps.length - 1]);
   const rising = lower != null && upper != null && upper > lower;
   const withinCount = steps.filter((r) => r.pConv <= ui.maxP).length;
-  const belowRf = steps.filter((r) => r.aprEff < (state.riskFree ?? 0)).length;
+  const belowRf = frame.buy.filter((r) => r.belowAlt && !isStale(r)).length;
   note.innerHTML =
-    `Строк на фронте: <b>${steps.length}</b>, внутри вашего порога ${fmtPct(ui.maxP, 1)} — <b>${withinCount}</b> (подсвечены)` +
-    (belowRf
-      ? `, из них <b>${belowRf}</b> платят меньше альт. ставки ${fmtPct(state.riskFree ?? 0, 2)} и приглушены: риск там есть, а смысла нет. `
-      : '. ') +
+    `Строк на фронте: <b>${steps.length}</b>, внутри вашего порога ${fmtPct(ui.maxP, 1)} — <b>${withinCount}</b> (подсвечены). ` +
+    (belowRf ? `Ещё <b>${belowRf}</b> оферт платят меньше альт. ставки ${fmtPct(rf, 2)} — на фронт не допускаются. ` : '') +
     (rising
       ? 'Фронт сейчас выпуклый: отдача на риск с ростом вероятности не падает, а растёт. ' +
         'Это значит, что «оптимальной середины» не существует — любое постоянное отношение к риску ' +
@@ -1112,10 +1078,9 @@ const EXIT_ANCHOR_META = {
  * выйти. Но два содержательных ответа этому правилу не подчиняются, потому что
  * считают обе ветви сразу, а фронт — только ветвь выхода. Их место здесь.
  */
-function renderExitAnchors(analyzed) {
+function renderExitAnchors(anchors) {
   const box = $('exit-anchors');
   if (!box) return;
-  const anchors = pickExitAnchors(analyzed);
   const H = Number(ui.horizon) || 90;
   const cards = [];
   for (const [id, meta] of Object.entries(EXIT_ANCHOR_META)) {
@@ -1144,10 +1109,11 @@ function renderExitAnchors(analyzed) {
 }
 
 /** Полный фронт выхода: все неулучшаемые оферты и цена каждого шага по нему. */
-function renderExitFrontier(analyzed) {
-  const steps = exitFrontier(analyzed);
-  const H = Number(ui.horizon) || 90;
-  renderExitAnchors(analyzed);
+function renderExitFrontier(frame) {
+  const analyzed = frame.analyzed;
+  const steps = frame.exitFront;
+  const H = frame.horizonDays;
+  renderExitAnchors(frame.exitAnchors);
   renderLimitedTable('exitfront', $('exit-front-table'), EXIT_FRONT_COLUMNS, steps, (r) =>
     r.laddered ? 'dim' : '',
   );
@@ -1193,12 +1159,12 @@ function renderExitFrontier(analyzed) {
       процентного пункта шанса выйти.`;
 }
 
-function renderSell(rows) {
+function renderSell(frame) {
   const info = conversionBasis();
   const line = $('basis-line');
   const qty = Number(ui.convQty) || 0;
 
-  if (!info) {
+  if (!info || !frame.analyzed) {
     line.innerHTML =
       'Введите цену покупки BTC — появится себестоимость, порог безубытка и подобранные оферты Sell High.';
     $('best-sell').innerHTML = '';
@@ -1207,16 +1173,7 @@ function renderSell(rows) {
     return;
   }
 
-  const analyzed = analyzeSellHigh({
-    rows,
-    basis: info.basis,
-    qty,
-    spot: state.spot,
-    history: state.history,
-    measure: ui.measure,
-    horizonDays: horizonDays(),
-    riskFree: state.riskFree ?? 0,
-  });
+  const analyzed = frame.analyzed;
   const profitable = analyzed.filter((r) => r.profitable);
   // Разрыв считаем относительно себестоимости, а не наоборот: «рынок на 68%
   // ниже себестоимости» — это утверждение о том, сколько недостаёт до выхода,
@@ -1228,7 +1185,7 @@ function renderSell(rows) {
   // безубыточным, карточки — равномерным срезом фронта. Совпадение получалось
   // случайно и на живых данных регулярно не получалось. Теперь расхождение
   // невозможно по построению, а не по рассуждению.
-  const best = pickBestSell({ rows: analyzed });
+  const best = frame.bestSell;
   const headline =
     best.mode === 'exit' ? best.rows.find((r) => (r.bestTag ?? '').includes('быстрее всего')) : null;
 
@@ -1266,7 +1223,7 @@ function renderSell(rows) {
       );
     })()}`;
 
-  renderExitFrontier(analyzed);
+  renderExitFrontier(frame);
 
   $('best-sell-head').innerHTML =
     best.mode === 'exit'
@@ -1420,17 +1377,23 @@ function render() {
       }
     };
 
-    step('предпосылки', () => {
+    step('альтернативная ставка', () => {
       state.riskFree = opportunityRate();
-      applyScenario();
     });
-    const buy = step('расчёт Buy Low', () => currentRows('BuyLow')) || [];
-    const sell = step('расчёт Sell High', () => currentRows('SellHigh')) || [];
+    const frame = step('расчёт', computeCurrentFrame);
+    const buy = frame?.buy ?? [];
+    const sell = frame?.sell ?? [];
     // Свежесть считается до шапки: кружок в ней показывает именно её.
     step('свежесть котировок', () => renderStale(buy, sell));
     step('шапка', renderHead);
-    step('блок Buy Low', () => renderBuy(buy));
-    step('блок Sell High', () => renderSell(sell));
+    // Блоки рисуются, только когда траекторный слой готов для текущих входов.
+    // Пока фоновая задача его считает (после смены горизонта, сценария или
+    // состава строк), на экране остаётся прошлый кадр: ни мигания, ни чисел от
+    // чужого горизонта. Задача сама перерисует панель, когда закончит.
+    if (frame?.ready) {
+      step('блок Buy Low', () => renderBuy(frame));
+      step('блок Sell High', () => renderSell(frame));
+    }
 
     // Архив пополняется тем же срезом, который только что показан.
     // Сама запись не чаще раза в минуту — интервал держит сам архив.
