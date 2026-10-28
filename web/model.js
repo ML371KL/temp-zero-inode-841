@@ -1303,7 +1303,9 @@ export function markHorizonRisk(rows, history, spot, horizonDays, riskFree = 0) 
   for (const r of rows) {
     if (!r.path) {
       // До сеттлмента дальше, чем весь горизонт: оферта не рассчитается ни разу.
-      r.pHorizon = 0;
+      // Риск у неё наступает после горизонта, и «0% за H дней» читался бы как
+      // безопасность, поэтому числа нет.
+      r.pHorizon = null;
       r.horizonInfo = { cycles: 0, n: 0, independent: 0, series: null };
       continue;
     }
@@ -1526,6 +1528,14 @@ export function pickStrategyCards(frontRows, limit = 6) {
 }
 
 /**
+ * Посчитан ли у строк Sell High траекторный слой: тогда у каждой есть
+ * horizonInfo (у не рассчитывающихся за горизонт — с нулём циклов).
+ */
+function hasHorizonLayer(rows) {
+  return rows.some((r) => r.horizonInfo != null);
+}
+
+/**
  * Подбор Sell High под конкретную позицию в BTC.
  * basis — фактическая цена, по которой BTC попал на баланс. Порог безубытка
  * ниже себестоимости на величину начисляемого процента.
@@ -1591,8 +1601,8 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
         exitSpeed = ((profitAtExit ?? 0) * pExitHorizon * YEAR_DAYS) / horizonDays;
       } else {
         // До первого сеттлмента дальше, чем весь горизонт: оферта не успевает
-        // рассчитаться ни разу, и шанс выхода равен нулю.
-        pExitHorizon = 0;
+        // рассчитаться ни разу. Числа за горизонт у неё нет — ни шанса выйти, ни
+        // риска продажи: всё это наступает после горизонта.
         horizonInfo = { cycles: 0, n: 0, independent: 0, series: null };
       }
     }
@@ -1661,7 +1671,9 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
   // недоминируемых оферт с выручкой от долей процента до 36%.
   // Фронт строится по шансу выйти за общий горизонт, а не по вероятности за
   // цикл: только так оферты разных сроков сравнимы между собой.
-  const axis = profitable.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
+  // Есть траекторный слой — ось за горизонт; по одной вероятности за цикл
+  // только пока истории нет.
+  const axis = hasHorizonLayer(out) ? 'pExitHorizon' : 'pConv';
   // Ось прибыли — накопленная к фактическому циклу выхода, а не за один цикл.
   for (const r of out) r.profitAxis = r.profitAtExit ?? r.profitPct;
   // Оферты с нулевым шансом выйти за горизонт исключаются до построения фронта.
@@ -1830,7 +1842,7 @@ export function pickExitAnchors(rows) {
   // Доминирование считается по той же паре, что и фронт: здесь обе величины
   // максимизируются, поэтому «побит» означает «есть оферта не хуже по прибыли и
   // не хуже по шансу выйти, и хотя бы по одной строго лучше».
-  const axis = pool.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
+  const axis = hasHorizonLayer(rows) ? 'pExitHorizon' : 'pConv';
   const usable = pool.filter((r) => Number.isFinite(r.profitAxis) && Number.isFinite(r[axis]));
   const dominatorOf = (r) => {
     if (!r || !Number.isFinite(r.profitAxis) || !Number.isFinite(r[axis])) return null;
@@ -1871,15 +1883,26 @@ export function pickExitAnchors(rows) {
  * скорости выхода, 19-я строка фронта из 27), ни лучший типичный исход (13-я).
  * Та же схема уже работает в pickBest на стороне Buy Low.
  *
- * Если рынок ушёл ниже себестоимости и безубыточного выхода нет, знак риска
- * переворачивается обратно: сработавший страйк означает принудительную продажу
- * BTC дешевле, чем он был куплен. Поэтому здесь нужен фронт по максимуму ставки
- * при минимуме вероятности срабатывания — заработок в BTC без фиксации убытка.
+ * Если рынок ушёл ниже себестоимости и безубыточного выхода за горизонт нет,
+ * знак риска переворачивается обратно: сработавший страйк означает
+ * принудительную продажу BTC дешевле, чем он был куплен. Поэтому здесь нужен
+ * фронт по максимуму ставки при минимуме вероятности срабатывания — заработок в
+ * BTC без фиксации убытка.
  */
 export function pickBestSell({ rows, limit = 6 }) {
   // Подписи сбрасываем на всём наборе, а не только на отобранных: при повторном
   // вызове строка может выпасть из отбора и унести с собой ярлык прошлого расчёта.
-  for (const r of rows) r.bestTag = null;
+  for (const r of rows) {
+    r.bestTag = null;
+    r.waitPareto = false;
+  }
+  // С траекторным слоем обе оси считаются за горизонт, и в отбор идут только
+  // оферты, которые рассчитаются внутри него хотя бы раз. Без этого оферта с
+  // первым сеттлментом за горизонтом получала «0% риска» и становилась
+  // «минимумом риска», хотя на своём сеттлменте продаётся в убыток с
+  // вероятностью около половины.
+  const layered = hasHorizonLayer(rows);
+  const settles = (r) => !layered || r.horizonInfo?.cycles > 0;
 
   const out = [];
   const take = (r, tag) => {
@@ -1924,13 +1947,17 @@ export function pickBestSell({ rows, limit = 6 }) {
     }
   };
 
-  const profitable = rows.filter((r) => r.profitable && !isStale(r) && Number.isFinite(r.profitAxis));
-  if (profitable.length) {
-    // Сортируем по вероятности продажи от большей к меньшей: сверху самый
-    // реалистичный выход, ниже — всё более дорогие, но всё менее вероятные.
-    const key = profitable.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
-    const front = profitable.filter((r) => r.sellPareto).sort((a, b) => b[key] - a[key]);
-    if (!front.length) return { mode: 'exit', axis: key, rows: [] };
+  // Режим выхода — только когда безубыточная оферта может вывести в USDT за
+  // горизонт (шанс выйти больше нуля). Безубыточная 239d при горизонте 90
+  // включала режим выхода с пустым блоком, и режим ожидания не показывался.
+  const profitable = rows.filter(
+    (r) => r.profitable && !isStale(r) && Number.isFinite(r.profitAxis) && (!layered || r.pExitHorizon > 0),
+  );
+  // Сортируем по вероятности продажи от большей к меньшей: сверху самый
+  // реалистичный выход, ниже — всё более дорогие, но всё менее вероятные.
+  const key = layered ? 'pExitHorizon' : 'pConv';
+  const front = profitable.filter((r) => r.sellPareto).sort((a, b) => b[key] - a[key]);
+  if (front.length) {
     const maxBy = (k) => {
       const p = front.filter((r) => Number.isFinite(r[k]));
       return p.length ? p.reduce((a, b) => (b[k] > a[k] ? b : a)) : null;
@@ -1947,10 +1974,10 @@ export function pickBestSell({ rows, limit = 6 }) {
   // вероятности за цикл у пятидневного и у 237-дневного продукта сравнивались бы
   // напрямую, а это величины разной размерности. Здесь срабатывание страйка —
   // принудительная продажа ниже себестоимости, поэтому шанс минимизируется.
-  const axis = rows.some((r) => Number.isFinite(r.pExitHorizon)) ? 'pExitHorizon' : 'pConv';
-  const usable = rows.filter((r) => !isStale(r) && Number.isFinite(r.aprEff) && Number.isFinite(r[axis]));
-  const front = paretoFront(usable, 'aprEff', axis, true);
-  const ranked = usable.filter((r) => front.has(r)).sort((a, b) => a[axis] - b[axis]);
+  const axis = key;
+  const usable = rows.filter((r) => !isStale(r) && settles(r) && Number.isFinite(r.aprEff) && Number.isFinite(r[axis]));
+  const waitFront = paretoFront(usable, 'aprEff', axis, true);
+  const ranked = usable.filter((r) => waitFront.has(r)).sort((a, b) => a[axis] - b[axis]);
   for (const r of ranked) r.waitPareto = true;
   // Тот же дефект жил и здесь, только в другом виде: прежний отбор брал шесть
   // первых строк от самого осторожного края, и оферта с максимальной ставкой в

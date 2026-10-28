@@ -46,7 +46,7 @@ import {
   QUANTILE_LEVELS,
   MS_DAY,
 } from '../web/quant.js';
-import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr, pickDepth, pickProbability, markHorizonRisk, pickStrategyCards, laddersFrom, ladderRate, runProduct } from '../web/model.js';
+import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr, pickDepth, pickProbability, markHorizonRisk, pickStrategyCards, pickBestSell, laddersFrom, ladderRate, runProduct } from '../web/model.js';
 import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry, atmVarianceCurve, totalVariance, forwardVol, surfaceAt, smileSlope, volSlopeAt } from '../web/surface.js';
 import { readFileSync } from 'node:fs';
 import { computeFrame, createFrameState, runPathSlice, PATH_REFRESH_MS } from '../web/frame.js';
@@ -1671,6 +1671,58 @@ section('Альтернативная ставка — точка фронта �
   const one = [{ productId: 'a', stratRisk: 0.1, stratGeo: 0.2, volEdge: -0.01 }];
   const c1 = pickStrategyCards(one);
   ok('ярлыки стратегии склеиваются', c1.length === 1 && c1[0].bestTag.includes('минимум риска') && c1[0].bestTag.includes('максимум стоимости') && c1[0].bestTag.includes('наименьшая недоплата'), c1[0]?.bestTag);
+}
+
+section('Отбор за горизонт: оферты, которые не рассчитаются внутри него');
+{
+  const snap = JSON.parse(gunzipSync(readFileSync(new URL('../docs/snapshot.json.gz', import.meta.url))).toString());
+  const quotes = new Map(Object.entries(snap.quotes));
+  for (const q of quotes.values()) for (const l of [...(q.buyLowPrice || []), ...(q.sellHighPrice || [])]) l.expiredAt = String(snap.now + 3_600_000);
+  const surface = buildSurface(snap.options, snap.now);
+  const history = new History(snap.klines);
+  const H = 90;
+  const rf = 0.04;
+  const common = { products: snap.products, quotes, now: snap.now, spot: snap.spot, surface, history, riskFree: rf, riskFreeBtc: snap.riskFreeBtc, vip: false, measure: 'max', horizonDays: H };
+  // Определение, а не поле модели: первый сеттлмент наступает внутри горизонта.
+  const settles = (r) => r.timing.tauDays <= H;
+
+  const buy = buildRows({ ...common, direction: 'BuyLow', amount: 1000 });
+  ok('на срезе есть оферты с первым сеттлментом за горизонтом', buy.some((r) => !settles(r)) && buy.some(settles));
+  ok(
+    'Buy Low: риск за горизонт — число у рассчитывающихся, у остальных числа нет',
+    buy.every((r) => (settles(r) ? Number.isFinite(r.pHorizon) : r.pHorizon == null)),
+    `без числа ${buy.filter((r) => r.pHorizon == null).length} из ${buy.length}`,
+  );
+
+  const sell = buildRows({ ...common, direction: 'SellHigh', amount: 1 });
+  const an = (basis) => analyzeSellHigh({ rows: sell, basis, qty: 1, spot: snap.spot, history, measure: 'max', horizonDays: H, riskFree: rf });
+
+  // Себестоимость выше любого страйка: режим ожидания. Перебор фронта ожидания
+  // по (ставка ↑, риск продажи за горизонт ↓) — только среди рассчитывающихся.
+  const deep = an(120000);
+  const w = pickBestSell({ rows: deep });
+  ok('Sell High: шанс за горизонт — число у рассчитывающихся, у остальных числа нет', deep.every((r) => (settles(r) ? Number.isFinite(r.pExitHorizon) : r.pExitHorizon == null)));
+  ok('ожидание: все карточки рассчитаются за горизонт', w.mode === 'wait' && w.rows.length > 0 && w.rows.every(settles), w.rows.map((r) => r.duration).join(' '));
+  const pool = deep.filter((r) => settles(r) && Number.isFinite(r.aprEff));
+  const dom = (a) => pool.some((b) => b !== a && b.aprEff >= a.aprEff && b.pExitHorizon <= a.pExitHorizon && (b.aprEff > a.aprEff || b.pExitHorizon < a.pExitHorizon));
+  const front = pool.filter((r) => !dom(r));
+  ok('фронт ожидания совпадает с перебором', front.length === deep.filter((r) => r.waitPareto).length && front.every((r) => r.waitPareto), `перебор ${front.length}`);
+  const safest = front.reduce((a, b) => (b.pExitHorizon < a.pExitHorizon ? b : a));
+  const tagged = w.rows.find((r) => (r.bestTag ?? '').includes('минимум риска'));
+  ok('«минимум риска» — перебором среди рассчитывающихся за горизонт', tagged === safest, `${safest.duration} ${safest.strike}: ${(safest.pExitHorizon * 100).toFixed(1)}%`);
+
+  // Безубыточные есть, но все — за горизонтом: режим ожидания с карточками, а
+  // не пустой режим выхода.
+  const mid = an(80000);
+  const prof = mid.filter((r) => r.profitable);
+  ok('на срезе безубыточны только оферты за горизонтом', prof.length > 0 && prof.every((r) => !settles(r)), `${prof.length}: ${[...new Set(prof.map((r) => r.duration))].join(' ')}`);
+  const m = pickBestSell({ rows: mid });
+  ok('безубыточные не успевают за горизонт — режим ожидания с карточками', m.mode === 'wait' && m.rows.length > 0 && m.rows.every(settles), `${m.mode}, карточек ${m.rows.length}`);
+
+  // Безубыточный выход внутри горизонта есть — режим выхода, карточки с шансом выйти.
+  const near = an(snap.spot * 1.03);
+  const e = pickBestSell({ rows: near });
+  ok('безубыточный выход за горизонт есть — режим выхода с карточками', e.mode === 'exit' && e.rows.length > 0 && e.rows.every((r) => settles(r) && r.pExitHorizon > 0), `карточек ${e.rows.length}`);
 }
 
 // ────────────────────────────────────────────── 8h. Кадр панели и кэш траекторного слоя

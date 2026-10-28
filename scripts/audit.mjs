@@ -241,7 +241,13 @@ console.log('── 1. Тайминг и начисление');
     return next.getUTCDay() !== 5 || next.getUTCHours() !== new Date(t2.settle).getUTCHours();
   });
   ok('следующий сеттлмент календарных серий — пятница в то же время', fridayBad.length === 0, `нарушений ${fridayBad.length}`);
-  ok('APR в цикле не выше эффективного', buy.every((x) => x.aprChained <= x.aprEff + 1e-12));
+  // Только у скользящих серий: там следующий цикл — тот же срок плюс простой.
+  // У календарных следующий цикл другой длины (57d → квартал 90/91), и после
+  // переката, пока окно подписки длинное, APR в цикле законно выше.
+  ok(
+    'APR в цикле не выше эффективного у скользящих серий',
+    buy.filter((x) => x.timing.cycleKind === 'rolling').every((x) => x.aprChained <= x.aprEff + 1e-12),
+  );
   ok(
     'процент за срок = APY·D/365',
     buy.every((x) => Math.abs(x.i - (x.apy * x.timing.yieldDays) / YEAR_DAYS) < 1e-15),
@@ -879,7 +885,11 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
 
   // Отбор в режиме выхода: фронт по максимуму обеих величин.
   const best = pickBestSell({ rows: analyzed });
-  ok('режим определён верно', best.mode === (analyzed.some((r) => r.profitable) ? 'exit' : 'wait'), best.mode);
+  // Выход — только если безубыточная живая оферта рассчитается внутри горизонта
+  // и шанс выйти у неё больше нуля.
+  const canExit = analyzed.some((r) => r.profitable && !r.quoteStale && r.timing.tauDays <= H && r.pExitHorizon > 0);
+  ok('режим определён верно', best.mode === (canExit ? 'exit' : 'wait'), best.mode);
+  ok('в любом режиме карточки рассчитаются внутри горизонта', best.rows.every((r) => r.timing.tauDays <= H), `карточек ${best.rows.length}`);
   if (best.mode === 'exit') {
     ok('в режиме выхода показаны только безубыточные', best.rows.every((r) => r.profitable));
     const pool = analyzed.filter(
@@ -1021,7 +1031,10 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     waiting.rows.every((r, k) => k === 0 || r[wAxis] >= waiting.rows[k - 1][wAxis] - 1e-12),
     `ось ${wAxis}`,
   );
-  const deepPool = deep.filter((r) => Number.isFinite(r.aprEff) && Number.isFinite(r[wAxis]));
+  // Риск за горизонт есть только у оферт, которые рассчитаются внутри него:
+  // оферта с первым сеттлментом позже горизонта не бывает «минимумом риска».
+  ok('в режиме ожидания все карточки рассчитаются внутри горизонта', waiting.rows.every((r) => r.timing.tauDays <= H), `карточек ${waiting.rows.length}`);
+  const deepPool = deep.filter((r) => r.timing.tauDays <= H && Number.isFinite(r.aprEff) && Number.isFinite(r[wAxis]));
   const waitDominated = (a) =>
     deepPool.some(
       (b) => b !== a && b.aprEff >= a.aprEff && b[wAxis] <= a[wAxis] && (b.aprEff > a.aprEff || b[wAxis] < a[wAxis]),
@@ -1108,11 +1121,15 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
   // Горизонт выхода: приведение вероятностей к общему сроку.
   {
     const withH = analyzed.filter((r) => Number.isFinite(r.pExitHorizon));
-    ok('шанс выхода посчитан для всех строк', withH.length === analyzed.length, `${withH.length} из ${analyzed.length}`);
+    ok(
+      'шанс выхода посчитан для всех строк, которые рассчитаются за горизонт',
+      withH.length === analyzed.filter((r) => r.timing.tauDays <= H).length,
+      `${withH.length} из ${analyzed.length}`,
+    );
     ok('шанс выхода лежит в [0,1]', withH.every((r) => r.pExitHorizon >= 0 && r.pExitHorizon <= 1));
     ok(
-      'оферта с первым сеттлментом за горизонтом не даёт шанса выйти',
-      analyzed.filter((r) => r.timing.tauDays > H).every((r) => r.pExitHorizon === 0),
+      'у оферты с первым сеттлментом за горизонтом шанса за горизонт нет',
+      analyzed.filter((r) => r.timing.tauDays > H).every((r) => r.pExitHorizon == null && r.horizonInfo?.cycles === 0),
       `таких оферт ${analyzed.filter((r) => r.timing.tauDays > H).length}`,
     );
     // Чем выше страйк, тем труднее до него дойти.
@@ -1249,7 +1266,7 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     ok(
       'оферты с нулевым шансом выйти исключены из фронта',
       exitFrontier(analyzed).every((r) => r.pExitHorizon > 0),
-      `таких оферт среди безубыточных ${analyzed.filter((r) => r.profitable && r.pExitHorizon === 0).length}`,
+      `таких оферт среди безубыточных ${analyzed.filter((r) => r.profitable && !(r.pExitHorizon > 0)).length}`,
     );
 
     // Фронт выхода упорядочен и цена шага пересчитана верно.
@@ -1458,8 +1475,14 @@ console.log('\n── 13. Траектории: попутевые ряды пр
   ok('отсортированные ряды согласованы с попутевыми', sortBad === 0, `циклов проверено ${checked}`);
   ok('вероятность из двоичного поиска совпадает с прямым счётом', hitBad === 0, `нарушений ${hitBad}`);
 
-  ok('риск за горизонт посчитан для всех строк', buy.every((r) => Number.isFinite(r.pHorizon)));
-  ok('риск за горизонт лежит в [0,1]', buy.every((r) => r.pHorizon >= 0 && r.pHorizon <= 1));
+  // Число — у оферт, которые рассчитаются внутри горизонта (90 дней в opts);
+  // у остальных риск наступает после горизонта, и числа нет.
+  ok(
+    'риск за горизонт: число у рассчитывающихся, у остальных числа нет',
+    buy.every((r) => (r.timing.tauDays <= opts.horizonDays ? Number.isFinite(r.pHorizon) : r.pHorizon == null)),
+    `без числа ${buy.filter((r) => r.pHorizon == null).length} из ${buy.length}`,
+  );
+  ok('риск за горизонт лежит в [0,1]', buy.filter((r) => r.pHorizon != null).every((r) => r.pHorizon >= 0 && r.pHorizon <= 1));
   let hMono = 0;
   const grp = new Map();
   for (const r of buy) {
