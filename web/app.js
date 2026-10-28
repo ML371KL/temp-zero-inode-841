@@ -1231,7 +1231,7 @@ function renderSell(frame) {
       if (!headline) return '';
       const base = analyzed.baseline;
       return (
-        `Быстрее всех выводит в безубыток страйк <b>${fmtUsd(headline.strike, 2)}</b> — он же первой карточкой ` +
+        `Быстрее всех выводит в безубыток страйк <b>${fmtUsd(headline.strike, 2)}</b> — карточка ` +
         `с ярлыком «быстрее всего в безубыток»: прибыль ` +
         `<b>${fmtSigned(headline.profitAtExit, 2)}</b> к моменту выхода с шансом <b>${fmtPct(headline.pExitHorizon, 1)}</b> ` +
         `за ${ui.horizon} дней, ожидание <b>${fmtSpan(headline.expExitDays)}</b> — это <b>${fmtPct(headline.exitSpeed, 1)}</b> годовых ` +

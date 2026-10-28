@@ -330,6 +330,24 @@
     </footer>
 
     <div class="tip" id="tip" hidden></div>
-    <script type="module" src="app.js"></script>
+    <!-- Версия выкладки на всех модулях разом. Браузер кэширует каждый файл
+         отдельно, и без неё новый app.js мог встретиться со старым модулем из
+         кэша: импорт нового имени падает при связывании, и страница не стартует.
+         При каждой выкладке, где меняются модули, менять v в обоих местах. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "./app.js": "./app.js?v=2026-10-28",
+          "./archive.js": "./archive.js?v=2026-10-28",
+          "./charts.js": "./charts.js?v=2026-10-28",
+          "./feeds.js": "./feeds.js?v=2026-10-28",
+          "./frame.js": "./frame.js?v=2026-10-28",
+          "./model.js": "./model.js?v=2026-10-28",
+          "./quant.js": "./quant.js?v=2026-10-28",
+          "./surface.js": "./surface.js?v=2026-10-28"
+        }
+      }
+    </script>
+    <script type="module" src="app.js?v=2026-10-28"></script>
   </body>
 </html>
