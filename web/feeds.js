@@ -315,6 +315,61 @@ export class OfferStream {
   }
 }
 
+/**
+ * Котировки продуктов, которых нет в свежем списке, удаляются: каждые сутки
+ * уходит около 19 продуктов, и без чистки их лестницы копились бы в памяти.
+ * Пустой список — сбой ответа, а не повод стереть всё. Возвращает число удалённых.
+ */
+export function pruneQuotes(quotes, products) {
+  if (!products?.length) return 0;
+  const ids = new Set(products.map((p) => String(p.productId)));
+  let removed = 0;
+  for (const id of [...quotes.keys()]) {
+    if (!ids.has(id)) {
+      quotes.delete(id);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+/**
+ * Сторож потока спота. Соединение может остаться открытым и замолчать — тогда
+ * спот застыл бы. Если цен из потока нет дольше quietMs, спот тянется по REST
+ * не чаще раза в everyMs, пока поток не оживёт.
+ */
+export class SpotWatchdog {
+  constructor({ quietMs = 30_000, everyMs = 15_000 } = {}) {
+    this.quietMs = quietMs;
+    this.everyMs = everyMs;
+    // До запуска потока сторож молчит: судить о тишине ещё не о чем.
+    this.lastStreamAt = null;
+    this.lastPollAt = -Infinity;
+  }
+
+  /** Запуск: отсчёт тишины — с этого момента. */
+  start(now) {
+    this.lastStreamAt = now;
+  }
+
+  /** Из потока пришла цена. */
+  heard(now) {
+    this.lastStreamAt = now;
+  }
+
+  /** Поток молчит дольше порога. */
+  quiet(now) {
+    return this.lastStreamAt != null && now - this.lastStreamAt > this.quietMs;
+  }
+
+  /** Пора ли тянуть спот по REST; если да — запоминает запрос. */
+  due(now) {
+    if (!this.quiet(now) || now - this.lastPollAt < this.everyMs) return false;
+    this.lastPollAt = now;
+    return true;
+  }
+}
+
 /** Поток спот-цены BTCUSDT для мгновенного пересчёта расстояния до страйков. */
 export class SpotStream {
   constructor(onPrice) {

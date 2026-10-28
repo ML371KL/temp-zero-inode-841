@@ -52,7 +52,7 @@ import { readFileSync } from 'node:fs';
 import { computeFrame, createFrameState, runPathSlice, PATH_REFRESH_MS } from '../web/frame.js';
 import { samplePoints, migrateSamples, wantedKeys, buildStats } from '../web/archive.js';
 import { gunzipSync } from 'node:zlib';
-import { fetchProducts, fetchQuote, fetchOptionTickers, fetchSpot, rolloverDelay, hasOpenProducts, UnknownProducts } from '../web/feeds.js';
+import { fetchProducts, fetchQuote, fetchOptionTickers, fetchSpot, rolloverDelay, hasOpenProducts, UnknownProducts, pruneQuotes, SpotWatchdog } from '../web/feeds.js';
 
 let failed = 0;
 let passed = 0;
@@ -1904,6 +1904,25 @@ section('Перекат в 08:00 UTC');
   u.settle(new Set(['1', '2']));
   ok('чужая монета после запроса больше запроса не вызывает', !u.shouldFetch(['1', 'eth-9'], known, now + 120_000));
   ok('и не чаще раза в минуту', !u.shouldFetch(['btc-new'], known, now + 30_000) && u.shouldFetch(['btc-new'], known, now + 61_000));
+
+  // Котировки прошедших продуктов удаляются после обновления списка.
+  const quotes = new Map([['1', {}], ['2', {}], ['8h', {}], ['old', {}]]);
+  const removed = pruneQuotes(quotes, [prod('1', 0, 1), prod('8h', 0, 1), prod('3', 0, 1)]);
+  ok('котировки продуктов вне списка удалены', removed === 2 && [...quotes.keys()].join(',') === '1,8h', [...quotes.keys()].join(','));
+  ok('пустой список ничего не стирает', pruneQuotes(quotes, []) === 0 && quotes.size === 2);
+}
+
+section('Сторож потока спота');
+{
+  const w = new SpotWatchdog({ quietMs: 30_000, everyMs: 15_000 });
+  ok('до запуска потока сторож молчит', !w.quiet(1e9) && !w.due(1e9));
+  w.start(0);
+  ok('поток жив — REST не нужен', !w.due(10_000) && !w.due(30_000));
+  ok('тишина дольше 30 с — спот по REST', w.quiet(30_001) && w.due(30_001));
+  ok('не чаще раза в 15 с', !w.due(40_000) && w.due(45_001));
+  w.heard(50_000);
+  ok('поток ожил — REST прекращается', !w.quiet(70_000) && !w.due(70_000));
+  ok('снова замолчал — снова REST', w.due(80_001));
 }
 
 // ────────────────────────────────────────────── 9. Разбор символов опционов

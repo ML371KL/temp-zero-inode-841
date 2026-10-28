@@ -12,6 +12,8 @@ import {
   rateForHorizon,
   OfferStream,
   SpotStream,
+  SpotWatchdog,
+  pruneQuotes,
   normalizeWsOffer,
   rolloverDelay,
   hasOpenProducts,
@@ -65,6 +67,8 @@ const state = {
 
 // Кэш траекторного слоя и фоновая задача его пересчёта (frame.js).
 const frameState = createFrameState();
+// Сторож потока спота: молчит дольше 30 с — спот по REST.
+const spotWatch = new SpotWatchdog();
 
 const PREF_KEY = 'dual-assets-radar-ui';
 const ui = {
@@ -289,6 +293,8 @@ function fmtQuoteAge(row) {
 async function loadProducts() {
   try {
     state.products = await fetchProducts();
+    // Котировки прошедших продуктов больше не нужны.
+    pruneQuotes(state.quotes, state.products);
     renderDurationChips();
   } catch (e) {
     pushError(`продукты: ${e.message}`);
@@ -808,9 +814,10 @@ function renderBuy(frame) {
   // Приглушены протухшие и те, что хуже бездействия: в режиме подписки — ниже
   // альт. ставки, в режиме стратегии — дешевле USDT за горизонт.
   const strategyMode = ui.mode === 'strategy';
+  // Подсветка — фронт того режима, который на экране.
   renderLimitedTable('buy', $('buy-table'), BUY_COLUMNS, sorted, (r) =>
     [
-      r.pareto ? 'pareto' : '',
+      (strategyMode ? r.stratPareto : r.pareto) ? 'pareto' : '',
       isStale(r) || (strategyMode ? r.stratBelowUsdt : r.belowAlt) ? 'dim' : '',
     ]
       .filter(Boolean)
@@ -1335,6 +1342,7 @@ function renderDiag() {
   const parts = [];
   parts.push(`продуктов: ${state.products.length}`);
   parts.push(`котировок: ${state.quotes.size}`);
+  if (spotWatch.quiet(Date.now())) parts.push('спот: по REST — поток молчит');
   if (state.surface) parts.push(`экспираций опционов: ${state.surface.expiries.length}`);
   if (state.history) {
     const h = state.history.raw;
@@ -1751,10 +1759,25 @@ async function main() {
   });
   offers.start();
 
-  new SpotStream((price) => {
+  const applySpot = (price) => {
     state.spotDir = state.spot ? Math.sign(price - state.spot) : 0;
     state.spot = price;
+  };
+  // Соединение может остаться открытым и замолчать: тогда спот тянется по REST
+  // раз в 15 секунд, пока поток не оживёт.
+  spotWatch.start(Date.now());
+  new SpotStream((price) => {
+    spotWatch.heard(Date.now());
+    applySpot(price);
   }).start();
+  setInterval(() => {
+    if (!spotWatch.due(Date.now())) return;
+    fetchSpot()
+      .then((price) => {
+        if (price > 0 && spotWatch.quiet(Date.now())) applySpot(price);
+      })
+      .catch(() => {});
+  }, 5_000);
 
   // Единый такт пересчёта: раз в секунду хватает, чтобы видеть таяние срока,
   // и не мешает потоку котировок обновлять состояние между кадрами.
