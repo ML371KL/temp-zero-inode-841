@@ -177,6 +177,63 @@ export async function fetchAprStats(repo = 'ML371KL/temp-zero-inode-841', branch
   }
 }
 
+// ─────────────────────────────────────────────── перекат продуктов в 08:00 UTC
+
+/**
+ * Через сколько миллисекунд запросить продукты: сразу после ближайшего
+ * закрытия подписки (плюс несколько секунд на выпуск следующих). Раньше список
+ * обновлялся раз в пять минут, и после переката доска пустовала до шести минут.
+ */
+export function rolloverDelay(products, now, padMs = 5_000) {
+  let next = Infinity;
+  for (const p of products) {
+    const t = Number(p.subscribeEndAt);
+    if (t > now && t < next) next = t;
+  }
+  return Number.isFinite(next) ? next - now + padMs : null;
+}
+
+/** Есть ли продукт, подписка на который открыта и закроется не в ближайшую минуту. */
+export function hasOpenProducts(products, now) {
+  return products.some(
+    (p) => p.status === 'Available' && Number(p.subscribeStartAt) <= now && Number(p.subscribeEndAt) > now + 60_000,
+  );
+}
+
+/**
+ * Незнакомые productId в потоке котировок. Поток несёт продукты всех монет, и
+ * чужие тоже незнакомы, поэтому после запроса списка те, что в нём так и не
+ * появились, запоминаются как чужие и больше запроса не вызывают. Запрос — не
+ * чаще раза в minGapMs.
+ */
+export class UnknownProducts {
+  constructor(minGapMs = 60_000) {
+    this.minGapMs = minGapMs;
+    this.foreign = new Set();
+    this.lastAt = -Infinity;
+    this.pending = null;
+  }
+
+  /** ids — productId из сообщения потока, known — productId текущего списка. */
+  shouldFetch(ids, known, now) {
+    if (this.pending || now - this.lastAt < this.minGapMs) return false;
+    const unknown = [];
+    for (const id of ids) if (!known.has(id) && !this.foreign.has(id)) unknown.push(id);
+    if (!unknown.length) return false;
+    this.lastAt = now;
+    this.pending = unknown;
+    return true;
+  }
+
+  /** После запроса: кого нет и в свежем списке — чужие монеты. */
+  settle(known) {
+    // Каждые сутки у всех монет новые productId: набор не должен расти вечно.
+    if (this.foreign.size > 5000) this.foreign.clear();
+    for (const id of this.pending ?? []) if (!known.has(id)) this.foreign.add(id);
+    this.pending = null;
+  }
+}
+
 // ────────────────────────────────────────────────────────────── WebSocket
 
 /**

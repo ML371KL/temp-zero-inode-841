@@ -13,6 +13,9 @@ import {
   OfferStream,
   SpotStream,
   normalizeWsOffer,
+  rolloverDelay,
+  hasOpenProducts,
+  UnknownProducts,
 } from './feeds.js';
 import { buildSurface, forwardVol } from './surface.js';
 import { computeFrame, createFrameState, runPathSlice } from './frame.js';
@@ -290,6 +293,29 @@ async function loadProducts() {
   } catch (e) {
     pushError(`продукты: ${e.message}`);
   }
+}
+
+/**
+ * Перекат в 08:00 UTC: продукты запрашиваются сразу после ближайшего закрытия
+ * подписки и потом каждые 20 секунд, пока не появятся открытые (не дольше пяти
+ * минут — дальше работает обычное обновление списка).
+ */
+let rolloverTimer = null;
+function scheduleRollover() {
+  clearTimeout(rolloverTimer);
+  const delay = rolloverDelay(state.products, Date.now());
+  rolloverTimer = setTimeout(() => rolloverCheck(0), delay ?? 20_000);
+}
+
+async function rolloverCheck(attempt) {
+  await loadProducts();
+  if (hasOpenProducts(state.products, Date.now()) || attempt >= 15) {
+    await bootstrapQuotes();
+    render();
+    scheduleRollover();
+    return;
+  }
+  rolloverTimer = setTimeout(() => rolloverCheck(attempt + 1), 20_000);
 }
 
 async function bootstrapQuotes() {
@@ -1670,14 +1696,25 @@ async function main() {
 
   loadHistory().then(render);
 
+  // Незнакомый productId в потоке — возможно, вышли новые продукты: список
+  // запрашивается сразу, не дожидаясь пятиминутного обновления.
+  const unknownIds = new UnknownProducts();
   const offers = new OfferStream({
     onSnapshot: (data, at) => {
       const wanted = new Set(state.products.map((p) => String(p.productId)));
+      const ids = [];
       for (const row of data) {
+        ids.push(String(row.p));
         if (!wanted.has(String(row.p))) continue;
         state.quotes.set(String(row.p), normalizeWsOffer(row));
       }
       state.lastQuoteAt = at;
+      if (unknownIds.shouldFetch(ids, wanted, Date.now())) {
+        loadProducts().then(() => {
+          unknownIds.settle(new Set(state.products.map((p) => String(p.productId))));
+          render();
+        });
+      }
     },
     onStatus: (s) => {
       state.wsStatus = s;
@@ -1698,6 +1735,7 @@ async function main() {
     await loadProducts();
     await bootstrapQuotes();
   }, 5 * 60_000);
+  scheduleRollover();
   // Пока жив поток, котировки приходят каждые несколько секунд и добирать их по
   // REST незачем. Как только поток встал, пятиминутного цикла мало: ставка живёт
   // меньше минуты, и блоки рекомендаций мигали бы — живые полминуты из каждых

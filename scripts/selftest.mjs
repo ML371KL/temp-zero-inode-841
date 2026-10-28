@@ -52,7 +52,7 @@ import { readFileSync } from 'node:fs';
 import { computeFrame, createFrameState, runPathSlice, PATH_REFRESH_MS } from '../web/frame.js';
 import { samplePoints, migrateSamples, wantedKeys, buildStats } from '../web/archive.js';
 import { gunzipSync } from 'node:zlib';
-import { fetchProducts, fetchQuote, fetchOptionTickers, fetchSpot } from '../web/feeds.js';
+import { fetchProducts, fetchQuote, fetchOptionTickers, fetchSpot, rolloverDelay, hasOpenProducts, UnknownProducts } from '../web/feeds.js';
 
 let failed = 0;
 let passed = 0;
@@ -1709,6 +1709,29 @@ section('Кадр панели: траекторный слой не кажды�
   const sizes = Object.values(fs.sides).map((x) => x?.results.size ?? 0);
   ok('кэш слоя не растёт с кадрами', sizes.every((n) => n <= 600), `строк в кэше по сторонам: ${sizes.join(', ')}`);
   ok('кэш History не растёт с кадрами', history.cache.size < 30, `${history.cache.size}`);
+}
+
+// ────────────────────────────────────────────── 8i. Перекат продуктов
+
+section('Перекат в 08:00 UTC');
+{
+  const now = Date.UTC(2026, 9, 28, 7, 50);
+  const end = Date.UTC(2026, 9, 28, 7, 59, 59);
+  const prod = (id, start, finish) => ({ productId: id, status: 'Available', subscribeStartAt: String(start), subscribeEndAt: String(finish) });
+  const old = [prod('1', end - 86_400_000, end), prod('2', end - 86_400_000, end), prod('8h', now - 3600_000, end - 8 * 3600_000 + 86_400_000)];
+  ok('запрос продуктов — через 5 с после ближайшего закрытия подписки', rolloverDelay(old, now) === end - now + 5_000, `${rolloverDelay(old, now)} мс`);
+  ok('после закрытия всех окон открытых продуктов нет', !hasOpenProducts(old.slice(0, 2), end + 1_000));
+  ok('новые продукты с открытым окном распознаются', hasOpenProducts([...old.slice(0, 2), prod('3', end + 1, end + 86_400_000)], end + 30_000));
+  ok('окно, закрывающееся через минуту, открытым не считается', !hasOpenProducts([prod('4', now, now + 30_000)], now));
+
+  const u = new UnknownProducts(60_000);
+  const known = new Set(['1', '2']);
+  ok('свои productId запроса не вызывают', !u.shouldFetch(['1', '2'], known, now));
+  ok('незнакомый productId вызывает запрос', u.shouldFetch(['1', '2', 'eth-9'], known, now));
+  ok('пока запрос не завершён, второй не ставится', !u.shouldFetch(['1', 'eth-9', 'x'], known, now + 1));
+  u.settle(new Set(['1', '2']));
+  ok('чужая монета после запроса больше запроса не вызывает', !u.shouldFetch(['1', 'eth-9'], known, now + 120_000));
+  ok('и не чаще раза в минуту', !u.shouldFetch(['btc-new'], known, now + 30_000) && u.shouldFetch(['btc-new'], known, now + 61_000));
 }
 
 // ────────────────────────────────────────────── 9. Разбор символов опционов
