@@ -1323,40 +1323,55 @@ section('Срочная структура волатильности и сце�
   const geo = Math.exp(accLog / sp.paths) ** (365 / H) - 1;
   near('геометрический рост траекторий равен заданному CAGR', geo, 0.11, 1e-9);
 
-  // Накопленная изменчивость пути обязана совпасть с рыночной кривой.
-  let accVar = 0;
-  for (let j = 1; j <= sp.bars; j++) {
-    let s = 0;
-    for (let p = 0; p < sp.paths; p++) {
-      s += (Math.log(sp.ratio[p * sp.width + j]) - Math.log(sp.ratio[p * sp.width + j - 1])) ** 2;
+  // Разброс по траекториям накопленного логарифма на каждый день обязан
+  // совпасть с рыночной кривой w(t). Считается прямо по матрице цен: дисперсия
+  // ln(S_j/S_0) по траекториям, без множителей модели.
+  const spread = (s, crv) => {
+    let worst = 0;
+    let at = 0;
+    for (let j = 1; j <= s.bars; j++) {
+      let m = 0;
+      for (let p = 0; p < s.paths; p++) m += Math.log(s.ratio[p * s.width + j]);
+      m /= s.paths;
+      let v = 0;
+      for (let p = 0; p < s.paths; p++) v += (Math.log(s.ratio[p * s.width + j]) - m) ** 2;
+      v /= s.paths;
+      const dev = Math.abs(v / totalVariance(crv, (j * s.barDays) / 365) - 1);
+      if (dev > worst) {
+        worst = dev;
+        at = j;
+      }
     }
-    accVar += s / sp.paths;
-  }
-  const want = totalVariance(clean, H / 365);
-  ok(
-    'накопленная дисперсия траекторий равна рыночной w(H)',
-    Math.abs(accVar / want - 1) < 0.05,
-    `получено ${accVar.toFixed(5)}, рынок ${want.toFixed(5)}, отклонение ${((accVar / want - 1) * 100).toFixed(2)}%`,
-  );
+    return { worst, at };
+  };
+  const sv = spread(sp, clean);
+  ok('разброс траекторий на каждый день равен рыночной w(t)', sv.worst < 1e-9, `максимум |Var/w − 1| ${sv.worst.toExponential(2)} (день ${sv.at})`);
 
-  // А на кривой с починенным участком изменчивость обязана быть НЕ МЕНЬШЕ
-  // рыночной: плоский участок остаётся историческим, а не нулевым.
-  hist.useScenario({ cagr: 0.11, curve, id: 'repaired' });
-  const spR = hist.scenarioPaths(H);
-  let varR = 0;
-  for (let j = 1; j <= spR.bars; j++) {
-    let s2 = 0;
-    for (let p = 0; p < spR.paths; p++) {
-      s2 += (Math.log(spR.ratio[p * spR.width + j]) - Math.log(spR.ratio[p * spR.width + j - 1])) ** 2;
+  // Ряд с трендами: приращения автокоррелированы, и разброс за горизонт шире
+  // суммы дневных. Подбор по дневным движениям давал здесь траектории шире
+  // рынка; подбор по накопленному разбросу — ровно рынок.
+  {
+    let s2 = 4242;
+    const rnd2 = () => ((s2 = (s2 * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5);
+    const trend = [];
+    let px2 = 60000;
+    let mom = 0;
+    for (let k = 0; k < 900; k++) {
+      mom = 0.9 * mom + 0.01 * rnd2();
+      px2 *= Math.exp(mom + 0.02 * rnd2());
+      trend.push([k * step, px2]);
     }
-    varR += s2 / spR.paths;
+    const ht = new History({ D: { stepMs: step, series: trend } });
+    ht.useScenario({ cagr: 0.11, curve: clean, id: 'trend' });
+    const st = spread(ht.scenarioPaths(H), clean);
+    ok('на ряду с трендами разброс тоже равен рыночному', st.worst < 1e-9, `максимум |Var/w − 1| ${st.worst.toExponential(2)} (день ${st.at})`);
   }
-  const wantR = totalVariance(curve, H / 365);
-  ok(
-    'на починенном участке изменчивость не обнуляется',
-    varR > wantR * 1.01,
-    `${varR.toFixed(5)} против рыночных ${wantR.toFixed(5)} — плоский участок взят историческим`,
-  );
+
+  // Кривая с починенным (плоским) участком: разброс следует за ней и на
+  // плоском участке не растёт — рынок не обещает там новой дисперсии.
+  hist.useScenario({ cagr: 0.11, curve, id: 'repaired' });
+  const sr = spread(hist.scenarioPaths(H), curve);
+  ok('на починенной кривой разброс тоже равен рыночному', sr.worst < 1e-9, `максимум |Var/w − 1| ${sr.worst.toExponential(2)} (день ${sr.at})`);
   hist.useScenario({ cagr: 0.11, curve: clean, id: 'clean' });
 
   // Все оферты обязаны считаться на ОДНОМ наборе траекторий.

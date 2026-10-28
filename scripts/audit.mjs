@@ -1952,20 +1952,27 @@ console.log('\n── 18. Предпосылки о рынке: кривая в�
   const geo = Math.exp(accLog / sp.paths) ** (365 / H) - 1;
   ok('геометрический рост траекторий равен заданному', Math.abs(geo - auto) < 1e-9, `${pc(geo, 3)} против ${pc(auto, 3)}`);
 
-  let accVar = 0;
-  for (let j = 1; j <= sp.bars; j++) {
-    let s = 0;
-    for (let p = 0; p < sp.paths; p++) {
-      s += (Math.log(sp.ratio[p * sp.width + j]) - Math.log(sp.ratio[p * sp.width + j - 1])) ** 2;
+  // Разброс по траекториям накопленного логарифма ln(S_t/S_0) на контрольных
+  // днях против рыночной w(t). Прежняя проверка сверяла сумму квадратов дневных
+  // приращений и не видела, что тренды истории расширяют разброс за горизонт.
+  {
+    const days = [...new Set([1, 7, 30, Math.round(sp.bars / 2), sp.bars])].filter((d) => d >= 1 && d <= sp.bars);
+    let worst = 0;
+    const shown = [];
+    for (const j of days) {
+      let m = 0;
+      for (let p = 0; p < sp.paths; p++) m += Math.log(sp.ratio[p * sp.width + j]);
+      m /= sp.paths;
+      let v = 0;
+      for (let p = 0; p < sp.paths; p++) v += (Math.log(sp.ratio[p * sp.width + j]) - m) ** 2;
+      v /= sp.paths;
+      const t = (j * sp.barDays) / 365;
+      const w = totalVariance(curve, t);
+      worst = Math.max(worst, Math.abs(v / w - 1));
+      shown.push(`д${j} ${pc(Math.sqrt(v / t), 1)}/${pc(Math.sqrt(w / t), 1)}`);
     }
-    accVar += s / sp.paths;
+    ok('разброс траекторий на контрольных днях равен рыночной w(t)', worst < 1e-9, `${shown.join(' · ')}; максимум |Var/w − 1| ${worst.toExponential(2)}`);
   }
-  const wantW = totalVariance(curve, H / 365);
-  ok(
-    'накопленная изменчивость траекторий равна рыночной',
-    Math.abs(accVar / wantW - 1) < 0.05,
-    `${accVar.toFixed(5)} против ${wantW.toFixed(5)} (${((accVar / wantW - 1) * 100).toFixed(2)}%)`,
-  );
   ok(
     'сценарная волатильность ниже реализованной за пять лет',
     sp.scenarioVol < sp.histVol,
