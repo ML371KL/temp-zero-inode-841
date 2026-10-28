@@ -1561,6 +1561,8 @@ console.log('\n── 14. Стратегия до выбранной даты');
       .map((x) => [x.strike / spot, x.apy])
       .sort((a, b) => a[0] - b[0]);
     const rateAt = (m) => {
+      // Страйк «в деньгах» (K ≥ S) Bybit не предлагает — подписки нет.
+      if (m >= 1) return null;
       if (m < lad[0][0]) return null;
       if (m >= lad[lad.length - 1][0]) return lad[lad.length - 1][1];
       for (let j = 1; j < lad.length; j++) {

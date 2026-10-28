@@ -975,16 +975,18 @@ export function laddersFrom(rows, spot) {
  * Ставка следующего цикла для удаления m = K/S от цены прошлого сеттлмента.
  *   между страйками лестницы — линейно по m;
  *   ближе к цене, чем ближний страйк (но вне денег), — ставка ближнего края;
- *   дальше от цены, чем дальний страйк, — −1: такой подписки нет.
+ *   дальше от цены, чем дальний страйк, — −1: такой подписки нет;
+ *   страйк «в деньгах» (Buy Low: m ≥ 1, Sell High: m ≤ 1) — −1: Bybit таких
+ *   страйков не предлагает.
  */
 export function ladderRate(L, m) {
   const n = L.m.length;
   if (!n) return -1;
   if (L.buy) {
-    if (m < L.m[0]) return -1;
+    if (m >= 1 || m < L.m[0]) return -1;
     if (m >= L.m[n - 1]) return L.apy[n - 1];
   } else {
-    if (m > L.m[n - 1]) return -1;
+    if (m <= 1 || m > L.m[n - 1]) return -1;
     if (m <= L.m[0]) return L.apy[0];
   }
   let lo = 0;
@@ -1004,7 +1006,8 @@ export function ladderRate(L, m) {
  *  Цикл 0 — сама оферта: её ставка, её срок, её сеттлмент через τ.
  *  Цикл k ≥ 1 — подписка на тот же страйк того же продукта. Ставка — из
  *    сегодняшней лестницы по удалению K/S, где S — цена прошлого сеттлмента
- *    (ladderRate). Если страйк ушёл за дальний край лестницы, подписки в этом
+ *    (ladderRate). Если страйк ушёл за дальний край лестницы или оказался «в
+ *    деньгах» (после цикла без подписки цена прошла за страйк), подписки в этом
  *    цикле нет: у Buy Low деньги лежат под альтернативную ставку весь цикл и
  *    конвертироваться не могут, у Sell High монета лежит без процента и продана
  *    быть не может.
@@ -1148,6 +1151,13 @@ export function runProduct({ rows, base, sched, ladder, spot, horizonDays, riskF
             x = xk[k];
             continue;
           }
+          if (x <= target) {
+            // Страйк «в деньгах» (K ≥ S): после цикла без подписки цена прошла
+            // под страйк, а такого Buy Low Bybit не предлагает — подписки нет.
+            g *= idle[k];
+            x = xk[k];
+            continue;
+          }
           let rate = nearRate;
           if (x > xLast) {
             let lo = 0;
@@ -1169,6 +1179,11 @@ export function runProduct({ rows, base, sched, ladder, spot, horizonDays, riskF
           if (x < xLast) {
             // До конца горизонта цена ниже дальнего края: продаж больше нет.
             if (sufMax[k - 1] < xLast) break;
+            x = xk[k];
+            continue;
+          }
+          if (x >= target) {
+            // Страйк «в деньгах» (K ≤ S): такого Sell High нет — подписки нет.
             x = xk[k];
             continue;
           }

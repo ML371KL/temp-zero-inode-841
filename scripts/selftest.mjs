@@ -46,7 +46,7 @@ import {
   QUANTILE_LEVELS,
   MS_DAY,
 } from '../web/quant.js';
-import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr, pickDepth, pickProbability, markHorizonRisk, pickStrategyCards } from '../web/model.js';
+import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr, pickDepth, pickProbability, markHorizonRisk, pickStrategyCards, laddersFrom, ladderRate, runProduct } from '../web/model.js';
 import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry, atmVarianceCurve, totalVariance, forwardVol, surfaceAt, smileSlope, volSlopeAt } from '../web/surface.js';
 import { readFileSync } from 'node:fs';
 import { computeFrame, createFrameState, runPathSlice, PATH_REFRESH_MS } from '../web/frame.js';
@@ -981,8 +981,28 @@ section('Траекторный движок против отдельного �
     [63000, 0.12],
     [66000, 0.05],
   ].map(([strike, apy]) => ({ productId: 's', direction: 'SellHigh', strike, apy, i: (apy * 4) / 365, timing: tSH, aprEff: 0.1, pRN: 0.3, pHist: 0.3, histInfo: { independent: 999 } }));
+  // Узкие лестницы у самой цены: страйк часто уходит за дальний край, а на
+  // следующем сеттлменте цена оказывается за страйком — случай «в деньгах».
+  bl.push(
+    ...[
+      [59000, 0.2],
+      [59400, 0.4],
+      [59800, 0.9],
+    ].map(([strike, apy]) => ({ productId: 'bn', direction: 'BuyLow', strike, apy, i: (apy * 2) / 365, timing: tBL, aprEff: 0.1 })),
+  );
+  sh.push(
+    ...[
+      [60200, 0.9],
+      [60600, 0.4],
+      [61000, 0.2],
+    ].map(([strike, apy]) => ({ productId: 'sn', direction: 'SellHigh', strike, apy, i: (apy * 4) / 365, timing: tSH, aprEff: 0.1, pRN: 0.3, pHist: 0.3, histInfo: { independent: 999 } })),
+  );
+  const sameProduct = (rows, r) => rows.filter((x) => x.productId === r.productId);
 
   const base = hist.scenarioPaths(H);
+  // Сколько раз перебор встретил страйк «в деньгах» на момент подписки: без
+  // таких случаев правило «подписки нет» осталось бы непроверенным.
+  const itmSeen = { BuyLow: 0, SellHigh: 0 };
   const brute = (row, ladderRows) => {
     const t = row.timing;
     const days = [];
@@ -993,6 +1013,12 @@ section('Траекторный движок против отдельного �
     const lad = ladderRows.map((r) => [r.strike / spot, r.apy]).sort((a, b) => a[0] - b[0]);
     const rateAt = (m) => {
       const buy = row.direction === 'BuyLow';
+      // Страйк «в деньгах» (Buy Low: K ≥ S, Sell High: K ≤ S) Bybit не
+      // предлагает — подписки нет.
+      if (buy ? m >= 1 : m <= 1) {
+        itmSeen[row.direction]++;
+        return null;
+      }
       const far = buy ? m < lad[0][0] : m > lad[lad.length - 1][0];
       if (far) return null;
       if (buy && m >= lad[lad.length - 1][0]) return lad[lad.length - 1][1];
@@ -1058,7 +1084,7 @@ section('Траекторный движок против отдельного �
   let worst = 0;
   let inactiveSeen = false;
   for (const r of bl) {
-    const b = brute(r, bl);
+    const b = brute(r, sameProduct(bl, r));
     const rel = (x, y) => Math.abs(x - y) / Math.max(1e-12, Math.abs(y));
     worst = Math.max(worst, rel(r.strategy.value, b.mean), rel(r.strategy.valueMedian, b.median), rel(r.strategy.valueGeo, b.geo), Math.abs(r.strategy.pEndBtc - b.p), Math.abs(r.pHorizon - b.p));
     if (r.strategy.cycles !== b.n) worst = Infinity;
@@ -1071,7 +1097,7 @@ section('Траекторный движок против отдельного �
   const an = analyzeSellHigh({ rows: sh, basis, qty: 1, spot, history: hist, horizonDays: H, riskFree: rf });
   let worstS = 0;
   for (const r of an) {
-    const b = brute(r, sh);
+    const b = brute(r, sameProduct(sh, r));
     const rel = (x, y) => Math.abs(x - y) / Math.max(1e-12, Math.abs(y));
     worstS = Math.max(
       worstS,
@@ -1083,6 +1109,11 @@ section('Траекторный движок против отдельного �
     );
   }
   ok('Sell High: шанс выйти, ожидание, прибыль к выходу и матожидание совпадают с перебором', worstS < 1e-12, `максимум отклонения ${worstS.toExponential(2)} по ${an.length} строкам`);
+  ok(
+    'в проверке есть подписки на страйк «в деньгах» с обеих сторон, и их нет',
+    itmSeen.BuyLow > 0 && itmSeen.SellHigh > 0,
+    `Buy Low ${itmSeen.BuyLow}, Sell High ${itmSeen.SellHigh}`,
+  );
 
   // Кэш траекторного слоя живёт на строке и не плодит записей в History.
   const before = hist.cache.size;
@@ -1091,6 +1122,39 @@ section('Траекторный движок против отдельного �
     computeStrategy({ rows, history: hist, spot: spot * (1 + f * 1e-5), horizonDays: H, riskFree: rf });
   }
   ok('траекторный слой не растит кэш History от кадра к кадру', hist.cache.size <= before + 1, `было ${before}, стало ${hist.cache.size}`);
+}
+
+section('Страйк «в деньгах» на момент подписки — подписки нет');
+{
+  // Одна траектория, числа считаются прямо здесь. Сеттлменты на днях 1, 3, 5:
+  // после цикла без подписки (страйк за дальним краем) цена уходит за страйк, и
+  // такой страйк Bybit уже не предлагает. Прежде движок давал ему ставку
+  // ближнего края и тут же засчитывал конвертацию или продажу.
+  const spot = 100;
+  const rf = 0.04;
+  const timing = { tauDays: 1, yieldDays: 1, cycleDays: 2, gapDays: 1, cycleKind: 'rolling' };
+  const sched = settlementSchedule(timing, 5);
+  const one = (ratio) => ({ ratio: Float64Array.from(ratio), width: 6, paths: 1, bars: 5, barDays: 1, independent: 1, series: 'D' });
+
+  // Buy Low: лестница 97/98/99 под 10/50/200%; оферта — страйк 97.
+  const bl = [97, 98, 99].map((K, j) => ({ productId: 'P', direction: 'BuyLow', strike: K, apy: [0.1, 0.5, 2.0][j], timing }));
+  const lb = laddersFrom(bl, spot).get('P|BuyLow');
+  // День 1 — 102 (страйк дальше края), день 3 — 96 (страйк выше цены), день 5 — 96.5.
+  const [rb] = runProduct({ rows: [bl[0]], base: one([1, 1.02, 1, 0.96, 0.96, 0.965]), sched, ladder: lb, spot, horizonDays: 5, riskFree: rf });
+  ok('Buy Low: страйк выше цены не подписывается — конвертации нет', rb.pHit === 0, `pHit ${rb.pHit}`);
+  near('Buy Low: оба цикла без подписки лежат под альт. ставку', rb.value, (1 + 0.1 / 365) * (1 + (rf * 2) / 365) ** 2, 1e-15);
+  ok('ставка лестницы для страйка выше цены — подписки нет', ladderRate(lb, 97 / 96) === -1 && ladderRate(lb, 1) === -1);
+  near('ближе ближнего страйка, но вне денег — ставка ближнего края', ladderRate(lb, 0.995), 2.0, 0);
+
+  // Sell High: лестница 101/102/103 под 200/50/10%; оферта — страйк 103.
+  const sh = [101, 102, 103].map((K, j) => ({ productId: 'S', direction: 'SellHigh', strike: K, apy: [2.0, 0.5, 0.1][j], timing }));
+  const ls = laddersFrom(sh, spot).get('S|SellHigh');
+  // День 1 — 98 (страйк дальше края), день 3 — 104 (страйк ниже цены), день 5 — 103.5.
+  const [rs] = runProduct({ rows: [sh[2]], base: one([1, 0.98, 1, 1.04, 1.04, 1.035]), sched, ladder: ls, spot, horizonDays: 5, riskFree: rf });
+  ok('Sell High: страйк ниже цены не подписывается — продажи нет', rs.pHit === 0, `pHit ${rs.pHit}`);
+  near('Sell High: монета без процента до конца горизонта', rs.wMean, (1 + 0.1 / 365) * 1.035 * spot, 1e-12);
+  ok('ставка лестницы для страйка ниже цены — подписки нет', ladderRate(ls, 103 / 104) === -1 && ladderRate(ls, 1) === -1);
+  near('выше ближнего страйка, но вне денег — ставка ближнего края', ladderRate(ls, 1.005), 2.0, 0);
 }
 
 // ────────────────────────────────────────────── 8d3. Расписание серий
