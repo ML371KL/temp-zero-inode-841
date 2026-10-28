@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Dual Assets BTC/USDT — радар</title>
-    <link rel="stylesheet" href="style.css" />
+    <link rel="stylesheet" href="style.css?v=2026-10-28" />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>₿</text></svg>" />
     <script>
     /* Тема ДО первой отрисовки — и вечернее правило.
@@ -333,7 +333,8 @@
     <!-- Версия выкладки на всех модулях разом. Браузер кэширует каждый файл
          отдельно, и без неё новый app.js мог встретиться со старым модулем из
          кэша: импорт нового имени падает при связывании, и страница не стартует.
-         При каждой выкладке, где меняются модули, менять v в обоих местах. -->
+         При каждой выкладке, где меняются модули или стили, менять v везде:
+         в карте импорта, у app.js и у style.css в шапке. -->
     <script type="importmap">
       {
         "imports": {
