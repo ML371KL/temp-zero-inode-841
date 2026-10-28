@@ -169,6 +169,99 @@ export function volAt(surface, spot, K, T) {
   return null;
 }
 
+// ────────────────────────────────────── наклон улыбки для вероятности
+
+/**
+ * Сколько ближайших котировок берёт локальная регрессия. Кусочно-линейная
+ * улыбка даёт ступенчатую производную — вероятность прыгала бы между соседними
+ * страйками; квадратичная регрессия по десятку соседей сглаживает шум марок, но
+ * держит местную форму улыбки.
+ */
+export const SMOOTH_POINTS = 10;
+
+/**
+ * Наклон сглаженной улыбки dσ/dx в точке x = ln(K/F) одной экспирации:
+ * взвешенная (трикуб) квадратичная регрессия iv по x на SMOOTH_POINTS
+ * ближайших котировок, наклон — линейный член. За краями котировок улыбка
+ * плоская, как в ivAtMoneyness, поэтому и наклон там нулевой. При недостатке
+ * точек или вырожденной системе — null: вызывающий откатится на N(∓d₂).
+ */
+export function smileSlope(expiry, x) {
+  const s = expiry?.smile;
+  if (!s || s.length < 5 || !Number.isFinite(x)) return null;
+  if (x < s[0].x || x > s[s.length - 1].x) return 0;
+  // Окно ближайших соседей: улыбка отсортирована по x, расширяемся от точки.
+  let hi = 0;
+  while (hi < s.length && s[hi].x < x) hi++;
+  let lo = hi - 1;
+  const take = Math.min(SMOOTH_POINTS, s.length);
+  const idx = [];
+  while (idx.length < take) {
+    const dl = lo >= 0 ? x - s[lo].x : Infinity;
+    const dr = hi < s.length ? s[hi].x - x : Infinity;
+    if (dl <= dr) idx.push(lo--);
+    else idx.push(hi++);
+  }
+  let dmax = 0;
+  for (const k of idx) dmax = Math.max(dmax, Math.abs(s[k].x - x));
+  dmax = dmax * 1.0001 || 1e-9;
+  // Нормальные уравнения взвешенного МНК для iv = a + b·u + c·u², u = x_k − x.
+  let S0 = 0, S1 = 0, S2 = 0, S3 = 0, S4 = 0, T0 = 0, T1 = 0, T2 = 0;
+  for (const k of idx) {
+    const u = s[k].x - x;
+    const q = Math.abs(u) / dmax;
+    const w = (1 - q * q * q) ** 3;
+    const u2 = u * u;
+    S0 += w;
+    S1 += w * u;
+    S2 += w * u2;
+    S3 += w * u2 * u;
+    S4 += w * u2 * u2;
+    T0 += w * s[k].iv;
+    T1 += w * s[k].iv * u;
+    T2 += w * s[k].iv * u2;
+  }
+  // Правило Крамера для 3×3: нужен только b.
+  const det = S0 * (S2 * S4 - S3 * S3) - S1 * (S1 * S4 - S3 * S2) + S2 * (S1 * S3 - S2 * S2);
+  if (!(Math.abs(det) > 1e-300)) return null;
+  const detB = S0 * (T1 * S4 - S3 * T2) - T0 * (S1 * S4 - S3 * S2) + S2 * (S1 * T2 - T1 * S2);
+  const b = detB / det;
+  return Number.isFinite(b) ? b : null;
+}
+
+/**
+ * ∂σ/∂K на произвольный срок — так же, как volAt собирает уровень: на краях
+ * берётся ближайшая экспирация, между ними полная дисперсия при фиксированном K,
+ *   σ²T = (1−u)·σ_a²T_a + u·σ_b²T_b  ⇒  ∂σ/∂K = [(1−u)σ_aσ'_aT_a + uσ_bσ'_bT_b]/(σT).
+ * Уровни σ_a, σ_b — из марок (как в volAt), наклоны — из сглаженной улыбки.
+ */
+export function volSlopeAt(surface, spot, K, T) {
+  const ex = surface?.expiries;
+  if (!ex?.length || !(T > 0) || !(K > 0)) return null;
+  const slopeOn = (e) => {
+    const g = smileSlope(e, Math.log(K / e.forward));
+    return g == null ? null : g / K;
+  };
+  if (T <= ex[0].T) return slopeOn(ex[0]);
+  if (T >= ex[ex.length - 1].T) return slopeOn(ex[ex.length - 1]);
+  for (let k = 1; k < ex.length; k++) {
+    if (T <= ex[k].T) {
+      const a = ex[k - 1];
+      const b = ex[k];
+      const ivA = ivAtMoneyness(a, Math.log(K / a.forward));
+      const ivB = ivAtMoneyness(b, Math.log(K / b.forward));
+      const sA = slopeOn(a);
+      const sB = slopeOn(b);
+      if (ivA == null || ivB == null || sA == null || sB == null) return null;
+      const u = (T - a.T) / (b.T - a.T);
+      const w = (1 - u) * ivA * ivA * a.T + u * ivB * ivB * b.T;
+      const sigma = Math.sqrt(Math.max(w, 1e-12) / T);
+      return ((1 - u) * ivA * sA * a.T + u * ivB * sB * b.T) / (sigma * T);
+    }
+  }
+  return null;
+}
+
 // Точное совпадение даты сеттлмента с котируемой экспирацией — отдельная
 // пометка: там оценка риска опирается на рынок напрямую, без интерполяции.
 export function hasExactExpiry(surface, settleMs, toleranceMs = 2 * 3600_000) {

@@ -17,6 +17,11 @@ import {
   chainedApr,
   valueOffer,
   fairAprEffective,
+  digitalProbability,
+  prepareSample,
+  sampleCdf,
+  sampleLossProfile,
+  empiricalMeanGross,
   logReturns,
   empiricalCdf,
   empiricalShortfall,
@@ -39,7 +44,9 @@ import {
   MS_DAY,
 } from '../web/quant.js';
 import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr } from '../web/model.js';
-import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry, atmVarianceCurve, totalVariance, forwardVol, surfaceAt } from '../web/surface.js';
+import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry, atmVarianceCurve, totalVariance, forwardVol, surfaceAt, smileSlope, volSlopeAt } from '../web/surface.js';
+import { readFileSync } from 'node:fs';
+import { gunzipSync } from 'node:zlib';
 import { fetchProducts, fetchQuote, fetchOptionTickers, fetchSpot } from '../web/feeds.js';
 
 let failed = 0;
@@ -367,6 +374,189 @@ section('σ оферты и справедливая ставка со стои�
   ]);
   ok('якорь «в деньгах» не берёт оферту ниже альт. ставки', anchors.money?.row.productId === 'b');
   ok('и якорь матожидания тоже', anchors.expected?.row.productId === 'b');
+}
+
+// ────────────────────────────────────────────── 5b. Вероятность из улыбки
+
+section('Вероятность конвертации из улыбки');
+{
+  // Независимая проверка: на улыбке, точно квадратичной по x = ln(K/F), любая
+  // локальная квадратичная регрессия воспроизводит её без ошибки, а истинная
+  // вероятность — конечная разность цен опциона по страйку с σ(K) из этой же
+  // квадратичной формулы. Ни smileSlope, ни digitalProbability в эталоне нет.
+  const t0 = Date.UTC(2026, 6, 31, 8, 0);
+  const F = 62000;
+  const quad = (x, T) => 0.42 - 0.35 * x + 1.4 * x * x + 0.05 * T; // перекос к путам, как у BTC
+  const mk = (d, mon, T) =>
+    Array.from({ length: 25 }, (_, k) => 45000 + k * 1000).map((K) => ({
+      symbol: `BTC-${d}${mon}26-${K}-P-USDT`,
+      markIv: String(quad(Math.log(K / F), T)),
+      underlyingPrice: String(F),
+      indexPrice: String(F),
+    }));
+  const Ta = (Date.UTC(2026, 7, 7, 8) - t0) / MS_DAY / 365;
+  const Tb = (Date.UTC(2026, 7, 28, 8) - t0) / MS_DAY / 365;
+  const surface = buildSurface([...mk(7, 'AUG', Ta), ...mk(28, 'AUG', Tb)], t0);
+  const smileVol = (K, T) => {
+    // σ на произвольный срок — полная дисперсия при фиксированном K, как в volAt,
+    // но от точной квадратичной улыбки, а не от марок.
+    const wa = quad(Math.log(K / F), Ta) ** 2 * Ta;
+    const wb = quad(Math.log(K / F), Tb) ** 2 * Tb;
+    if (T <= Ta) return quad(Math.log(K / F), Ta);
+    const u = (T - Ta) / (Tb - Ta);
+    return Math.sqrt(((1 - u) * wa + u * wb) / T);
+  };
+  let worst = 0;
+  let worstLn = 0;
+  for (const T of [Ta, (Ta + Tb) / 2, Tb]) {
+    const Teff = twapEffectiveT(T);
+    for (const K of [52000, 56000, 60000, 64000, 68000]) {
+      const h = 0.5;
+      const fd = (black76Put(F, K + h, smileVol(K + h, T), Teff) - black76Put(F, K - h, smileVol(K - h, T), Teff)) / (2 * h);
+      const sigma = volAt(surface, F, K, T);
+      const skew = volSlopeAt(surface, F, K, T);
+      const p = digitalProbability({ direction: 'BuyLow', forward: F, strike: K, sigma, Teff, skew });
+      const pLn = digitalProbability({ direction: 'BuyLow', forward: F, strike: K, sigma, Teff });
+      worst = Math.max(worst, Math.abs(p - fd));
+      worstLn = Math.max(worstLn, Math.abs(pLn - fd));
+      // Sell High — та же производная с другим знаком: P(S>K) = 1 − P(S<K).
+      const ps = digitalProbability({ direction: 'SellHigh', forward: F, strike: K, sigma, Teff, skew });
+      worst = Math.max(worst, Math.abs(ps - (1 - fd)));
+    }
+  }
+  ok('P рын. = ∂Put/∂K по улыбке (конечная разность цен)', worst < 2e-6, `максимум расхождения ${worst.toExponential(2)} на трёх сроках и пяти страйках`);
+  ok('логнормальная N(−d₂) от неё заметно отличается', worstLn > 0.01, `до ${(worstLn * 100).toFixed(2)} п.п.`);
+  near('без наклона — откат на N(−d₂)', digitalProbability({ direction: 'BuyLow', forward: F, strike: 58000, sigma: 0.5, Teff: 0.05 }), normCdf(-((Math.log(F / 58000) - 0.5 * 0.5 * 0.05 / 2) / (0.5 * Math.sqrt(0.05)))), 1e-15);
+  ok('вероятность зажата в [0, 1]', digitalProbability({ direction: 'BuyLow', forward: F, strike: 40000, sigma: 0.5, Teff: 0.05, skew: -1 }) === 0);
+  ok('за краями котировок наклон нулевой', smileSlope(surface.expiries[0], Math.log(30000 / F)) === 0);
+  ok('на редкой улыбке наклона нет', smileSlope({ smile: [{ x: 0, iv: 0.4 }, { x: 0.1, iv: 0.4 }] }, 0.05) === null);
+
+  // Условная потеря делится на ту же вероятность из улыбки.
+  const K = 58000;
+  const T = Ta;
+  const Teff = twapEffectiveT(T);
+  const sigma = volAt(surface, F, K, T);
+  const pSmile = digitalProbability({ direction: 'BuyLow', forward: F, strike: K, sigma, Teff, skew: volSlopeAt(surface, F, K, T) });
+  const loss = rnLossProfile({ direction: 'BuyLow', forward: F, strike: K, sigma, Teff, spot: F, p: pSmile });
+  near('условная потеря = Put/K ÷ вероятность из улыбки', loss.conditional, black76Put(F, K, sigma, Teff) / K / pSmile, 1e-15);
+
+  // Подготовленная выборка отвечает так же, как прямой проход.
+  let seed = 4242;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5);
+  const sample = Array.from({ length: 3000 }, () => 0.3 * rnd() + 0.05 * rnd() ** 3).sort((a, b) => a - b);
+  const prep = prepareSample(sample);
+  let diff = 0;
+  for (const strike of [40, 47, 50, 53, 61]) {
+    for (const dir of ['BuyLow', 'SellHigh']) {
+      const a = empiricalLossProfile(sample, 50, strike, dir);
+      const b = sampleLossProfile(prep, 50, strike, dir);
+      diff = Math.max(diff, Math.abs(a.expected - b.expected), Math.abs((a.conditional ?? 0) - (b.conditional ?? 0)), Math.abs(a.stress - b.stress));
+    }
+    diff = Math.max(diff, Math.abs(empiricalCdf(sample, Math.log(strike / 50)) - sampleCdf(prep, Math.log(strike / 50))));
+  }
+  diff = Math.max(diff, Math.abs(empiricalMeanGross(sample) - prep.meanGross));
+  ok('подготовленная выборка совпадает с прямым проходом', diff < 1e-12, `максимум ${diff.toExponential(2)}`);
+}
+
+// ────────────────────────────────────────────── 5c. Срез из репозитория
+
+section('Срез рынка из репозитория: вероятность и лестницы');
+{
+  // docs/snapshot.json.gz — живые котировки 01.08.2026, лежат в репозитории и
+  // проверяются без сети.
+  const snap = JSON.parse(gunzipSync(readFileSync(new URL('../docs/snapshot.json.gz', import.meta.url))).toString());
+  const surface = buildSurface(snap.options, snap.now);
+  const history = new History(snap.klines);
+  const common = {
+    products: snap.products,
+    quotes: new Map(Object.entries(snap.quotes)),
+    now: snap.now,
+    spot: snap.spot,
+    surface,
+    history,
+    riskFree: snap.riskFree,
+    riskFreeBtc: snap.riskFreeBtc,
+    amount: 1000,
+    vip: true,
+    measure: 'max',
+  };
+  const buy = buildRows({ ...common, direction: 'BuyLow' });
+  const sell = buildRows({ ...common, direction: 'SellHigh' });
+  ok('строки среза построены', buy.length > 100 && sell.length > 100, `Buy Low ${buy.length}, Sell High ${sell.length}`);
+
+  // Порядок вероятностей внутри каждой лестницы: у Buy Low растёт со страйком,
+  // у Sell High убывает. И у рыночной, и у нормированной исторической.
+  let pairs = 0;
+  let bad = 0;
+  for (const rows of [buy, sell]) {
+    const by = new Map();
+    for (const r of rows) {
+      if (!by.has(r.productId)) by.set(r.productId, []);
+      by.get(r.productId).push(r);
+    }
+    for (const list of by.values()) {
+      const s = [...list].sort((a, b) => a.strike - b.strike);
+      for (let k = 1; k < s.length; k++) {
+        for (const key of ['pRN', 'pHistScaled']) {
+          const a = s[k - 1][key];
+          const b = s[k][key];
+          if (a == null || b == null) continue;
+          pairs++;
+          if (s[k].direction === 'BuyLow' ? b < a - 1e-12 : b > a + 1e-12) bad++;
+        }
+      }
+    }
+  }
+  ok('вероятности монотонны внутри каждой лестницы', bad === 0 && pairs > 300, `пар соседей ${pairs}, нарушений ${bad}`);
+
+  // Против конечной разности цен по улыбке, сглаженной ОТДЕЛЬНО: невзвешенная
+  // квадратичная регрессия по десяти ближайшим котировкам (в панели — трикуб).
+  // Окно по числу точек, а не по ширине x: у суточных сроков вся улыбка умещается
+  // в ±0.1 по x, и широкое окно сгладило бы её форму целиком.
+  const fitQuad = (pts, x0) => {
+    let S0 = 0, S1 = 0, S2 = 0, S3 = 0, S4 = 0, T0 = 0, T1 = 0, T2 = 0;
+    for (const { x, iv } of pts) {
+      const u = x - x0;
+      S0++; S1 += u; S2 += u * u; S3 += u ** 3; S4 += u ** 4; T0 += iv; T1 += iv * u; T2 += iv * u * u;
+    }
+    const A = [[S0, S1, S2], [S1, S2, S3], [S2, S3, S4]];
+    const B = [T0, T1, T2];
+    const det = (m) => m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    const D = det(A);
+    const c = [0, 1, 2].map((j) => det(A.map((row, i) => row.map((v, k) => (k === j ? B[i] : v)))) / D);
+    return (x) => c[0] + c[1] * (x - x0) + c[2] * (x - x0) ** 2;
+  };
+  let worst = 0;
+  let checked = 0;
+  for (const r of buy.filter((x) => x.exactExpiry && x.sigma > 0 && !x.isVip)) {
+    const e = surface.expiries.reduce((a, b) => (Math.abs(b.expiry - r.timing.settle) < Math.abs(a.expiry - r.timing.settle) ? b : a));
+    const xK = Math.log(r.strike / e.forward);
+    if (xK < e.smile[0].x || xK > e.smile[e.smile.length - 1].x) continue;
+    const pts = [...e.smile].sort((a, b) => Math.abs(a.x - xK) - Math.abs(b.x - xK)).slice(0, 10);
+    const f = fitQuad(pts, xK);
+    // Уровень — марки панели, форма — свой сглаживатель.
+    const shift = r.sigma - f(xK);
+    const px = (k) => black76Put(r.forward, k, f(Math.log(k / e.forward)) + shift, r.Teff);
+    const h = r.strike * 1e-4;
+    const fd = (px(r.strike + h) - px(r.strike - h)) / (2 * h);
+    worst = Math.max(worst, Math.abs(fd - r.pRN));
+    checked++;
+  }
+  ok('P рын. близка к производной цены по отдельно сглаженной улыбке', checked > 20 && worst < 0.005, `строк ${checked}, максимум ${(worst * 100).toFixed(2)} п.п.`);
+
+  // Нормированная история — одна выборка на срок, растянутая под σ ATM.
+  let histBad = 0;
+  const seen = new Set();
+  for (const r of buy) {
+    if (seen.has(r.productId) || !(r.sigmaAtm > 0)) continue;
+    seen.add(r.productId);
+    const sc = history.scaled(r.timing.tauDays, r.sigmaAtm, r.Teff, r.forward / snap.spot);
+    const want = empiricalCdf(sc, Math.log(r.strike / snap.spot));
+    if (Math.abs(want - r.pHistScaled) > 1e-12) histBad++;
+    near(`σ ATM ${r.duration}${r.isVip ? ' VIP' : ''} — σ при K = F`, r.sigmaAtm, volAt(surfaceAt(surface, snap.now), snap.spot, r.forward, r.timing.tauDays / 365), 1e-15);
+    if (seen.size >= 3) break;
+  }
+  ok('P ист. норм. взята из выборки, растянутой под σ ATM срока', histBad === 0);
 }
 
 // ────────────────────────────────────────────── 6. Эмпирика

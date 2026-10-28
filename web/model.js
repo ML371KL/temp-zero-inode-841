@@ -18,6 +18,9 @@ import {
   empiricalLossProfile,
   rnLossProfile,
   martingaleShift,
+  prepareSample,
+  sampleCdf,
+  sampleLossProfile,
   percentileFromQuantiles,
   bucketKey,
   paretoFront,
@@ -29,7 +32,7 @@ import {
   STRESS_LEVEL,
   YEAR_DAYS,
 } from './quant.js';
-import { volAt, forwardAt, hasExactExpiry, forwardVol, surfaceAt } from './surface.js';
+import { volAt, volSlopeAt, forwardAt, hasExactExpiry, forwardVol, surfaceAt } from './surface.js';
 
 /**
  * Снимок опционов старше этого — такие же протухшие данные, как истёкшая
@@ -515,6 +518,8 @@ export class History {
         sorted.length > 1 ? sorted.reduce((a, b) => a + (b - mean) ** 2, 0) / (sorted.length - 1) : 0;
       hit = {
         sorted,
+        // Та же выборка, подготовленная к ответам за O(log n) на строку.
+        prep: prepareSample(sorted),
         mean,
         sigma: Math.sqrt(variance),
         key: p.key,
@@ -599,9 +604,28 @@ export function sampleCagr(history) {
 export { bucketKey as statsBucketKey };
 
 /**
+ * То, что у всех строк одного продукта общее: форвард на дату сеттлмента,
+ * σ «на деньгах» срока и две исторические выборки — сырая (кэш History, по
+ * барам) и нормированная под σ ATM и форвард (только на этот вызов: она зависит
+ * от непрерывных величин, и долгоживущий кэш по ним был бы течью).
+ */
+function productSide({ memo, product, timing, surface, spot, history, T, Teff }) {
+  const key = `${product.productId}|${timing.tauDays}`;
+  const hit = memo?.get(key);
+  if (hit) return hit;
+  const forward = surface ? forwardAt(surface, spot, T) : spot;
+  const sigmaAtm = surface ? volAt(surface, spot, forward, T) : null;
+  const hist = history ? history.returns(timing.tauDays) : null;
+  const scaled = hist && sigmaAtm > 0 && spot > 0 ? history.scaled(timing.tauDays, sigmaAtm, Teff, forward / spot) : null;
+  const out = { forward, sigmaAtm, hist, scaledPrep: scaled?.length ? prepareSample(scaled) : null };
+  memo?.set(key, out);
+  return out;
+}
+
+/**
  * Полный расчёт одной оферты (страйк + направление внутри продукта).
  */
-export function buildRow({ product, level, direction, now, spot, surface, history, riskFree, riskFreeBtc, amount, stats }) {
+export function buildRow({ product, level, direction, now, spot, surface, history, riskFree, riskFreeBtc, amount, stats, memo = null }) {
   const timing = productTiming(product, now);
   const strike = Number(level.selectPrice);
   const apy = apyFromE8(level.apyE8);
@@ -612,17 +636,24 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
   const T = Math.max(timing.tauDays, 0) / YEAR_DAYS;
   const Teff = twapEffectiveT(T);
   const sigma = surface ? volAt(surface, spot, strike, T) : null;
-  const forward = surface ? forwardAt(surface, spot, T) : spot;
+  // Наклон улыбки в точке страйка: без него вероятность — логнормальная N(∓d₂).
+  const skew = surface && sigma > 0 ? volSlopeAt(surface, spot, strike, T) : null;
+
+  // Всё, что одно на продукт, считается один раз: форвард, σ «на деньгах» и
+  // нормированная историческая выборка. Память живёт один вызов buildRows.
+  const perProduct = productSide({ memo, product, timing, surface, spot, history, T, Teff });
+  const { forward, hist, scaledPrep } = perProduct;
 
   // Оценка зовётся и без волатильности: признак «ниже альтернативной ставки»
   // от σ не зависит, а цены и премии без неё просто остаются пустыми.
-  const valued = valueOffer({ direction, strike, apy, timing, forward, sigma, riskFree, riskFreeBtc });
+  const valued = valueOffer({ direction, strike, apy, timing, forward, sigma, riskFree, riskFreeBtc, skew });
 
   // Глубина конвертации под мерой рынка опционов. Это та же цена опциона, но
   // выраженная не как вероятность события, а как доля капитала: сколько теряется
   // в среднем, сколько теряется в самих случаях конвертации и насколько глубоко
-  // уходит цена в худших пяти процентах исходов.
-  const lossRN = sigma > 0 ? rnLossProfile({ direction, forward, strike, sigma, Teff, spot }) : null;
+  // уходит цена в худших пяти процентах исходов. Условная потеря делится на
+  // вероятность из улыбки — ту же, что показана в «P рын.».
+  const lossRN = sigma > 0 ? rnLossProfile({ direction, forward, strike, sigma, Teff, spot, p: valued.pTriggerRN }) : null;
 
   // Историческая частота срабатывания на том же горизонте.
   //
@@ -639,26 +670,28 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
   // ожидаемая доходность внутри одной серии считаются по одному распределению.
   // Раньше вероятность бралась из нормированного мира, а потеря — из сырого, и
   // одна карточка описывала два разных рынка сразу.
-  const hist = history ? history.returns(timing.tauDays) : null;
-  const scaledSorted = hist && sigma > 0 && spot > 0 ? history.scaled(timing.tauDays, sigma, Teff, forward / spot) : null;
-
+  //
+  // Нормированная серия одна на срок: выборка растягивается под σ «на деньгах»
+  // этого срока, а не под σ своего страйка. Улыбка уже несёт рыночную надбавку
+  // за толстый хвост, история — свой; растягивать историю под σ дальнего страйка
+  // значило учесть хвост дважды. Тот же принцип уже работает в траекторном слое.
   let pHist = null;
   let pHistScaled = null;
   let shortfall = null;
   let shortfallScaled = null;
   let lossHist = null;
   let lossHistScaled = null;
-  if (hist && hist.sorted.length) {
+  if (hist?.prep) {
     const x = Math.log(strike / spot);
-    const below = empiricalCdf(hist.sorted, x);
+    const below = sampleCdf(hist.prep, x);
     pHist = direction === 'BuyLow' ? below : 1 - below;
-    shortfall = empiricalShortfall(hist.sorted, spot, strike, direction);
-    lossHist = empiricalLossProfile(hist.sorted, spot, strike, direction);
-    if (scaledSorted?.length) {
-      const belowScaled = empiricalCdf(scaledSorted, x);
+    lossHist = sampleLossProfile(hist.prep, spot, strike, direction);
+    shortfall = lossHist?.expected ?? null;
+    if (scaledPrep) {
+      const belowScaled = sampleCdf(scaledPrep, x);
       pHistScaled = direction === 'BuyLow' ? belowScaled : 1 - belowScaled;
-      shortfallScaled = empiricalShortfall(scaledSorted, spot, strike, direction);
-      lossHistScaled = empiricalLossProfile(scaledSorted, spot, strike, direction);
+      lossHistScaled = sampleLossProfile(scaledPrep, spot, strike, direction);
+      shortfallScaled = lossHistScaled?.expected ?? null;
     }
   }
 
@@ -685,19 +718,18 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
   // стоимости — (1+i)(E[S]/spot − E[(S−K)⁺]/spot). Подставлять сюда единицу
   // вместо E[S]/spot нельзя: это молча приравнивает ожидаемую цену BTC к
   // текущей и на длинных сроках занижает результат на весь исторический дрейф.
-  const expNetFrom = (sf, series) => {
+  const expNetFrom = (sf, prep) => {
     if (sf == null || !(timing.lockDays > 0)) return null;
     let value = null;
     if (direction === 'BuyLow') {
       value = (1 + i) * (1 - sf);
-    } else if (series?.length) {
-      const meanGross = empiricalMeanGross(series);
-      if (meanGross != null) value = (1 + i) * (meanGross - sf);
+    } else if (prep) {
+      value = (1 + i) * (prep.meanGross - sf);
     }
     return value == null ? null : ((value - 1) * YEAR_DAYS) / timing.lockDays;
   };
-  const expNetApr = expNetFrom(shortfall, hist?.sorted);
-  const expNetAprScaled = expNetFrom(shortfallScaled, scaledSorted);
+  const expNetApr = expNetFrom(shortfall, hist?.prep);
+  const expNetAprScaled = expNetFrom(shortfallScaled, scaledPrep);
 
   // Где текущая ставка стоит относительно того, что предлагалось раньше на
   // таком же сроке и таком же расстоянии от спота. Величина справочная: в отбор
@@ -744,9 +776,13 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
     spot,
     forward,
     sigma,
+    sigmaAtm: perProduct.sigmaAtm,
+    skew,
     Teff,
     exactExpiry: surface ? hasExactExpiry(surface, timing.settle) : false,
     pRN: valued.pTriggerRN,
+    // Логнормальная вероятность без наклона улыбки — для справки и проверок.
+    pLognormal: valued.pLognormal,
     pHist,
     pHistScaled,
     histInfo: hist
@@ -924,6 +960,8 @@ export function buildRows({
   const surf = surface ? surfaceAt(surface, now) : null;
   const optionsAge = surface ? now - (surface.builtAt ?? surface.now) : Infinity;
   const optionsStale = !(optionsAge <= OPTIONS_MAX_AGE_MS);
+  // Общее на продукт считается один раз за вызов (см. productSide).
+  const memo = new Map();
   for (const product of products) {
     if (product.status !== 'Available') continue;
     if (product.isVipProduct && !vip) continue;
@@ -937,7 +975,7 @@ export function buildRows({
     if (!quote) continue;
     const levels = direction === 'BuyLow' ? quote.buyLowPrice : quote.sellHighPrice;
     for (const level of levels || []) {
-      const row = buildRow({ product, level, direction, now, spot, surface: surf, history, riskFree, riskFreeBtc, amount, stats });
+      const row = buildRow({ product, level, direction, now, spot, surface: surf, history, riskFree, riskFreeBtc, amount, stats, memo });
       row.optionsStale = optionsStale;
       row.pConv = pickProbability(row, measure);
       row.depth = pickDepth(row, measure);

@@ -231,22 +231,84 @@ console.log('── 1. Тайминг и начисление');
 
 console.log('\n── 2. Вероятность конвертации: аналитика против Монте-Карло');
 {
-  // Берём разнородную выборку: короткие и длинные сроки, ближние и дальние страйки.
-  const sample = [...buy].sort((a, b) => a.pRN - b.pRN).filter((r) => r.sigma > 0);
+  // Логнормальная часть: N(−d₂) на σ своего страйка против Монте-Карло той же
+  // меры. Рабочая «P рын.» — из улыбки, она сверяется ниже отдельно.
+  const sample = [...buy].sort((a, b) => a.pLognormal - b.pLognormal).filter((r) => r.sigma > 0);
   const picks = [sample[0], sample[Math.floor(sample.length / 4)], sample[Math.floor(sample.length / 2)], sample[sample.length - 1]];
   let worst = 0;
   for (const r of picks) {
     if (!r) continue;
     const mc = monteCarlo({ F: r.forward, K: r.strike, sigma: r.sigma, T: r.Teff, direction: 'BuyLow', i: r.i });
-    const diff = Math.abs(mc.p - r.pRN);
+    const diff = Math.abs(mc.p - r.pLognormal);
     worst = Math.max(worst, diff);
     ok(
-      `P(конв) ${r.duration} страйк ${r.strike}`,
+      `P(конв) логнормальная ${r.duration} страйк ${r.strike}`,
       diff < 4 * mc.se + 1e-4,
-      `аналитика ${pc(r.pRN)}, Монте-Карло ${pc(mc.p)}, расхождение ${(diff * 100).toFixed(3)} п.п.`,
+      `аналитика ${pc(r.pLognormal)}, Монте-Карло ${pc(mc.p)}, расхождение ${(diff * 100).toFixed(3)} п.п.`,
     );
   }
   ok('максимальное расхождение по вероятности мало', worst < 0.003, `${(worst * 100).toFixed(3)} п.п.`);
+
+  // Вероятность из улыбки — производная цены пута по страйку. Эталон считается
+  // отдельно: конечная разность цен по улыбке, сглаженной своей невзвешенной
+  // квадратичной регрессией по десяти ближайшим котировкам (в панели — трикуб).
+  const fitQuad = (pts, x0) => {
+    let S0 = 0, S1 = 0, S2 = 0, S3 = 0, S4 = 0, T0 = 0, T1 = 0, T2 = 0;
+    for (const { x, iv } of pts) {
+      const u = x - x0;
+      S0++; S1 += u; S2 += u * u; S3 += u ** 3; S4 += u ** 4; T0 += iv; T1 += iv * u; T2 += iv * u * u;
+    }
+    const A = [[S0, S1, S2], [S1, S2, S3], [S2, S3, S4]];
+    const B = [T0, T1, T2];
+    const det = (m) => m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    const D = det(A);
+    const c = [0, 1, 2].map((j) => det(A.map((row, i) => row.map((v, k) => (k === j ? B[i] : v)))) / D);
+    return (x) => c[0] + c[1] * (x - x0) + c[2] * (x - x0) ** 2;
+  };
+  let worstSmile = 0;
+  let smileChecked = 0;
+  for (const r of [...buy, ...sell].filter((x) => x.exactExpiry && x.sigma > 0)) {
+    const e = surface.expiries.reduce((a, b) => (Math.abs(b.expiry - r.timing.settle) < Math.abs(a.expiry - r.timing.settle) ? b : a));
+    const xK = Math.log(r.strike / e.forward);
+    if (xK < e.smile[0].x || xK > e.smile[e.smile.length - 1].x) continue;
+    const pts = [...e.smile].sort((a, b) => Math.abs(a.x - xK) - Math.abs(b.x - xK)).slice(0, 10);
+    const f = fitQuad(pts, xK);
+    const shift = r.sigma - f(xK);
+    const px = (k) => black76Put(r.forward, k, f(Math.log(k / e.forward)) + shift, r.Teff);
+    const h = r.strike * 1e-4;
+    const dPut = (px(r.strike + h) - px(r.strike - h)) / (2 * h);
+    const want = r.direction === 'BuyLow' ? dPut : 1 - dPut;
+    worstSmile = Math.max(worstSmile, Math.abs(want - r.pRN));
+    smileChecked++;
+  }
+  ok(
+    'P рын. = производная цены по отдельно сглаженной улыбке',
+    smileChecked > 50 && worstSmile < 0.005,
+    `строк ${smileChecked}, максимум расхождения ${(worstSmile * 100).toFixed(2)} п.п.`,
+  );
+  // Порядок вероятностей внутри лестниц — и рыночной, и нормированной истории.
+  let pairs = 0;
+  let monoBad = 0;
+  for (const rows of [buy, sell]) {
+    const by = new Map();
+    for (const r of rows) {
+      if (!by.has(r.productId)) by.set(r.productId, []);
+      by.get(r.productId).push(r);
+    }
+    for (const list of by.values()) {
+      const srt = [...list].sort((a, b) => a.strike - b.strike);
+      for (let k = 1; k < srt.length; k++) {
+        for (const key of ['pRN', 'pHistScaled']) {
+          const a = srt[k - 1][key];
+          const b = srt[k][key];
+          if (a == null || b == null) continue;
+          pairs++;
+          if (srt[k].direction === 'BuyLow' ? b < a - 1e-12 : b > a + 1e-12) monoBad++;
+        }
+      }
+    }
+  }
+  ok('вероятности монотонны внутри каждой лестницы', monoBad === 0, `пар соседей ${pairs}, нарушений ${monoBad}`);
 
   // Справедливая стоимость: аналитика против того же Монте-Карло.
   const r = picks[2];
@@ -265,9 +327,9 @@ console.log('\n── 2. Вероятность конвертации: анал
   if (s) {
     const mc = monteCarlo({ F: s.forward, K: s.strike, sigma: s.sigma, T: s.Teff, direction: 'SellHigh', i: s.i });
     ok(
-      `P(продажи) ${s.duration} страйк ${s.strike}`,
-      Math.abs(mc.p - s.pRN) < 4 * mc.se + 1e-4,
-      `аналитика ${pc(s.pRN)}, Монте-Карло ${pc(mc.p)}`,
+      `P(продажи) логнормальная ${s.duration} страйк ${s.strike}`,
+      Math.abs(mc.p - s.pLognormal) < 4 * mc.se + 1e-4,
+      `аналитика ${pc(s.pLognormal)}, Монте-Карло ${pc(mc.p)}`,
     );
   }
 }
@@ -750,7 +812,7 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     const expected = (((1 + r.i) * (meanGross - r.shortfall) - 1) * YEAR_DAYS) / r.timing.lockDays;
     if (Math.abs(expected - r.expNetApr) > 1e-9) driftBad++;
     // Нормированная серия обязана давать свой собственный shortfall и своё EV.
-    const sc = history.scaled(r.timing.tauDays, r.sigma, r.Teff, r.forward / spot);
+    const sc = history.scaled(r.timing.tauDays, r.sigmaAtm, r.Teff, r.forward / spot);
     if (sc) {
       const mg = empiricalMeanGross(sc);
       const want = (((1 + r.i) * (mg - r.shortfallScaled) - 1) * YEAR_DAYS) / r.timing.lockDays;
@@ -1250,7 +1312,8 @@ console.log('\n── 12. Две согласованные серии вмес�
   let evBad = 0;
   let checked = 0;
   for (const r of buy) {
-    const sc = history.scaled(r.timing.tauDays, r.sigma, r.Teff, r.forward / spot);
+    // Нормированная серия одна на срок: растянута под σ «на деньгах».
+    const sc = history.scaled(r.timing.tauDays, r.sigmaAtm, r.Teff, r.forward / spot);
     if (!sc?.length) continue;
     checked++;
     // Мартингальность: среднее самой цены равно форварду, а не медиана.
@@ -1273,7 +1336,7 @@ console.log('\n── 12. Две согласованные серии вмес�
   const longRow = buy.filter((r) => r.timing.tauDays > 120).sort((a, b) => b.timing.tauDays - a.timing.tauDays)[0];
   if (longRow) {
     const h = history.returns(longRow.timing.tauDays);
-    const k = (longRow.sigma * Math.sqrt(longRow.Teff)) / h.sigma;
+    const k = (longRow.sigmaAtm * Math.sqrt(longRow.Teff)) / h.sigma;
     const drift = Math.log(longRow.forward / spot);
     const naive = h.sorted.map((x) => (x - h.mean) * k + drift);
     const bias = empiricalMeanGross(naive) / (longRow.forward / spot) - 1;

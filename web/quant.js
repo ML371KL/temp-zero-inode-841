@@ -242,7 +242,29 @@ export function chainedApr(apy, yieldDays, cycleDays) {
  *   S_T ≥ K  → возвращают Q(1+i)·K USDT
  * Выплата в USDT = Q(1+i)·min(S_T, K) — проданный колл со страйком K.
  */
-export function valueOffer({ direction, strike, apy, timing, forward, sigma, riskFree = 0, riskFreeBtc = 0 }) {
+/**
+ * Вероятность конвертации, которую несут цены опционов: производная
+ * недисконтированной цены по страйку (Бриден — Литценбергер),
+ *   Buy Low:   P(S<K) = ∂Put/∂K  =  N(−d₂) + вега·∂σ/∂K,
+ *   Sell High: P(S>K) = −∂Call/∂K =  N(d₂) − вега·∂σ/∂K,
+ * где вега = F·φ(d₁)·√T. N(∓d₂) на σ своего страйка — это вероятность
+ * логнормального мира с плоской улыбкой; у BTC σ растёт к дальним путам, и без
+ * поправки на наклон вероятность дальних страйков завышена. Без наклона —
+ * откат на N(∓d₂). Результат зажат в [0, 1].
+ */
+export function digitalProbability({ direction, forward, strike, sigma, Teff, skew = null }) {
+  if (!(sigma > 0) || !(Teff > 0) || !(forward > 0) || !(strike > 0)) return null;
+  const v = sigma * Math.sqrt(Teff);
+  const d1 = (Math.log(forward / strike) + (v * v) / 2) / v;
+  const d2 = d1 - v;
+  const base = direction === 'BuyLow' ? normCdf(-d2) : normCdf(d2);
+  if (skew == null || !Number.isFinite(skew)) return base;
+  const vega = forward * Math.exp((-d1 * d1) / 2) * Math.sqrt(Teff / (2 * Math.PI));
+  const p = direction === 'BuyLow' ? base + vega * skew : base - vega * skew;
+  return clamp(p, 0, 1);
+}
+
+export function valueOffer({ direction, strike, apy, timing, forward, sigma, riskFree = 0, riskFreeBtc = 0, skew = null }) {
   const i = interestRate(apy, timing.yieldDays);
   const T = Math.max(timing.tauDays, 0) / YEAR_DAYS;
   const Teff = twapEffectiveT(T);
@@ -269,21 +291,19 @@ export function valueOffer({ direction, strike, apy, timing, forward, sigma, ris
 
   let fairPerUnit; // ожидание выплаты под Q, в единицах вложенного капитала
   let optionPrice = null;
-  let pTrigger = null; // вероятность конвертации под мерой Q
+  let pTrigger = null; // вероятность конвертации под мерой Q — из улыбки
+  let pLognormal = null; // она же без наклона улыбки, N(∓d₂)
 
   if (sigma > 0 && Teff > 0) {
-    const v = sigma * Math.sqrt(Teff);
-    const d1 = (Math.log(F / K) + (v * v) / 2) / v;
-    const d2 = d1 - v;
     if (direction === 'BuyLow') {
       optionPrice = black76Put(F, K, sigma, Teff);
       fairPerUnit = (1 + i) * (1 - optionPrice / K);
-      pTrigger = normCdf(-d2);
     } else {
       optionPrice = black76Call(F, K, sigma, Teff);
       fairPerUnit = ((1 + i) * (F - optionPrice)) / F;
-      pTrigger = normCdf(d2);
     }
+    pLognormal = digitalProbability({ direction, forward: F, strike: K, sigma, Teff });
+    pTrigger = digitalProbability({ direction, forward: F, strike: K, sigma, Teff, skew });
   }
 
   // Оферта, переведённая в волатильность: при какой sigma премия ровно справедлива.
@@ -322,6 +342,7 @@ export function valueOffer({ direction, strike, apy, timing, forward, sigma, ris
     df,
     optionPrice,
     pTriggerRN: pTrigger,
+    pLognormal,
     offerVol,
     belowRiskFree,
     marketVol: sigma ?? null,
@@ -416,15 +437,19 @@ export function empiricalShortfall(sorted, spot, strike, direction) {
 
 export const STRESS_LEVEL = 0.05;
 
-/** Профиль глубины под мерой Q: аналитически из тех же цен опционов. */
-export function rnLossProfile({ direction, forward, strike, sigma, Teff, spot, level = STRESS_LEVEL }) {
+/**
+ * Профиль глубины под мерой Q: аналитически из тех же цен опционов.
+ * p — вероятность конвертации той же меры (из улыбки); условная потеря — это
+ * безусловная, делённая на неё. Без p берётся логнормальная N(∓d₂).
+ */
+export function rnLossProfile({ direction, forward, strike, sigma, Teff, spot, level = STRESS_LEVEL, p: pGiven = null }) {
   if (!(sigma > 0) || !(Teff > 0) || !(strike > 0) || !(forward > 0)) return null;
   const v = sigma * Math.sqrt(Teff);
   const d1 = (Math.log(forward / strike) + (v * v) / 2) / v;
   const d2 = d1 - v;
   const base = direction === 'BuyLow' ? strike : spot > 0 ? spot : forward;
   const price = direction === 'BuyLow' ? black76Put(forward, strike, sigma, Teff) : black76Call(forward, strike, sigma, Teff);
-  const p = direction === 'BuyLow' ? normCdf(-d2) : normCdf(d2);
+  const p = Number.isFinite(pGiven) ? pGiven : direction === 'BuyLow' ? normCdf(-d2) : normCdf(d2);
   // Квантиль цены сеттлмента под Q: S = F·exp(σ√T·z − σ²T/2).
   // Для Buy Low плохой исход — низкая цена, для Sell High — высокая.
   const z = normInv(direction === 'BuyLow' ? level : 1 - level);
@@ -459,6 +484,72 @@ export function empiricalLossProfile(sorted, spot, strike, direction, level = ST
     sorted.length - 1,
   );
   const sq = spot * Math.exp(sorted[idx]);
+  const stress = direction === 'BuyLow' ? Math.max(0, (strike - sq) / base) : Math.max(0, (sq - strike) / base);
+  return { expected: mean / base, conditional: p > 1e-9 ? mean / base / p : null, stress };
+}
+
+/**
+ * Выборка, подготовленная к ответам за O(log n): отсортированные логарифмы,
+ * множители цены e^r в том же порядке и их нарастающие суммы. Раньше каждая
+ * строка таблицы проходила всю выборку заново (тысячи экспонент на строку,
+ * сотни строк на кадр) — это была почти половина времени кадра. Ответы те же,
+ * что у empiricalCdf / empiricalLossProfile / empiricalMeanGross, до порядка
+ * суммирования.
+ */
+export function prepareSample(sorted) {
+  const n = sorted?.length ?? 0;
+  if (!n) return null;
+  const logs = sorted instanceof Float64Array ? sorted : Float64Array.from(sorted);
+  const gross = new Float64Array(n);
+  const cum = new Float64Array(n + 1);
+  for (let j = 0; j < n; j++) {
+    gross[j] = Math.exp(logs[j]);
+    cum[j + 1] = cum[j] + gross[j];
+  }
+  return { logs, gross, cum, n, meanGross: cum[n] / n };
+}
+
+/** Число элементов отсортированного массива, строго меньших x (или ≤ x при orEqual). */
+function countBelow(arr, x, orEqual) {
+  let lo = 0;
+  let hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (orEqual ? arr[mid] <= x : arr[mid] < x) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/** Доля выборки не выше x (в логарифмах) — то же, что empiricalCdf. */
+export function sampleCdf(prep, x) {
+  return prep ? countBelow(prep.logs, x, true) / prep.n : null;
+}
+
+/**
+ * Профиль глубины по подготовленной выборке — то же, что empiricalLossProfile:
+ * ожидаемая потеря, условная (на случаи с потерей) и стресс-квантиль.
+ */
+export function sampleLossProfile(prep, spot, strike, direction, level = STRESS_LEVEL) {
+  if (!prep || !(spot > 0) || !(strike > 0)) return null;
+  const { gross, cum, n, logs } = prep;
+  const k = strike / spot;
+  let acc;
+  let hits;
+  if (direction === 'BuyLow') {
+    // Потеря есть там, где цена сеттлмента строго ниже страйка.
+    hits = countBelow(gross, k, false);
+    acc = hits * strike - spot * cum[hits];
+  } else {
+    const below = countBelow(gross, k, true);
+    hits = n - below;
+    acc = spot * (cum[n] - cum[below]) - hits * strike;
+  }
+  const base = direction === 'BuyLow' ? strike : spot;
+  const mean = Math.max(0, acc) / n;
+  const p = hits / n;
+  const idx = clamp(Math.floor((direction === 'BuyLow' ? level : 1 - level) * (n - 1)), 0, n - 1);
+  const sq = spot * Math.exp(logs[idx]);
   const stress = direction === 'BuyLow' ? Math.max(0, (strike - sq) / base) : Math.max(0, (sq - strike) / base);
   return { expected: mean / base, conditional: p > 1e-9 ? mean / base / p : null, stress };
 }
