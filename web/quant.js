@@ -171,17 +171,29 @@ export function productTiming(product, now) {
 
   // Длина цикла при непрерывном повторении оферты.
   //
-  // Продукты каждого срока выпускаются раз в сутки, поэтому деньги, вернувшиеся
-  // после сеттлмента, не могут сразу зайти в следующую такую же оферту: надо
-  // дождаться закрытия очередного окна подписки. Для суточного продукта это
-  // означает цикл в двое суток на одни сутки начисления, то есть вдвое меньшую
-  // доходность, чем показывает разовая покупка перед самым закрытием окна.
+  // Деньги, вернувшиеся после сеттлмента, не могут сразу зайти в следующую
+  // оферту: надо дождаться закрытия очередного окна подписки (дедлайн общий у
+  // всех продуктов, раз в сутки). Для суточного продукта это цикл в двое суток
+  // на одни сутки начисления.
+  //
+  // Какой продукт будет следующим, зависит от серии. Скользящие (до 5 суток)
+  // выходят каждый день с тем же сроком. Недельные, месячные и квартальные
+  // привязаны к пятницам: после 9d с сеттлментом в пятницу следующий недельный
+  // рассчитается через 7 суток, и начисление в нём — 6 суток, а не 9.
   const k = Math.max(1, Math.ceil((receive - subEnd) / MS_DAY));
   const nextWindow = subEnd + k * MS_DAY;
-  const cycleDays = (nextWindow - settle) / MS_DAY + yieldDays;
+  const kind = cycleKind(settle, yieldDays);
+  const nextSettle = kind === 'rolling' ? nextWindow + yieldDays * MS_DAY : nextCalendarSettle(settle, kind);
+  const cycleDays = (nextSettle - settle) / MS_DAY;
+  // Начисление следующего цикла: от дедлайна его подписки до его сеттлмента.
+  const nextYieldDays = (nextSettle - nextWindow) / MS_DAY;
 
   return {
     cycleDays,
+    cycleKind: kind,
+    nextYieldDays,
+    // Сколько от сеттлмента до дедлайна следующей подписки: простой без процента.
+    gapDays: (nextWindow - settle) / MS_DAY,
     entry,
     subStart,
     subEnd,
@@ -201,6 +213,83 @@ export function productTiming(product, now) {
     // повод не доверять расчёту, а не молча подставлять метку.
     labelMatches: labelDays == null ? false : Math.abs(labelDays - yieldDays) < 1e-6,
   };
+}
+
+// ───────────────────────────────────────────────── расписание сеттлментов
+
+const QUARTER_MONTHS = new Set([2, 5, 8, 11]); // март, июнь, сентябрь, декабрь
+
+/** Последняя пятница месяца (смещение month от месяца ts) в то же время суток UTC, что ts. */
+function lastFridayAfter(ts, months) {
+  const d = new Date(ts);
+  const tod = ts - Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+  // Нулевой день следующего месяца — последний день нужного.
+  const last = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + months + 1, 0));
+  const back = (last.getUTCDay() - 5 + 7) % 7;
+  return Date.UTC(last.getUTCFullYear(), last.getUTCMonth(), last.getUTCDate() - back) + tod;
+}
+
+/**
+ * Серия продукта по дате сеттлмента и сроку:
+ *  срок ≤ 5 сут — скользящий, выходит каждый день с тем же сроком;
+ *  сеттлмент в пятницу и срок > 5 сут:
+ *    последняя пятница квартального месяца и срок > 45 сут — квартальный;
+ *    последняя пятница месяца и срок > 13 сут — месячный;
+ *    иначе — недельный;
+ *  всё прочее — как скользящий.
+ */
+export function cycleKind(settle, yieldDays) {
+  if (!(yieldDays > 5)) return 'rolling';
+  const d = new Date(settle);
+  if (d.getUTCDay() !== 5) return 'rolling';
+  const lastFriday = new Date(settle + 7 * MS_DAY).getUTCMonth() !== d.getUTCMonth();
+  if (lastFriday && QUARTER_MONTHS.has(d.getUTCMonth()) && yieldDays > 45) return 'quarterly';
+  if (lastFriday && yieldDays > 13) return 'monthly';
+  return 'weekly';
+}
+
+/** Следующий сеттлмент календарной серии. */
+export function nextCalendarSettle(settle, kind) {
+  if (kind === 'weekly') return settle + 7 * MS_DAY;
+  if (kind === 'monthly') return lastFridayAfter(settle, 1);
+  if (kind === 'quarterly') return lastFridayAfter(settle, 3);
+  return null;
+}
+
+/**
+ * Сеттлменты непрерывного повторения оферты внутри горизонта, в сутках от
+ * момента входа: первый — этой оферты (через τ), дальше по расписанию серии.
+ * accrual[k] — дни начисления цикла k: у первого — срок оферты, у следующих —
+ * от дедлайна их подписки (сеттлмент + простой) до их сеттлмента. cycle[k] —
+ * длина цикла k (у первого — τ).
+ */
+export function settlementSchedule(timing, horizonDays) {
+  const days = [];
+  const accrual = [];
+  const cycle = [];
+  if (!(timing?.tauDays > 0) || !(horizonDays >= timing.tauDays) || !(timing.cycleDays > 0)) {
+    return { days, accrual, cycle, n: 0, tailDays: horizonDays };
+  }
+  days.push(timing.tauDays);
+  accrual.push(timing.yieldDays);
+  cycle.push(timing.tauDays);
+  const calendar = timing.cycleKind && timing.cycleKind !== 'rolling' && Number.isFinite(timing.settle);
+  // Простой между сеттлментом и дедлайном следующей подписки; без явного поля —
+  // как у скользящей серии: цикл минус срок.
+  const gap = Number.isFinite(timing.gapDays) ? timing.gapDays : timing.cycleDays - timing.yieldDays;
+  let prev = calendar ? timing.settle : 0;
+  for (let k = 1; k < 10_000; k++) {
+    // Скользящая серия — постоянный цикл в сутках; календарная — по датам.
+    const next = calendar ? nextCalendarSettle(prev, timing.cycleKind) : prev + timing.cycleDays;
+    const len = calendar ? (next - prev) / MS_DAY : timing.cycleDays;
+    const d = days[days.length - 1] + len;
+    if (!(d <= horizonDays + 1e-9)) break;
+    days.push(d);
+    cycle.push(len);
+    accrual.push(len - gap);
+    prev = next;
+  }
+  return { days, accrual, cycle, n: days.length, tailDays: Math.max(0, horizonDays - days[days.length - 1]) };
 }
 
 // Простые проценты за номинальный срок: payout = amount × (1 + apy × D/365).
@@ -804,11 +893,16 @@ export function breakevenStrike(basis, apy, yieldDays) {
  * Считаем консервативно: цена стоит на месте, продажа не срабатывает,
  * растёт только количество BTC.
  */
-export function cyclesToRecover(basis, spot, apy, yieldDays, lockDays, cycleDays = lockDays, maxCycles = 400) {
+export function cyclesToRecover(basis, spot, apy, yieldDays, lockDays, cycleDays = lockDays, maxCycles = 400, nextYieldDays = yieldDays) {
   const i = interestRate(apy, yieldDays);
-  if (!(i > 0) || !(spot > 0) || !(basis > spot)) return { cycles: 0, days: 0 };
-  const n = Math.log(basis / spot) / Math.log(1 + i);
-  const cycles = Math.ceil(n);
+  // У недельных и календарных серий следующие циклы начисляют меньше дней, чем
+  // срок первой оферты (9d → 6 суток), поэтому процент первого цикла и
+  // следующих разный. Ставка при этом та же: цена стоит на месте.
+  const i1 = interestRate(apy, nextYieldDays);
+  if (!(i > 0) || !(i1 > 0) || !(spot > 0) || !(basis > spot)) return { cycles: 0, days: 0 };
+  const gap = Math.log(basis / spot);
+  const n = gap <= Math.log(1 + i) ? 1 : 1 + (gap - Math.log(1 + i)) / Math.log(1 + i1);
+  const cycles = i1 === i ? Math.ceil(gap / Math.log(1 + i)) : Math.ceil(n - 1e-12);
   if (!Number.isFinite(cycles) || cycles > maxCycles) return { cycles: null, days: null };
   // Первый цикл идёт от сегодняшнего дня до зачисления, а каждый следующий —
   // полный оборот с простоем между окнами подписки. Считать все циклы по
@@ -842,12 +936,72 @@ export function clamp(x, lo, hi) {
  * годовое удержание биткоина даёт +42%, а медианное — заметно меньше, и
  * показывать только первое значит обещать типичный исход по нетипичному.
  */
-export function median(values) {
+export function median(values, scratch = null) {
   if (!values?.length) return null;
-  // Копия обязательна: сортировка на месте испортила бы попутевый порядок,
-  // из которого стоимость и считалась.
-  const copy = Float64Array.from(values);
-  copy.sort();
-  const mid = copy.length >> 1;
-  return copy.length % 2 ? copy[mid] : (copy[mid - 1] + copy[mid]) / 2;
+  // Копия обязательна: перестановка на месте испортила бы попутевый порядок,
+  // из которого стоимость и считалась. Полная сортировка не нужна — хватает
+  // выбора k-го элемента: на кадре это сотни медиан по полторы тысячи траекторий.
+  const n = values.length;
+  const a = scratch && scratch.length >= n ? scratch.subarray(0, n) : new Float64Array(n);
+  a.set(values);
+  const mid = n >> 1;
+  const hi = selectKth(a, mid);
+  if (n % 2) return hi;
+  // После выбора слева от mid лежит всё, что не больше a[mid].
+  let lo = -Infinity;
+  for (let j = 0; j < mid; j++) if (a[j] > lo) lo = a[j];
+  return (lo + hi) / 2;
+}
+
+/** k-й по величине элемент (с нуля), перестановкой на месте — выбор Хоара. */
+function selectKth(a, k) {
+  let lo = 0;
+  let hi = a.length - 1;
+  while (hi > lo) {
+    const mid = (lo + hi) >> 1;
+    // Медиана трёх как опорный: на почти упорядоченных данных без неё выбор
+    // вырождается в квадратичный.
+    if (a[mid] < a[lo]) [a[mid], a[lo]] = [a[lo], a[mid]];
+    if (a[hi] < a[lo]) [a[hi], a[lo]] = [a[lo], a[hi]];
+    if (a[hi] < a[mid]) [a[hi], a[mid]] = [a[mid], a[hi]];
+    const pivot = a[mid];
+    let i = lo;
+    let j = hi;
+    while (i <= j) {
+      while (a[i] < pivot) i++;
+      while (a[j] > pivot) j--;
+      if (i <= j) {
+        const t = a[i];
+        a[i] = a[j];
+        a[j] = t;
+        i++;
+        j--;
+      }
+    }
+    if (k <= j) hi = j;
+    else if (k >= i) lo = i;
+    else return a[k];
+  }
+  return a[k];
+}
+
+/**
+ * Среднее геометрическое положительных значений. Логарифм берётся не от
+ * каждого значения, а от произведений небольших пачек — на кадре это десятки
+ * тысяч логарифмов вместо миллиона. Значения ниже 1e-12 зажимаются, как раньше.
+ */
+export function geoMean(values) {
+  const n = values?.length ?? 0;
+  if (!n) return null;
+  let logSum = 0;
+  let acc = 1;
+  for (let j = 0; j < n; j++) {
+    acc *= values[j] > 1e-12 ? values[j] : 1e-12;
+    if ((j & 31) === 31 || acc > 1e150 || acc < 1e-150) {
+      logSum += Math.log(acc);
+      acc = 1;
+    }
+  }
+  logSum += Math.log(acc);
+  return Math.exp(logSum / n);
 }

@@ -35,6 +35,7 @@ import {
 } from '../web/model.js';
 import {
   productTiming,
+  settlementSchedule,
   interestRate,
   basisFromConversion,
   effectiveApr,
@@ -200,9 +201,10 @@ console.log('── 1. Тайминг и начисление');
   for (const p of products) {
     const t = productTiming(p, now);
     if (!t.labelMatches) labelBad++;
-    // Цикл обязан быть больше окна начисления и кратен суткам с точностью до
-    // задержки выдачи: продукты выпускаются раз в сутки.
-    const extra = t.cycleDays - t.yieldDays;
+    // Цикл обязан быть больше начисления следующего цикла не больше чем на
+    // сутки: дедлайн подписки общий и наступает раз в сутки. У недельных и
+    // календарных серий начисление следующего цикла короче срока оферты.
+    const extra = t.cycleDays - t.nextYieldDays;
     if (!(extra > 0 && extra <= 1.0001)) cycleBad.push(`${p.duration}: +${extra.toFixed(4)}д`);
     // Проверка осмысленна только для открытых окон: у закрытого продукта
     // подписаться уже нельзя, и остаток блокировки естественно короче срока.
@@ -220,10 +222,25 @@ console.log('── 1. Тайминг и начисление');
     `${pc(r.aprEff)}`,
   );
   ok(
-    'APR в цикле = APY·D/цикл на живой строке',
-    Math.abs(r.aprChained - (r.apy * t.yieldDays) / t.cycleDays) < 1e-12,
+    'APR в цикле = APY·D_след/цикл на живой строке',
+    Math.abs(r.aprChained - (r.apy * t.nextYieldDays) / t.cycleDays) < 1e-12,
     `${pc(r.aprChained)}`,
   );
+  // Серии продуктов по расписанию, а не «завтра выйдет такой же».
+  const kinds = new Map();
+  for (const p of products) {
+    const t2 = productTiming(p, now);
+    kinds.set(`${p.duration}`, `${t2.cycleKind} ${t2.cycleDays.toFixed(2)}/${t2.nextYieldDays.toFixed(2)}`);
+  }
+  console.log(`       серии: ${[...kinds].map(([d, k]) => `${d} ${k}`).join(' · ')}`);
+  const fridayBad = products.filter((p) => {
+    const t2 = productTiming(p, now);
+    if (t2.cycleKind === 'rolling') return false;
+    // Независимо: следующий сеттлмент календарной серии — пятница в 07:59:59 UTC.
+    const next = new Date(t2.settle + t2.cycleDays * MS_DAY);
+    return next.getUTCDay() !== 5 || next.getUTCHours() !== new Date(t2.settle).getUTCHours();
+  });
+  ok('следующий сеттлмент календарных серий — пятница в то же время', fridayBad.length === 0, `нарушений ${fridayBad.length}`);
   ok('APR в цикле не выше эффективного', buy.every((x) => x.aprChained <= x.aprEff + 1e-12));
   ok(
     'процент за срок = APY·D/365',
@@ -270,6 +287,7 @@ console.log('\n── 2. Вероятность конвертации: анал
     return (x) => c[0] + c[1] * (x - x0) + c[2] * (x - x0) ** 2;
   };
   let worstSmile = 0;
+  let worstSmileRow = '';
   let smileChecked = 0;
   for (const r of [...buy, ...sell].filter((x) => x.exactExpiry && x.sigma > 0)) {
     const e = surface.expiries.reduce((a, b) => (Math.abs(b.expiry - r.timing.settle) < Math.abs(a.expiry - r.timing.settle) ? b : a));
@@ -282,13 +300,19 @@ console.log('\n── 2. Вероятность конвертации: анал
     const h = r.strike * 1e-4;
     const dPut = (px(r.strike + h) - px(r.strike - h)) / (2 * h);
     const want = r.direction === 'BuyLow' ? dPut : 1 - dPut;
-    worstSmile = Math.max(worstSmile, Math.abs(want - r.pRN));
+    if (Math.abs(want - r.pRN) > worstSmile) {
+      worstSmile = Math.abs(want - r.pRN);
+      worstSmileRow = `${r.duration} ${r.direction} ${r.strike}: ${pc(r.pRN)} против ${pc(want)}`;
+    }
     smileChecked++;
   }
+  // Допуск — один пункт: два сглаживателя (трикуб у панели, невзвешенный здесь)
+  // законно расходятся на крутых суточных улыбках у денег. Ошибка в формуле
+  // давала бы расхождение порядка самой поправки — до 8 п.п.
   ok(
     'P рын. = производная цены по отдельно сглаженной улыбке',
-    smileChecked > 50 && worstSmile < 0.005,
-    `строк ${smileChecked}, максимум расхождения ${(worstSmile * 100).toFixed(2)} п.п.`,
+    smileChecked > 50 && worstSmile < 0.01,
+    `строк ${smileChecked}, максимум расхождения ${(worstSmile * 100).toFixed(2)} п.п. (${worstSmileRow})`,
   );
   // Порядок вероятностей внутри лестниц — и рыночной, и нормированной истории.
   let pairs = 0;
@@ -835,8 +859,12 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
   for (const r of analyzed) {
     const rec = r.recovery;
     if (rec.cycles == null || rec.cycles === 0) continue;
-    const grown = (1 + r.i) ** rec.cycles;
+    // Первый цикл начисляет срок оферты, следующие — начисление своего цикла.
+    const i1 = (r.apy * r.timing.nextYieldDays) / YEAR_DAYS;
+    const grown = (1 + r.i) * (1 + i1) ** (rec.cycles - 1);
     if (grown < basis / spot - 1e-9) recBad.push(`${r.duration}/${r.strike}`);
+    const fewer = rec.cycles > 1 ? (1 + r.i) * (1 + i1) ** (rec.cycles - 2) : 0;
+    if (fewer >= basis / spot) recBad.push(`${r.duration}/${r.strike}: лишний цикл`);
     // Длительность обязана учитывать простой между окнами подписки.
     const expectedDays = r.timing.lockDays + (rec.cycles - 1) * r.timing.cycleDays;
     if (Math.abs(rec.days - expectedDays) > 1e-9) recBad.push(`срок ${r.duration}`);
@@ -1080,9 +1108,9 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     ok('шанс выхода посчитан для всех строк', withH.length === analyzed.length, `${withH.length} из ${analyzed.length}`);
     ok('шанс выхода лежит в [0,1]', withH.every((r) => r.pExitHorizon >= 0 && r.pExitHorizon <= 1));
     ok(
-      'оферта длиннее горизонта не даёт шанса выйти',
-      analyzed.filter((r) => r.timing.cycleDays > H).every((r) => r.pExitHorizon === 0),
-      `таких оферт ${analyzed.filter((r) => r.timing.cycleDays > H).length}`,
+      'оферта с первым сеттлментом за горизонтом не даёт шанса выйти',
+      analyzed.filter((r) => r.timing.tauDays > H).every((r) => r.pExitHorizon === 0),
+      `таких оферт ${analyzed.filter((r) => r.timing.tauDays > H).length}`,
     );
     // Чем выше страйк, тем труднее до него дойти.
     let mono = 0;
@@ -1113,15 +1141,17 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     // Отсортированные значения контрольной точки k для данной сетки (τ, цикл):
     // считаются один раз на сетку, дальше каждая строка стоит n бинарных поисков.
     const pointDists = new Map();
-    const pointsFor = (tauDays, cycleDays, n) => {
-      const firstBars = Math.max(1, Math.round(tauDays / spBase.barDays));
-      const cycleBars = Math.max(1, Math.round(cycleDays / spBase.barDays));
-      const key = `${firstBars}:${cycleBars}:${n}`;
+    // Контрольные точки — по расписанию серии (у недельных и календарных оно
+    // нерегулярно), сдвиги посчитаны здесь заново от дат сеттлментов.
+    const pointsFor = (timing, n) => {
+      const sched = settlementSchedule(timing, H);
+      const firstBars = Math.max(1, Math.round(sched.days[0] / spBase.barDays));
+      const key = `${firstBars}:${sched.days.map((d) => Math.round((d - sched.days[0]) / spBase.barDays)).join(',')}`;
       let dists = pointDists.get(key);
       if (!dists) {
         dists = [];
         for (let k = 0; k < n; k++) {
-          const bar = Math.min(spBase.bars, firstBars + k * cycleBars);
+          const bar = Math.min(spBase.bars, firstBars + Math.round((sched.days[k] - sched.days[0]) / spBase.barDays));
           const vals = new Float64Array(spBase.paths);
           for (let p = 0; p < spBase.paths; p++) vals[p] = spBase.ratio[p * spBase.width + bar];
           vals.sort();
@@ -1137,7 +1167,7 @@ console.log('\n── 10. Sell High: себестоимость, безубыт�
     for (const r of withH) {
       const n = r.horizonInfo?.cycles ?? 0;
       if (n < 2 || !(r.pExitHorizon > 0)) continue;
-      const dists = pointsFor(r.timing.tauDays, r.timing.cycleDays, n);
+      const dists = pointsFor(r.timing, n);
       const ratio = r.strike / spot;
       let survive = 1;
       for (let k = 0; k < n; k++) survive *= empiricalCdf(dists[k], ratio);
@@ -1486,27 +1516,86 @@ console.log('\n── 14. Стратегия до выбранной даты');
   }
   ok('шанс закончить в BTC совпадает с риском за горизонт', riskBad === 0, `нарушений ${riskBad}`);
 
-  // Полный перебор стоимости для нескольких строк.
-  let valBad = 0;
-  for (const r of rows.filter((x) => x.strategy).slice(0, 6)) {
-    const paths = history.pathSeries(r.timing.tauDays, r.timing.cycleDays, HS);
-    const n = paths.cycles;
-    const target = r.strike / spot;
-    const tail = 1 + (riskFree * paths.tailDays) / YEAR_DAYS;
-    let acc = 0;
-    for (let p = 0; p < paths.paths; p++) {
-      let k = -1;
-      for (let q = 0; q < n; q++) {
-        if (paths.runMin[p * n + q] <= target) {
-          k = q;
-          break;
-        }
-      }
-      acc += k >= 0 ? ((1 + r.i) ** (k + 1) * paths.terminal[p] * spot) / r.strike : (1 + r.i) ** n * tail;
+  // Полный перебор стоимости для нескольких строк — своим кодом: своё расписание
+  // (скользящие — τ + k·цикл, календарные — по датам последних пятниц, найденным
+  // перебором дней), своя лестница по удалению и линейный поиск по ней.
+  const lastFri = (y, m) => {
+    let best = null;
+    for (let d = 1; d <= 31; d++) {
+      const t = new Date(Date.UTC(y, m, d));
+      if (t.getUTCMonth() !== m) break;
+      if (t.getUTCDay() === 5) best = d;
     }
-    if (Math.abs(acc / paths.paths - r.strategy.value) > 1e-9) valBad++;
+    return best;
+  };
+  const scheduleOf = (r) => {
+    const t = r.timing;
+    const out = [{ d: t.tauDays, a: t.yieldDays, c: t.tauDays }];
+    let prev = t.settle;
+    for (let k = 1; k < 500; k++) {
+      let next;
+      if (t.cycleKind === 'weekly') next = prev + 7 * MS_DAY;
+      else if (t.cycleKind === 'monthly' || t.cycleKind === 'quarterly') {
+        const d0 = new Date(prev);
+        const m = d0.getUTCMonth() + (t.cycleKind === 'monthly' ? 1 : 3);
+        const y = d0.getUTCFullYear() + Math.floor(m / 12);
+        const mm = m % 12;
+        next = Date.UTC(y, mm, lastFri(y, mm), d0.getUTCHours(), d0.getUTCMinutes(), d0.getUTCSeconds());
+      } else next = prev + t.cycleDays * MS_DAY;
+      const d = t.tauDays + (next - t.settle) / MS_DAY;
+      if (d > HS + 1e-9) break;
+      out.push({ d, a: (next - prev) / MS_DAY - 1, c: (next - prev) / MS_DAY });
+      prev = next;
+    }
+    return out;
+  };
+  const sp = history.scenarioPaths(HS);
+  let valBad = 0;
+  for (const r of rows.filter((x) => x.strategy).slice(0, 12)) {
+    const sch = scheduleOf(r);
+    const lad = rows
+      .filter((x) => x.productId === r.productId)
+      .map((x) => [x.strike / spot, x.apy])
+      .sort((a, b) => a[0] - b[0]);
+    const rateAt = (m) => {
+      if (m < lad[0][0]) return null;
+      if (m >= lad[lad.length - 1][0]) return lad[lad.length - 1][1];
+      for (let j = 1; j < lad.length; j++) {
+        if (m <= lad[j][0]) return lad[j - 1][1] + ((m - lad[j - 1][0]) / (lad[j][0] - lad[j - 1][0])) * (lad[j][1] - lad[j - 1][1]);
+      }
+      return lad[lad.length - 1][1];
+    };
+    const K = r.strike / spot;
+    const fb = Math.max(1, Math.round(sch[0].d / sp.barDays));
+    const tailDays = HS - sch[sch.length - 1].d;
+    let acc = 0;
+    let hits = 0;
+    for (let p = 0; p < sp.paths; p++) {
+      const at = (d) => sp.ratio[p * sp.width + Math.min(sp.bars, Math.max(1, fb + Math.round((d - sch[0].d) / sp.barDays)))];
+      let g = 1;
+      let prev = 1;
+      let hit = false;
+      for (let k = 0; k < sch.length; k++) {
+        const rate = k === 0 ? r.apy : rateAt(K / prev);
+        const x = at(sch[k].d);
+        if (rate == null) g *= 1 + (riskFree * sch[k].c) / YEAR_DAYS;
+        else {
+          g *= 1 + (rate * sch[k].a) / YEAR_DAYS;
+          if (x <= K) {
+            hit = true;
+            break;
+          }
+        }
+        prev = x;
+      }
+      const term = sp.ratio[p * sp.width + sp.bars];
+      acc += hit ? (g * term) / K : g * (1 + (riskFree * tailDays) / YEAR_DAYS);
+      if (hit) hits++;
+    }
+    if (Math.abs(acc / sp.paths - r.strategy.value) > 1e-9 * r.strategy.value) valBad++;
+    if (Math.abs(hits / sp.paths - r.strategy.pEndBtc) > 1e-12) valBad++;
   }
-  ok('стоимость стратегии совпадает с полным перебором', valBad === 0, `нарушений ${valBad}`);
+  ok('стоимость стратегии и риск совпадают с полным перебором (ставка по удалению, расписание серии)', valBad === 0, `нарушений ${valBad}`);
 
   // Фронт стратегии — полным перебором.
   // Фронт строится по геометрическому: капитал складывается по периодам.
@@ -1571,17 +1660,21 @@ console.log('\n── 15. Первый сеттлмент: сетка проти
   for (const p of products.filter((x) => x.status === 'Available')) {
     const t = productTiming(p, now);
     if (!t.open) continue;
-    const paths = history.pathSeries(t.tauDays, t.cycleDays, H);
-    if (!paths) continue;
+    const sched = settlementSchedule(t, H);
+    if (!sched.n) continue;
     checked++;
     // Первая точка обязана отстоять на время до сеттлмента ЭТОГО продукта.
     const wantTau = (Number(p.settlementTime) - now) / MS_DAY;
-    if (Math.abs(paths.firstDays - wantTau) > 1e-9) bad.push(`${p.duration}: сетка ${paths.firstDays.toFixed(4)} против расписания ${wantTau.toFixed(4)}`);
-    // Число сеттлментов внутри горизонта — по расписанию, а не по циклам.
-    const wantN = H < wantTau ? 0 : 1 + Math.floor((H - wantTau) / t.cycleDays);
-    if (paths.cycles !== wantN) bad.push(`${p.duration}: сеттлментов ${paths.cycles} против ${wantN}`);
+    if (Math.abs(sched.days[0] - wantTau) > 1e-9) bad.push(`${p.duration}: сетка ${sched.days[0].toFixed(4)} против расписания ${wantTau.toFixed(4)}`);
+    // Следующие — по серии: скользящая через цикл, недельная через 7 суток,
+    // календарные — по последним пятницам. Все сеттлменты — в то же время суток.
+    for (let k = 1; k < sched.n; k++) {
+      const at = new Date(now + sched.days[k] * MS_DAY);
+      if (t.cycleKind !== 'rolling' && at.getUTCDay() !== 5) bad.push(`${p.duration}: сеттлмент ${k} не в пятницу`);
+      if (t.cycleKind === 'rolling' && Math.abs(sched.days[k] - sched.days[k - 1] - t.cycleDays) > 1e-9) bad.push(`${p.duration}: шаг ${k}`);
+    }
     // Последний смоделированный сеттлмент не должен выходить за горизонт.
-    if (paths.modeledDays > H + 1e-9) bad.push(`${p.duration}: последний сеттлмент на ${paths.modeledDays.toFixed(1)} при горизонте ${H}`);
+    if (sched.days[sched.n - 1] > H + 1e-9) bad.push(`${p.duration}: последний сеттлмент на ${sched.days[sched.n - 1].toFixed(1)} при горизонте ${H}`);
   }
   ok('первая контрольная точка совпадает с датой сеттлмента продукта', bad.length === 0, bad.slice(0, 3).join(' · ') || `проверено ${checked} продуктов`);
 
@@ -1590,7 +1683,8 @@ console.log('\n── 15. Первый сеттлмент: сетка проти
   const shifts = [];
   for (const p of products.filter((x) => x.status === 'Available')) {
     const t = productTiming(p, now);
-    if (t.open) shifts.push(t.cycleDays - t.tauDays);
+    // Только скользящие серии: у календарных цикл короче срока оферты.
+    if (t.open && t.cycleKind === 'rolling') shifts.push(t.cycleDays - t.tauDays);
   }
   const minShift = Math.min(...shifts);
   const maxShift = Math.max(...shifts);

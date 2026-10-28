@@ -18,6 +18,7 @@ import {
   valueOffer,
   fairAprEffective,
   digitalProbability,
+  settlementSchedule,
   prepareSample,
   sampleCdf,
   sampleLossProfile,
@@ -43,7 +44,7 @@ import {
   QUANTILE_LEVELS,
   MS_DAY,
 } from '../web/quant.js';
-import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr, pickDepth, pickProbability } from '../web/model.js';
+import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnchors, buildRows, sampleCagr, pickDepth, pickProbability, markHorizonRisk } from '../web/model.js';
 import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry, atmVarianceCurve, totalVariance, forwardVol, surfaceAt, smileSlope, volSlopeAt } from '../web/surface.js';
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
@@ -819,7 +820,11 @@ section('Траектории, накопление процента и стра
   const CYC = 2;
   const FIRST = Math.max(1, Math.round(TAU)); // бар первой контрольной точки
   const timing = { tauDays: TAU, cycleDays: CYC, yieldDays: 1, lockDays: TAU + 20 / 1440 };
-  const mkRow = (strike, i) => ({ strike, i, apy: (i * 365) / 1, aprEff: 0.1, duration: '1d', productId: 'x', timing });
+  const mkRow = (strike, i, productId = 'x') => ({ strike, i, apy: (i * 365) / 1, aprEff: 0.1, duration: '1d', productId, direction: 'BuyLow', timing });
+  // Широкая плоская лестница того же продукта: страйки далеко от цены с той же
+  // ставкой. С ней удаление страйка никогда не уходит за край, и ставка любого
+  // цикла равна сегодняшней — частный случай, в котором верна прежняя модель.
+  const flatLadder = (i, productId) => [50, 60, 70, 80].map((k) => mkRow(k, i, productId));
   const N = 1 + Math.floor((20 - TAU) / CYC);
   // Первый цикл, на котором ряд с шагом g достигает цели — считается из
   // определения ряда, а не из проверяемой функции.
@@ -832,13 +837,28 @@ section('Траектории, накопление процента и стра
   };
 
   // Стратегия: страйк ниже любой контрольной точки — конвертации нет никогда.
-  const safe = mkRow(90, 0.001);
-  computeStrategy({ rows: [safe], history: hist, spot: 100, horizonDays: 20, riskFree: 0 });
+  const safe = mkRow(90, 0.001, 'flat');
+  computeStrategy({ rows: [safe, ...flatLadder(0.001, 'flat')], history: hist, spot: 100, horizonDays: 20, riskFree: 0 });
   ok('без конвертации риск нулевой', safe.strategy.pEndBtc === 0);
-  near('без конвертации стоимость = (1+i)^n', safe.strategy.value, 1.001 ** N, 1e-12);
+  near('без конвертации при широкой лестнице стоимость = (1+i)^n', safe.strategy.value, 1.001 ** N, 1e-12);
   near('среднее и медиана совпадают на детерминированном ряду', safe.strategy.valueMedian, safe.strategy.value, 1e-12);
 
+  // Главное правило: страйк, ушедший от цены дальше дальнего края лестницы,
+  // подписки не получает. Здесь лестница из одного страйка, цена растёт, и уже
+  // после первого сеттлмента страйк дальше края: процент только за первый цикл,
+  // дальше деньги лежат под альтернативную ставку.
+  const lone = mkRow(90, 0.001, 'lone');
+  computeStrategy({ rows: [lone], history: hist, spot: 100, horizonDays: 20, riskFree: 0.365 });
+  const tailLone = 20 - (TAU + (N - 1) * CYC);
+  near(
+    'страйк за краем лестницы: процент только за первый цикл, дальше альт. ставка',
+    lone.strategy.value,
+    1.001 * (1 + (0.365 * CYC) / 365) ** (N - 1) * (1 + (0.365 * tailLone) / 365),
+    1e-12,
+  );
+
   // Для конвертации цена обязана уйти ВНИЗ, поэтому падающий ряд: 0.1% в сутки.
+  // Страйк здесь приближается к цене — ставка ближнего края, подписка есть.
   const down = Array.from({ length: 400 }, (_, k) => [k * step, 100 * 0.999 ** k]);
   const histDown = new History({ D: { stepMs: step, series: down } });
   const hot = mkRow(99.95, 0.001);
@@ -866,8 +886,8 @@ section('Траектории, накопление процента и стра
   );
 
   // Хвост горизонта приносит безрисковый процент только если конвертации не было.
-  const withTail = mkRow(90, 0.001);
-  computeStrategy({ rows: [withTail], history: hist, spot: 100, horizonDays: 21, riskFree: 0.365 });
+  const withTail = mkRow(90, 0.001, 'tail');
+  computeStrategy({ rows: [withTail, ...flatLadder(0.001, 'tail')], history: hist, spot: 100, horizonDays: 21, riskFree: 0.365 });
   const nTail = 1 + Math.floor((21 - TAU) / CYC);
   const tailDays = 21 - (TAU + (nTail - 1) * CYC);
   near(
@@ -877,7 +897,8 @@ section('Траектории, накопление процента и стра
     1e-12,
   );
 
-  // Sell High: процент накапливается по числу циклов до выхода.
+  // Sell High: процент накапливается по числу циклов до выхода. Цена растёт к
+  // страйку — удаление сокращается, ставка ближнего края, подписка есть.
   const sellRow = {
     strike: 100.3,
     i: 0.001,
@@ -885,6 +906,7 @@ section('Траектории, накопление процента и стра
     aprEff: 0.1,
     duration: '1d',
     productId: 's',
+    direction: 'SellHigh',
     timing,
     shortfall: null,
     pRN: 0.5,
@@ -903,6 +925,245 @@ section('Траектории, накопление процента и стра
   near('ожидание выхода = τ + (циклов−1)·цикл', s.expExitDays, TAU + kSell * CYC, 1e-12);
   ok('полное матожидание посчитано по обеим ветвям', Number.isFinite(s.fullRate) && Number.isFinite(s.fullMedianRate));
   ok('база сравнения приложена к результату', an.baseline != null && Number.isFinite(an.baseline.holdRate));
+
+  // Sell High при падении: страйк уходит от цены за дальний край лестницы —
+  // монета лежит без процента и продана быть не может.
+  const sellFar = { ...sellRow, productId: 'sf', strike: 100.05 };
+  const anFar = analyzeSellHigh({ rows: [sellFar], basis: 100, qty: 1, spot: 100, history: histDown, horizonDays: 20, riskFree: 0 });
+  near(
+    'Sell High за краем лестницы: процент только за первый цикл',
+    anFar[0].fullValue,
+    1.001 * 0.999 ** 20,
+    1e-12,
+  );
+}
+
+// ────────────────────────────────────────────── 8d2. Движок против перебора
+
+section('Траекторный движок против отдельного перебора');
+{
+  // Эталон написан здесь с нуля: своя сетка сеттлментов (τ + k·цикл), своё
+  // округление до баров, свой линейный поиск по лестнице, своя медиана
+  // сортировкой и геометрическое среднее суммой логарифмов. От движка панели он
+  // берёт только траектории сценария — общий вход, а не проверяемый код.
+  let seed = 2026;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff - 0.5);
+  const series = [];
+  let px = 60000;
+  for (let k = 0; k < 900; k++) {
+    px *= Math.exp(0.0002 + 0.035 * rnd());
+    series.push([k * MS_DAY, px]);
+  }
+  const hist = new History({ D: { stepMs: MS_DAY, series } });
+  hist.useScenario({ cagr: 0.12, curve: null, id: 'brute' });
+  const H = 60;
+  const spot = 60000;
+  const rf = 0.04;
+  // Лестница Buy Low с неровными ставками (есть и перекос) и Sell High.
+  const mkT = (tau, cyc, yieldDays) => ({ tauDays: tau, cycleDays: cyc, yieldDays, lockDays: tau + 0.014 });
+  const tBL = mkT(2.6, 3, 2);
+  const tSH = mkT(4.3, 5, 4);
+  const bl = [
+    [54000, 0.06],
+    [55500, 0.1],
+    [57000, 0.18],
+    [58000, 0.17],
+    [59000, 0.35],
+    [59800, 0.8],
+  ].map(([strike, apy]) => ({ productId: 'b', direction: 'BuyLow', strike, apy, i: (apy * 2) / 365, timing: tBL, aprEff: 0.1 }));
+  const sh = [
+    [60300, 0.7],
+    [61500, 0.3],
+    [63000, 0.12],
+    [66000, 0.05],
+  ].map(([strike, apy]) => ({ productId: 's', direction: 'SellHigh', strike, apy, i: (apy * 4) / 365, timing: tSH, aprEff: 0.1, pRN: 0.3, pHist: 0.3, histInfo: { independent: 999 } }));
+
+  const base = hist.scenarioPaths(H);
+  const brute = (row, ladderRows) => {
+    const t = row.timing;
+    const days = [];
+    for (let d = t.tauDays; d <= H + 1e-9; d += t.cycleDays) days.push(d);
+    const n = days.length;
+    const fb = Math.max(1, Math.round(t.tauDays / base.barDays));
+    const bars = days.map((d) => Math.min(base.bars, Math.max(1, fb + Math.round((d - t.tauDays) / base.barDays))));
+    const lad = ladderRows.map((r) => [r.strike / spot, r.apy]).sort((a, b) => a[0] - b[0]);
+    const rateAt = (m) => {
+      const buy = row.direction === 'BuyLow';
+      const far = buy ? m < lad[0][0] : m > lad[lad.length - 1][0];
+      if (far) return null;
+      if (buy && m >= lad[lad.length - 1][0]) return lad[lad.length - 1][1];
+      if (!buy && m <= lad[0][0]) return lad[0][1];
+      for (let j = 1; j < lad.length; j++) {
+        if (m <= lad[j][0]) return lad[j - 1][1] + ((m - lad[j - 1][0]) / (lad[j][0] - lad[j - 1][0])) * (lad[j][1] - lad[j - 1][1]);
+      }
+      return lad[lad.length - 1][1];
+    };
+    const K = row.strike / spot;
+    const vals = [];
+    let hits = 0;
+    let gExit = 0;
+    let waitDays = 0;
+    for (let p = 0; p < base.paths; p++) {
+      const at = (b) => base.ratio[p * base.width + b];
+      let g = 1;
+      let prev = 1;
+      let hit = -1;
+      for (let k = 0; k < n; k++) {
+        const rate = k === 0 ? row.apy : rateAt(K / prev);
+        const x = at(bars[k]);
+        if (rate == null) {
+          if (row.direction === 'BuyLow') g *= 1 + (rf * t.cycleDays) / 365;
+        } else {
+          g *= 1 + (rate * (k === 0 ? t.yieldDays : t.cycleDays - (t.cycleDays - t.yieldDays))) / 365;
+          if (row.direction === 'BuyLow' ? x <= K : x >= K) {
+            hit = k;
+            break;
+          }
+        }
+        prev = x;
+      }
+      const term = at(base.bars);
+      let v;
+      if (row.direction === 'BuyLow') {
+        v = hit >= 0 ? (g * term) / K : g * (1 + (rf * (H - days[n - 1])) / 365);
+      } else if (hit >= 0) {
+        v = g * row.strike * (1 + (rf * (H - days[hit])) / 365);
+        gExit += g;
+      } else {
+        v = g * term * spot;
+      }
+      waitDays += days[hit >= 0 ? hit : n - 1];
+      if (hit >= 0) hits++;
+      vals.push(v);
+    }
+    const sorted = [...vals].sort((a, b) => a - b);
+    const mid = sorted.length >> 1;
+    return {
+      p: hits / base.paths,
+      mean: vals.reduce((a, b) => a + b, 0) / vals.length,
+      median: sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2,
+      geo: Math.exp(vals.reduce((a, b) => a + Math.log(b), 0) / vals.length),
+      gExit: hits ? gExit / hits : null,
+      wait: waitDays / base.paths,
+      n,
+    };
+  };
+
+  computeStrategy({ rows: bl, history: hist, spot, horizonDays: H, riskFree: rf });
+  markHorizonRisk(bl, hist, spot, H, rf);
+  let worst = 0;
+  let inactiveSeen = false;
+  for (const r of bl) {
+    const b = brute(r, bl);
+    const rel = (x, y) => Math.abs(x - y) / Math.max(1e-12, Math.abs(y));
+    worst = Math.max(worst, rel(r.strategy.value, b.mean), rel(r.strategy.valueMedian, b.median), rel(r.strategy.valueGeo, b.geo), Math.abs(r.strategy.pEndBtc - b.p), Math.abs(r.pHorizon - b.p));
+    if (r.strategy.cycles !== b.n) worst = Infinity;
+    if (b.p < 0.999) inactiveSeen = true;
+  }
+  ok('Buy Low: стоимость, медиана, геометрическое и риск совпадают с перебором', worst < 1e-12, `максимум отклонения ${worst.toExponential(2)} по ${bl.length} строкам`);
+  ok('в проверке есть траектории без конвертации', inactiveSeen);
+
+  const basis = 61000;
+  const an = analyzeSellHigh({ rows: sh, basis, qty: 1, spot, history: hist, horizonDays: H, riskFree: rf });
+  let worstS = 0;
+  for (const r of an) {
+    const b = brute(r, sh);
+    const rel = (x, y) => Math.abs(x - y) / Math.max(1e-12, Math.abs(y));
+    worstS = Math.max(
+      worstS,
+      Math.abs(r.pExitHorizon - b.p),
+      rel(r.fullValue, b.mean / basis),
+      rel(r.fullMedian, b.median / basis),
+      rel(r.expExitDays, b.wait),
+      b.gExit == null ? (r.profitAtExit == null ? 0 : Infinity) : rel(r.profitAtExit, (b.gExit * r.strike) / basis - 1),
+    );
+  }
+  ok('Sell High: шанс выйти, ожидание, прибыль к выходу и матожидание совпадают с перебором', worstS < 1e-12, `максимум отклонения ${worstS.toExponential(2)} по ${an.length} строкам`);
+
+  // Кэш траекторного слоя живёт на строке и не плодит записей в History.
+  const before = hist.cache.size;
+  for (let f = 0; f < 30; f++) {
+    const rows = bl.map((r) => ({ ...r, path: undefined, pathKey: undefined, timing: { ...r.timing, tauDays: r.timing.tauDays - f * 1e-5 } }));
+    computeStrategy({ rows, history: hist, spot: spot * (1 + f * 1e-5), horizonDays: H, riskFree: rf });
+  }
+  ok('траекторный слой не растит кэш History от кадра к кадру', hist.cache.size <= before + 1, `было ${before}, стало ${hist.cache.size}`);
+}
+
+// ────────────────────────────────────────────── 8d3. Расписание серий
+
+section('Расписание сеттлментов: скользящие, недельные, месячные, квартальные');
+{
+  // Эталон дат — перебором дней календаря, без формул проверяемого кода.
+  const lastFriday = (y, m) => {
+    let best = null;
+    for (let d = 1; d <= 31; d++) {
+      const t = Date.UTC(y, m, d, 7, 59, 59);
+      if (new Date(t).getUTCMonth() !== m) break;
+      if (new Date(t).getUTCDay() === 5) best = t;
+    }
+    return best;
+  };
+  const mk = (subEnd, settle, duration) => ({
+    subscribeStartAt: String(subEnd - MS_DAY),
+    subscribeEndAt: String(subEnd),
+    settlementTime: String(settle),
+    expectReceiveAt: String(settle + 20 * 60_000),
+    duration,
+  });
+  const now = Date.UTC(2026, 9, 28, 4, 42);
+  const subEnd = Date.UTC(2026, 9, 28, 7, 59, 59);
+  const at = (y, m, d) => Date.UTC(y, m, d, 7, 59, 59);
+
+  const w = productTiming(mk(subEnd, at(2026, 10, 6), '9d'), now);
+  ok('9d с сеттлментом в пятницу — недельная серия', w.cycleKind === 'weekly');
+  near('цикл недельной серии — 7 суток', w.cycleDays, 7, 1e-9, ' сут');
+  near('начисление следующего цикла — 6 суток', w.nextYieldDays, 6, 1e-9, ' сут');
+  near('APR в цикле — по следующему циклу: APY·6/7', chainedApr(0.5, w.nextYieldDays, w.cycleDays), (0.5 * 6) / 7, 1e-15);
+  const sw = settlementSchedule(w, 90);
+  ok('за 90 дней у 9d двенадцать сеттлментов', sw.n === 12, `${sw.n}`);
+  ok('все циклы недельной серии по 7 суток и 6 начисления', sw.cycle.slice(1).every((c) => Math.abs(c - 7) < 1e-9) && sw.accrual.slice(1).every((a) => Math.abs(a - 6) < 1e-9));
+
+  const mo = productTiming(mk(subEnd, at(2026, 10, 27), '30d'), now);
+  ok('30d в последнюю пятницу ноября — месячная серия', mo.cycleKind === 'monthly');
+  near('следующий сеттлмент — последняя пятница декабря', mo.settle + mo.cycleDays * MS_DAY, lastFriday(2026, 11), 1e-3, ' мс');
+  const smo = settlementSchedule(mo, 200);
+  const wantMonths = [lastFriday(2026, 10), lastFriday(2026, 11), lastFriday(2027, 0), lastFriday(2027, 1), lastFriday(2027, 2), lastFriday(2027, 3), lastFriday(2027, 4)];
+  const gotMonths = smo.days.map((d) => now + d * MS_DAY);
+  ok(
+    'месячная цепочка идёт по последним пятницам',
+    gotMonths.every((t, k) => Math.abs(t - wantMonths[k]) < 1),
+    gotMonths.map((t) => new Date(t).toISOString().slice(0, 10)).join(' '),
+  );
+  ok('начисление каждого цикла = цикл − 1 сутки', smo.accrual.slice(1).every((a, k) => Math.abs(a - (smo.cycle[k + 1] - 1)) < 1e-9));
+
+  const q = productTiming(mk(subEnd, at(2026, 11, 25), '58d'), now);
+  ok('58d в последнюю пятницу декабря — квартальная серия', q.cycleKind === 'quarterly');
+  near('следующий сеттлмент — последняя пятница марта', q.settle + q.cycleDays * MS_DAY, lastFriday(2027, 2), 1e-3, ' мс');
+  const q2 = productTiming(mk(subEnd, at(2027, 2, 26), '149d'), now);
+  near('149d → последняя пятница июня', q2.settle + q2.cycleDays * MS_DAY, lastFriday(2027, 5), 1e-3, ' мс');
+
+  // Короткий срок в последнюю пятницу квартала — не квартальный: срок решает.
+  const shortQ = productTiming(mk(at(2026, 11, 18), at(2026, 11, 25), '7d'), at(2026, 11, 18) - 3600_000);
+  ok('7d в последнюю пятницу квартала — недельная серия', shortQ.cycleKind === 'weekly');
+  const mid = productTiming(mk(at(2026, 11, 1), at(2026, 11, 25), '24d'), at(2026, 11, 1) - 3600_000);
+  ok('24d в последнюю пятницу декабря — месячная, не квартальная', mid.cycleKind === 'monthly');
+  const roll = productTiming(mk(subEnd, at(2026, 9, 30), '2d'), now);
+  ok('2d — скользящая серия', roll.cycleKind === 'rolling' && Math.abs(roll.cycleDays - 3) < 1e-9 && Math.abs(roll.nextYieldDays - 2) < 1e-9);
+  const fivePlusNotFriday = productTiming(mk(subEnd, at(2026, 10, 3), '6d'), now);
+  ok('срок больше 5 суток не в пятницу — как скользящая', fivePlusNotFriday.cycleKind === 'rolling');
+
+  // Возврат к безубытку у недельной серии: первый цикл начисляет 9 суток,
+  // следующие — по 6. Ставка та же, цена на месте.
+  const rec = cyclesToRecover(101, 100, 0.2, 9, 9.2, 7, 400, 6);
+  const i0 = (0.2 * 9) / 365;
+  const i1 = (0.2 * 6) / 365;
+  let c = 1;
+  let g = 1 + i0;
+  while (g < 101 / 100) {
+    g *= 1 + i1;
+    c++;
+  }
+  ok('циклы до безубытка: первый по сроку оферты, дальше по следующему начислению', rec.cycles === c, `${rec.cycles} против перебора ${c}`);
 }
 
 // ────────────────────────────────────────────── 8e. Отбор в блок «оптимальные»

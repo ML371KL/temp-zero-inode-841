@@ -24,6 +24,8 @@ import {
   percentileFromQuantiles,
   bucketKey,
   paretoFront,
+  settlementSchedule,
+  geoMean,
   apyFromE8,
   basisFromConversion,
   breakevenStrike,
@@ -99,8 +101,13 @@ function firstHitDown(runMin, base, n, target) {
  * глубине истории при достаточном разрешении горизонта (не менее четырёх шагов),
  * а не по числу окон.
  */
+let historySerial = 0;
+
 export class History {
   constructor(series) {
+    // Номер экземпляра: по нему траекторный слой отличает одну историю от
+    // другой (после перезагрузки свечей ключ сценария может совпасть).
+    this.uid = ++historySerial;
     // series: { '60': {stepMs, series:[[ts,close]]}, '240': {...}, 'D': {...} }
     this.raw = series;
     // Ключи здесь приведены к дискретным величинам — номерам баров и срокам, —
@@ -631,7 +638,9 @@ export function buildRow({ product, level, direction, now, spot, surface, histor
   const apy = apyFromE8(level.apyE8);
   const i = interestRate(apy, timing.yieldDays);
   const aprEff = effectiveApr(apy, timing.yieldDays, timing.lockDays);
-  const aprChained = chainedApr(apy, timing.yieldDays, timing.cycleDays);
+  // APR в цикле — по первому следующему циклу: у недельных и календарных серий
+  // его начисление короче срока самой оферты.
+  const aprChained = chainedApr(apy, timing.nextYieldDays, timing.cycleDays);
 
   const T = Math.max(timing.tauDays, 0) / YEAR_DAYS;
   const Teff = twapEffectiveT(T);
@@ -914,28 +923,363 @@ export function pickExpNet(row, measure) {
   return raw ? row.expNetApr : (row.expNetAprScaled ?? row.expNetApr);
 }
 
+// ──────────────────────────────────────── прогон оферты по траекториям
+
+/**
+ * Сегодняшние лестницы ставок — форма «ставка как функция удаления страйка от
+ * цены», по одной на продукт и направление.
+ *
+ * Лестница Bybit привязана к цене: страйки котируются на заданных удалениях от
+ * спота, и неизменная лестница означает неизменную ставку ПО УДАЛЕНИЮ, а не за
+ * абсолютным страйком. Прежде траекторный слой начислял сегодняшнюю ставку
+ * страйка на каждом цикле, куда бы ни ушла цена: 1d «на деньгах» под 246%
+ * продолжал получать 246%, оказавшись на −9% от цены, где лестницы нет вовсе.
+ * Строится по всем строкам продукта текущего кадра: это форма, а не котировка.
+ */
+export function laddersFrom(rows, spot) {
+  const groups = new Map();
+  for (const r of rows) {
+    if (!(r.strike > 0) || !Number.isFinite(r.apy) || !(spot > 0)) continue;
+    const key = `${r.productId}|${r.direction}`;
+    let list = groups.get(key);
+    if (!list) groups.set(key, (list = []));
+    list.push([r.strike / spot, r.apy]);
+  }
+  const out = new Map();
+  for (const [key, list] of groups) {
+    // Направление по ключу: всё, что не Sell High, — лестница Buy Low.
+    list.sort((a, b) => a[0] - b[0]);
+    const m = new Float64Array(list.length);
+    const apy = new Float64Array(list.length);
+    list.forEach(([x, y], j) => {
+      m[j] = x;
+      apy[j] = y;
+    });
+    out.set(key, { m, apy, buy: !key.endsWith('|SellHigh') });
+  }
+  return out;
+}
+
+/**
+ * Ставка следующего цикла для удаления m = K/S от цены прошлого сеттлмента.
+ *   между страйками лестницы — линейно по m;
+ *   ближе к цене, чем ближний страйк (но вне денег), — ставка ближнего края;
+ *   дальше от цены, чем дальний страйк, — −1: такой подписки нет.
+ */
+export function ladderRate(L, m) {
+  const n = L.m.length;
+  if (!n) return -1;
+  if (L.buy) {
+    if (m < L.m[0]) return -1;
+    if (m >= L.m[n - 1]) return L.apy[n - 1];
+  } else {
+    if (m > L.m[n - 1]) return -1;
+    if (m <= L.m[0]) return L.apy[0];
+  }
+  let lo = 0;
+  let hi = n - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (L.m[mid] <= m) lo = mid;
+    else hi = mid;
+  }
+  const w = (m - L.m[lo]) / (L.m[hi] - L.m[lo]);
+  return L.apy[lo] + w * (L.apy[hi] - L.apy[lo]);
+}
+
+/**
+ * Одна оферта, повторяемая на всём горизонте, на каждой траектории сценария.
+ *
+ *  Цикл 0 — сама оферта: её ставка, её срок, её сеттлмент через τ.
+ *  Цикл k ≥ 1 — подписка на тот же страйк того же продукта. Ставка — из
+ *    сегодняшней лестницы по удалению K/S, где S — цена прошлого сеттлмента
+ *    (ladderRate). Если страйк ушёл за дальний край лестницы, подписки в этом
+ *    цикле нет: у Buy Low деньги лежат под альтернативную ставку весь цикл и
+ *    конвертироваться не могут, у Sell High монета лежит без процента и продана
+ *    быть не может.
+ *  Сеттлменты — по расписанию серии (settlementSchedule), процент цикла —
+ *    ставка × дни его начисления / 365.
+ *
+ * Buy Low: конвертация на сеттлменте k, если S_k ≤ K; дальше монета держится до
+ *   конца горизонта. Без конвертации — капитал плюс процент по остатку горизонта.
+ * Sell High: выход на сеттлменте k, если S_k ≥ K; выручка лежит под
+ *   альтернативную ставку до конца горизонта. Без выхода — монеты по цене конца.
+ *   Величины Sell High считаются без себестоимости (w = стоимость в USDT), она
+ *   входит делением: так один прогон годится для любой введённой цены покупки.
+ */
+export function runOffer({ row, base, sched, ladder, spot, horizonDays, riskFree = 0 }) {
+  return runProduct({ rows: [row], base, sched, ladder, spot, horizonDays, riskFree })[0];
+}
+
+/**
+ * Тот же прогон для всех строк одного продукта и направления сразу.
+ *
+ * Порядок циклов важен для скорости, а не для ответа: внешний цикл — по
+ * траекториям, внутренний — по строкам продукта. Цены на сеттлментах одной
+ * траектории читаются из матрицы один раз на продукт, а не один раз на строку:
+ * матрица на горизонте 365 занимает ~4.6 МБ, и прежний порядок «строка снаружи»
+ * прогонял её через память шестьсот девяносто раз за кадр.
+ */
+export function runProduct({ rows, base, sched, ladder, spot, horizonDays, riskFree = 0 }) {
+  const n = sched?.n ?? 0;
+  const R = rows.length;
+  const out = new Array(R).fill(null);
+  if (!n || !base || !(spot > 0)) return out;
+  const { ratio, width, paths, bars, barDays } = base;
+  const firstBars = Math.max(1, Math.round(sched.days[0] / barDays));
+  if (firstBars > bars) return out;
+  const bar = new Int32Array(n);
+  const accr = new Float64Array(n);
+  const idle = new Float64Array(n);
+  for (let k = 0; k < n; k++) {
+    bar[k] = Math.min(bars, Math.max(1, firstBars + Math.round((sched.days[k] - sched.days[0]) / barDays)));
+    accr[k] = sched.accrual[k] / YEAR_DAYS;
+    // Цикл без подписки: деньги Buy Low весь цикл лежат под альтернативную ставку.
+    idle[k] = 1 + (riskFree * sched.cycle[k]) / YEAR_DAYS;
+  }
+  const tail = 1 + (riskFree * sched.tailDays) / YEAR_DAYS;
+  const last = n - 1;
+  const days = Float64Array.from(sched.days);
+  // Простой выручки Sell High после выхода на сеттлменте k — под альт. ставку.
+  const afterExit = new Float64Array(n);
+  for (let k = 0; k < n; k++) afterExit[k] = 1 + (riskFree * Math.max(0, horizonDays - days[k])) / YEAR_DAYS;
+
+  // Лестница в координатах цены прошлого сеттлмента x = S/S₀: удаление
+  // m = K/S = target/x, поэтому границы m_j переходят в xs_j = target/m_j
+  // (по убыванию). Две проверки отсекают «за краем» и «ближе края», и только
+  // внутри лестницы нужны двоичный поиск и одно деление. Ответ тот же, что у
+  // ladderRate (проверяется тестом против отдельного перебора).
+  const nl = ladder ? ladder.m.length : 0;
+  const lm = ladder ? ladder.m : null;
+  const la = ladder ? ladder.apy : null;
+  const slope = new Float64Array(nl);
+  for (let j = 0; j + 1 < nl; j++) slope[j] = (la[j + 1] - la[j]) / (lm[j + 1] - lm[j]);
+  const spec = rows.map((row) => {
+    const ok = row.strike > 0 && Number.isFinite(row.apy);
+    const target = row.strike / spot;
+    const xs = new Float64Array(nl);
+    for (let j = 0; j < nl; j++) xs[j] = target / lm[j];
+    const buy = row.direction !== 'SellHigh';
+    return {
+      ok,
+      buy,
+      target,
+      strike: row.strike,
+      apy: row.apy,
+      g0: 1 + row.apy * accr[0],
+      xs,
+      // Buy Low: за краем — x > xs[0]; ближе края — x ≤ xs[nl−1].
+      // Sell High: за краем — x < xs[nl−1]; ближе края — x ≥ xs[0].
+      xFirst: nl ? xs[0] : 0,
+      xLast: nl ? xs[nl - 1] : 0,
+      nearRate: nl ? (buy ? la[nl - 1] : la[0]) : row.apy,
+      hits: 0,
+      acc: 0,
+      accExitG: 0,
+      accDays: 0,
+    };
+  });
+  const values = new Float64Array(R * paths);
+  const xk = new Float64Array(n);
+  // Нарастающие с конца минимум и максимум цен сеттлментов и произведения
+  // множителей простоя: если до конца горизонта цена уже ни разу не вернётся к
+  // лестнице, оставшиеся циклы без подписки сворачиваются в одно умножение.
+  // Таких «хвостов» больше половины всех серий без подписки.
+  const sufMin = new Float64Array(n);
+  const sufMax = new Float64Array(n);
+  const idleTo = new Float64Array(n); // ∏ idle[1..k]
+  idleTo[0] = 1;
+  for (let k = 1; k < n; k++) idleTo[k] = idleTo[k - 1] * idle[k];
+
+  for (let p = 0; p < paths; p++) {
+    const o = p * width;
+    for (let k = 0; k < n; k++) xk[k] = ratio[o + bar[k]];
+    // Шаг k опирается на цену прошлого сеттлмента x[k−1], поэтому хвосты — по
+    // индексам 0…n−2.
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (let k = n - 2; k >= 0; k--) {
+      if (xk[k] < lo) lo = xk[k];
+      if (xk[k] > hi) hi = xk[k];
+      sufMin[k] = lo;
+      sufMax[k] = hi;
+    }
+    const term = ratio[o + bars];
+    for (let r = 0; r < R; r++) {
+      const c = spec[r];
+      if (!c.ok) continue;
+      const { buy, target, xs, xFirst, xLast, nearRate } = c;
+      let g = c.g0;
+      let x = xk[0];
+      let hit = -1;
+      // Направления разведены по двум циклам: в горячем месте не должно быть
+      // ветвлений на направление. Три четверти шагов — циклы без подписки
+      // (страйк за краем лестницы), поэтому они вынесены в самую короткую ветку.
+      if (!nl) {
+        // Без лестницы — прежняя модель: ставка оферты на каждом цикле.
+        if (buy ? x <= target : x >= target) hit = 0;
+        for (let k = 1; hit < 0 && k < n; k++) {
+          g *= 1 + c.apy * accr[k];
+          x = xk[k];
+          if (buy ? x <= target : x >= target) hit = k;
+        }
+      } else if (buy) {
+        if (x <= target) hit = 0;
+        for (let k = 1; hit < 0 && k < n; k++) {
+          if (x > xFirst) {
+            // До конца горизонта цена выше дальнего края: подписок больше нет,
+            // деньги лежат под альтернативную ставку.
+            if (sufMin[k - 1] > xFirst) {
+              g *= idleTo[n - 1] / idleTo[k - 1];
+              break;
+            }
+            g *= idle[k];
+            x = xk[k];
+            continue;
+          }
+          let rate = nearRate;
+          if (x > xLast) {
+            let lo = 0;
+            let hi = nl - 1;
+            while (hi - lo > 1) {
+              const mid = (lo + hi) >> 1;
+              if (xs[mid] >= x) lo = mid;
+              else hi = mid;
+            }
+            rate = la[lo] + (target / x - lm[lo]) * slope[lo];
+          }
+          g *= 1 + rate * accr[k];
+          x = xk[k];
+          if (x <= target) hit = k;
+        }
+      } else {
+        if (x >= target) hit = 0;
+        for (let k = 1; hit < 0 && k < n; k++) {
+          if (x < xLast) {
+            // До конца горизонта цена ниже дальнего края: продаж больше нет.
+            if (sufMax[k - 1] < xLast) break;
+            x = xk[k];
+            continue;
+          }
+          let rate = nearRate;
+          if (x < xFirst) {
+            let lo = 0;
+            let hi = nl - 1;
+            while (hi - lo > 1) {
+              const mid = (lo + hi) >> 1;
+              if (xs[mid] >= x) lo = mid;
+              else hi = mid;
+            }
+            rate = la[lo] + (target / x - lm[lo]) * slope[lo];
+          }
+          g *= 1 + rate * accr[k];
+          x = xk[k];
+          if (x >= target) hit = k;
+        }
+      }
+      let v;
+      if (buy) {
+        v = hit >= 0 ? (g * term) / target : g * tail;
+      } else if (hit >= 0) {
+        v = g * c.strike * afterExit[hit];
+        c.accExitG += g;
+        c.accDays += days[hit];
+      } else {
+        v = g * term * spot;
+        c.accDays += days[last];
+      }
+      if (hit >= 0) c.hits++;
+      values[r * paths + p] = v;
+      c.acc += v;
+    }
+  }
+
+  const scratch = new Float64Array(paths);
+  for (let r = 0; r < R; r++) {
+    const c = spec[r];
+    if (!c.ok) continue;
+    const own = values.subarray(r * paths, (r + 1) * paths);
+    const common = {
+      cycles: n,
+      pHit: c.hits / paths,
+      paths,
+      modeledDays: days[last],
+      tailDays: sched.tailDays,
+      independent: base.independent,
+      series: base.series,
+    };
+    out[r] = c.buy
+      ? { ...common, value: c.acc / paths, valueMedian: median(own, scratch), valueGeo: geoMean(own) }
+      : {
+          ...common,
+          // Ожидание времени до выхода, ограниченное последним сеттлментом горизонта.
+          expExitDays: c.accDays / paths,
+          // Средний множитель монет к моменту выхода — по траекториям, где выход был.
+          exitGrossMean: c.hits ? c.accExitG / c.hits : null,
+          wMean: c.acc / paths,
+          wMedian: median(own, scratch),
+        };
+  }
+  return out;
+}
+
+/**
+ * Траекторный слой для набора строк — один прогон на строку, общий для риска за
+ * горизонт, стоимости стратегии и блока выхода. Результат кладётся на строку
+ * (r.path) с ключом входов: строки пересобираются каждый кадр, так что живёт он
+ * один кадр, а внутри кадра второй вызов с теми же входами ничего не считает.
+ */
+export function pathLayer(rows, { history, spot, horizonDays, riskFree = 0 }) {
+  const base = history && horizonDays > 0 ? history.scenarioPaths(horizonDays) : null;
+  const key = `${horizonDays}|${riskFree}|${history?.uid ?? ''}:${history?.scenarioKey ?? ''}|${spot}`;
+  // Строки, которым прогон нужен, — по группам «продукт, направление, τ»:
+  // у группы общие сеттлменты и лестница.
+  const groups = new Map();
+  for (const r of rows) {
+    // Ключ строки — входы слоя и сама оферта: копия строки с другим страйком не
+    // должна унаследовать чужой прогон.
+    const rowKey = `${key}|${r.productId}|${r.direction}|${r.strike}|${r.apy}|${r.timing?.tauDays}`;
+    if (r.pathKey === rowKey && r.path !== undefined) continue;
+    r.pathKey = rowKey;
+    r.path = null;
+    if (!base) continue;
+    const gk = `${r.productId}|${r.direction}|${r.timing.tauDays}`;
+    let g = groups.get(gk);
+    if (!g) groups.set(gk, (g = []));
+    g.push(r);
+  }
+  if (!groups.size) return rows;
+  const ladders = laddersFrom(rows, spot);
+  for (const list of groups.values()) {
+    const r0 = list[0];
+    const sched = settlementSchedule(r0.timing, horizonDays);
+    const res = runProduct({ rows: list, base, sched, ladder: ladders.get(`${r0.productId}|${r0.direction}`), spot, horizonDays, riskFree });
+    list.forEach((r, j) => (r.path = res[j]));
+  }
+  return rows;
+}
+
 /**
  * Риск, приведённый к общему горизонту: вероятность того, что при непрерывном
  * повторении этой же оферты страйк сработает хотя бы раз за H дней.
  *
  * Вероятность за одну покупку несравнима между сроками: 7% за 1.6 суток и 7% за
  * 237 суток — это разные вещи, и первая при непрерывном катании означает почти
- * гарантированную конвертацию в течение месяца. Частота берётся по историческим
- * траекториям, поэтому зависимость соседних циклов учтена.
+ * гарантированную конвертацию в течение месяца. Частота берётся по траекториям
+ * сценария, поэтому зависимость соседних циклов учтена; циклы без подписки
+ * (страйк за краем лестницы) сработать не могут.
  */
-export function markHorizonRisk(rows, history, spot, horizonDays) {
+export function markHorizonRisk(rows, history, spot, horizonDays, riskFree = 0) {
+  pathLayer(rows, { history, spot, horizonDays, riskFree });
   for (const r of rows) {
-    const ext = history?.pathExtremes(r.timing.tauDays, r.timing.cycleDays, horizonDays);
-    if (!ext) {
+    if (!r.path) {
       // До сеттлмента дальше, чем весь горизонт: оферта не рассчитается ни разу.
       r.pHorizon = 0;
       r.horizonInfo = { cycles: 0, n: 0, independent: 0, series: null };
       continue;
     }
-    const ratio = r.strike / spot;
-    r.pHorizon =
-      r.direction === 'BuyLow' ? empiricalCdf(ext.minima, ratio) : 1 - empiricalCdf(ext.maxima, ratio);
-    r.horizonInfo = { cycles: ext.cycles, n: ext.paths, independent: ext.independent, series: ext.series };
+    r.pHorizon = r.path.pHit;
+    r.horizonInfo = { cycles: r.path.cycles, n: r.path.paths, independent: r.path.independent, series: r.path.series };
   }
   return rows;
 }
@@ -958,6 +1302,9 @@ export function buildRows({
   measure,
   stats,
   horizonDays = 0,
+  // Траекторный слой можно не считать здесь: панель считает его отдельно и не
+  // каждый кадр (frame.js), скрипты — сразу.
+  paths = true,
 }) {
   const rows = [];
   // Поверхность на текущий момент: время до экспираций — от now, а не от
@@ -992,7 +1339,7 @@ export function buildRows({
   }
   // Риск за горизонт нужен обеим сторонам, но на стороне Sell High его считает
   // analyzeSellHigh вместе с остальной механикой выхода — здесь не дублируем.
-  if (horizonDays > 0 && history && direction === 'BuyLow') markHorizonRisk(rows, history, spot, horizonDays);
+  if (horizonDays > 0 && history && direction === 'BuyLow' && paths) markHorizonRisk(rows, history, spot, horizonDays, riskFree ?? 0);
   // Фронт строится только по живым котировкам: он питает и карточки, и якоря,
   // и график, поэтому протухшая строка, попав на него, расползлась бы по всем
   // рекомендательным блокам сразу. В полных таблицах она остаётся, приглушённая.
@@ -1114,6 +1461,9 @@ export function pickBest({ rows, maxP, limit = 6 }) {
  * ниже себестоимости на величину начисляемого процента.
  */
 export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'max', horizonDays = 90, riskFree = 0 }) {
+  // Траекторный слой — один прогон на строку; если панель уже приложила его к
+  // строкам с теми же входами, здесь ничего не пересчитывается.
+  if (history && basis > 0) pathLayer(rows, { history, spot, horizonDays, riskFree });
   const out = rows.map((r) => {
     const be = breakevenStrike(basis, r.apy, r.timing.yieldDays);
     const payoutBtc = qty > 0 ? qty * (1 + r.i) : null;
@@ -1126,6 +1476,8 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
       r.timing.yieldDays,
       r.timing.lockDays,
       r.timing.cycleDays,
+      400,
+      r.timing.nextYieldDays,
     );
 
     // Шанс выйти за общий горизонт, если крутить именно эту оферту.
@@ -1133,8 +1485,9 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
     // Без приведения к общему горизонту вероятности несравнимы: 47% за цикл в
     // 55 дней и 41% за цикл в 237 дней — это совершенно разные вещи, а фронт,
     // построенный по такой оси, механически вытаскивает наверх самые длинные
-    // продукты. Здесь считается частота по историческим траекториям, поэтому
-    // зависимость соседних циклов учтена.
+    // продукты. Всё берётся из одного прогона по траекториям сценария
+    // (runOffer): зависимость соседних циклов учтена, ставка следующих циклов —
+    // по удалению страйка от цены, а циклы за краем лестницы продажи не дают.
     let pExitHorizon = null;
     let horizonInfo = null;
     let expExitDays = null;
@@ -1145,77 +1498,29 @@ export function analyzeSellHigh({ rows, basis, qty, spot, history, measure = 'ma
     let fullMedian = null;
     let fullMedianRate = null;
     if (history && basis > 0) {
-      const ext = history.pathExtremes(r.timing.tauDays, r.timing.cycleDays, horizonDays);
-      const paths = history.pathSeries(r.timing.tauDays, r.timing.cycleDays, horizonDays);
-      if (ext && paths && ext.maxima.length) {
-        const ratio = r.strike / spot;
-        pExitHorizon = 1 - empiricalCdf(ext.maxima, ratio);
-        horizonInfo = { cycles: ext.cycles, n: ext.paths, independent: ext.independent, series: ext.series };
-
-        // Ожидаемое время до выхода, ограниченное горизонтом.
-        //
-        // Без него две оферты с одинаковой прибылью и одинаковым шансом выйти
-        // выглядят равноценными, хотя одна освобождает капитал через неделю, а
-        // другая через полгода. E[min(T, n)] = Σ P(T > k), а P(T > k) — это
-        // доля траекторий, у которых нарастающий максимум за k циклов не достал
-        // до страйка.
-        let sum = 1;
-        for (let k = 1; k < ext.cycles; k++) sum += empiricalCdf(ext.running[k - 1], ratio);
-        // Выход на первом сеттлменте наступает через τ, а не через полный цикл,
-        // поэтому первый оборот считается по τ и только остальные по циклу.
-        expExitDays = r.timing.tauDays + (sum - 1) * r.timing.cycleDays;
-
-        // Один проход по траекториям даёт то, чего в формуле за один цикл не
-        // было и быть не могло.
-        //
-        // Первое: если выход случился на цикле k, процент в биткоине накопился
-        // k раз, а не один. Раньше прибыль считалась как (1+i)K/basis − 1 при
-        // любом времени ожидания, и это занижало короткие циклы втрое — как раз
-        // те, где накопление успевает поработать.
-        //
-        // Второе: ветка «выход не состоялся» больше не стоит ноль. На руках
-        // остаётся (1+i)^n монет по цене конца горизонта, и это тоже стоимость.
-        // Без неё метрика блока была не доходностью, а скоростью реализации
-        // одной желанной ветви и всегда выглядела положительной.
-        const n = paths.cycles;
-        const outcomes = new Float64Array(paths.paths);
-        let accProfit = 0;
-        let exits = 0;
-        let accFull = 0;
-        for (let p = 0; p < paths.paths; p++) {
-          const k = firstHitUp(paths.runMax, p * n, n, ratio);
-          let v;
-          if (k >= 0) {
-            const value = ((1 + r.i) ** (k + 1) * r.strike) / basis;
-            accProfit += value - 1;
-            // После продажи деньги лежат в USDT до конца горизонта: без этого
-            // ранний выход сравнивался бы с поздним на разных окнах. Продажа на
-            // k-м сеттлменте случается в момент τ + k·цикл.
-            const idle = Math.max(0, horizonDays - (r.timing.tauDays + k * r.timing.cycleDays));
-            v = value * (1 + (riskFree * idle) / YEAR_DAYS);
-            exits++;
-          } else {
-            v = ((1 + r.i) ** n * paths.terminal[p] * spot) / basis;
-          }
-          outcomes[p] = v;
-          accFull += v;
-        }
-        profitAtExit = exits ? accProfit / exits : null;
-        fullValue = accFull / paths.paths;
-        fullMedian = median(outcomes);
+      const path = r.path;
+      if (path) {
+        pExitHorizon = path.pHit;
+        horizonInfo = { cycles: path.cycles, n: path.paths, independent: path.independent, series: path.series };
+        // Ожидаемое время до выхода, ограниченное горизонтом: первый выход
+        // наступает через τ, дальше — по расписанию сеттлментов серии.
+        expExitDays = path.expExitDays;
+        // Если выход случился на цикле k, процент в биткоине накопился за все
+        // циклы до него. Ветка «выход не состоялся» тоже стоит денег: на руках
+        // монеты по цене конца горизонта. Себестоимость входит делением.
+        profitAtExit = path.exitGrossMean == null ? null : (path.exitGrossMean * r.strike) / basis - 1;
+        fullValue = path.wMean / basis;
+        fullMedian = path.wMedian / basis;
         // Стоимость за горизонт приводится к году геометрически — так же, как в
-        // режиме стратегии и у баз сравнения. Простое умножение на 365/H дало бы
-        // числа, несопоставимые с соседним блоком.
+        // режиме стратегии и у баз сравнения.
         fullRate = annualize(fullValue, horizonDays);
         fullMedianRate = annualize(fullMedian, horizonDays);
         // Скорость безубыточного выхода: прибыль, которую выход реально
         // приносит, взвешенная шансом его дождаться и приведённая к полному
-        // горизонту. Знаменатель именно H, а не n·цикл: у 54-дневного продукта
-        // при горизонте 90 укладывается один цикл, и деление на 55 дней вместо
-        // 90 завышало его годовые в полтора раза против пятидневного.
+        // горизонту. Знаменатель именно H, а не n·цикл.
         exitSpeed = ((profitAtExit ?? 0) * pExitHorizon * YEAR_DAYS) / horizonDays;
       } else {
-        // Цикл длиннее горизонта: за это время оферта просто не успевает
+        // До первого сеттлмента дальше, чем весь горизонт: оферта не успевает
         // рассчитаться ни разу, и шанс выхода равен нулю.
         pExitHorizon = 0;
         horizonInfo = { cycles: 0, n: 0, independent: 0, series: null };
@@ -1613,77 +1918,45 @@ export function pickBestSell({ rows, limit = 6 }) {
  * то добавляет 3–9% годовых в монетах. То есть модель занижает ценность
  * конвертации, и это осознанный запас в сторону осторожности, а не пропуск.
  *
- * Что модель принимает на веру и о чём панель обязана предупреждать: ставка и
- * лестница страйков считаются неизменными на весь горизонт, а распределение
- * цены берётся историческим — со всем реализованным дрейфом BTC. Поэтому рядом
- * всегда показываются две базы сравнения: удержание USDT и удержание BTC на тех
- * же самых траекториях.
+ * Что модель принимает на веру: лестница ставок — сегодняшняя, как функция
+ * удаления страйка от цены (ставка следующих циклов берётся по удалению страйка
+ * от цены прошлого сеттлмента; за краем лестницы подписки нет), а траектории
+ * цены — сценарные. Поэтому рядом всегда показываются две базы сравнения:
+ * удержание USDT и удержание BTC на тех же самых траекториях.
  */
 export function computeStrategy({ rows, history, spot, horizonDays, riskFree = 0 }) {
   if (!history || !(spot > 0) || !(horizonDays > 0)) return null;
 
+  pathLayer(rows, { history, spot, horizonDays, riskFree });
   for (const r of rows) {
     r.strategy = null;
     r.stratAnnual = null;
+    r.stratGeo = null;
     r.stratRisk = null;
     r.stratPareto = false;
-    const paths = history.pathSeries(r.timing.tauDays, r.timing.cycleDays, horizonDays);
-    if (!paths || !(r.strike > 0) || !Number.isFinite(r.i)) continue;
-
-    const n = paths.cycles;
-    const target = r.strike / spot;
-    // Хвост горизонта, не покрытый целыми циклами: там деньги просто лежат.
-    const tail = 1 + (riskFree * paths.tailDays) / YEAR_DAYS;
-    const values = new Float64Array(paths.paths);
-    let acc = 0;
-    let accLog = 0;
-    let converted = 0;
-    for (let p = 0; p < paths.paths; p++) {
-      const k = firstHitDown(paths.runMin, p * n, n, target);
-      let v;
-      if (k >= 0) {
-        // Конвертация на цикле k+1: к этому моменту процент начислен k+1 раз,
-        // и весь он тоже превращается в монету по страйку. Дальше биткоин
-        // держится до конца горизонта и оценивается по цене этого дня.
-        v = ((1 + r.i) ** (k + 1) * paths.terminal[p] * spot) / r.strike;
-        converted++;
-      } else {
-        v = (1 + r.i) ** n * tail;
-      }
-      values[p] = v;
-      acc += v;
-      accLog += Math.log(Math.max(v, 1e-12));
-    }
-    const value = acc / paths.paths;
+    const path = r.path;
+    if (!path || !Number.isFinite(path.value)) continue;
     // Три статистики, и они отвечают на разные вопросы.
     //
-    // Среднее арифметическое — ожидание ОДНОГО эпизода. Правильная величина,
-    // если вы делаете это один раз малой долей капитала. На скошенном вправо
-    // распределении оно задаётся правым хвостом: на пятилетней выборке среднее
-    // годовое удержание биткоина даёт около 30%, а геометрическое — около 10%.
-    //
+    // Среднее арифметическое — ожидание ОДНОГО эпизода. На скошенном вправо
+    // распределении оно задаётся правым хвостом.
     // Геометрическое — во что превратится капитал, если политику ПОВТОРЯТЬ.
-    // Именно оно складывается по периодам, и именно по нему строится фронт:
-    // на живых данных оно отрицательно у большинства строк, которые по
-    // арифметическому выглядели положительными.
-    //
+    // Именно оно складывается по периодам, и именно по нему строится фронт.
     // Медиана — типичный исход. Разрыв со средним и есть мера скошенности.
-    const mid = median(values);
-    const geo = Math.exp(accLog / paths.paths);
     r.strategy = {
-      value,
-      annual: annualize(value, horizonDays),
-      valueMedian: mid,
-      annualMedian: annualize(mid, horizonDays),
-      valueGeo: geo,
-      annualGeo: annualize(geo, horizonDays),
-      pEndBtc: converted / paths.paths,
-      cycles: n,
-      modeledDays: paths.modeledDays,
-      tailDays: paths.tailDays,
-      paths: paths.paths,
-      independent: paths.independent,
-      series: paths.series,
+      value: path.value,
+      annual: annualize(path.value, horizonDays),
+      valueMedian: path.valueMedian,
+      annualMedian: annualize(path.valueMedian, horizonDays),
+      valueGeo: path.valueGeo,
+      annualGeo: annualize(path.valueGeo, horizonDays),
+      pEndBtc: path.pHit,
+      cycles: path.cycles,
+      modeledDays: path.modeledDays,
+      tailDays: path.tailDays,
+      paths: path.paths,
+      independent: path.independent,
+      series: path.series,
     };
     r.stratAnnual = r.strategy.annual;
     r.stratGeo = r.strategy.annualGeo;
