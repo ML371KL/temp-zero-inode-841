@@ -1807,15 +1807,24 @@ export function frontierWithMargins(rows, riskFree = 0) {
  *           процент минус ожидаемая потеря на конвертации.
  *  yield  — максимум эффективного APR. Осмысленно, если конвертация вас
  *           устраивает: то есть страйк — цена, по которой вы и так готовы купить.
+ *
+ * measure — выбранная мера: от неё зависит, допускается ли к матожиданию
+ * короткая историческая выборка. riskFree — альтернативная ставка: матожидание
+ * ниже неё помечается (belowAlt).
  */
-export function pickAnchors(allRows) {
+export function pickAnchors(allRows, { measure = 'max', riskFree = null } = {}) {
   // Якорь — это рекомендация, поэтому протухшие котировки сюда не допускаются.
   // Не допускаются и оферты ниже альтернативной ставки: их доминирует простое
   // «держать деньги под эту ставку», и называть такую оферту лучшей по какому
   // угодно критерию нельзя.
   const rows = allRows.filter((r) => !isStale(r) && !r.belowRiskFree);
-  const top = (key) => {
-    const pool = rows.filter((r) => Number.isFinite(r[key]));
+  // Матожидание считается по исторической выборке, и на короткой (меньше
+  // MIN_INDEPENDENT_WINDOWS независимых окон) управлять отбором ей нельзя — то
+  // же правило, что у вероятности. Кроме меры «историческая, как есть»: её
+  // пользователь выбрал сам.
+  const expPool = measure === 'hist' ? rows : rows.filter((r) => !histSide(r, measure).thin);
+  const top = (key, from = rows) => {
+    const pool = from.filter((r) => Number.isFinite(r[key]));
     return pool.length ? pool.reduce((a, b) => (b[key] > a[key] ? b : a)) : null;
   };
 
@@ -1838,8 +1847,14 @@ export function pickAnchors(allRows) {
     ['expected', 'expNet'],
     ['yield', 'aprEff'],
   ]) {
-    const row = top(key);
+    const row = id === 'expected' ? top(key, expPool) : top(key);
     out[id] = row ? { row, key, value: row[key], dominator: dominatorOf(row) } : null;
+  }
+  // Лучшее матожидание может не дотягивать до бездействия: пометка рядом с
+  // числом, сама оферта остаётся ответом на свой вопрос.
+  if (out.expected && Number.isFinite(riskFree) && out.expected.value < riskFree) {
+    out.expected.belowAlt = true;
+    out.expected.riskFree = riskFree;
   }
   return out;
 }

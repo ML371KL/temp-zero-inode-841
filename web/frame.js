@@ -274,7 +274,7 @@ export function computeFrame(fs, inp) {
   // Риск за горизонт — из приложенного слоя (pathLayer здесь ничего не считает).
   if (inp.history) markHorizonRisk(buy, inp.history, inp.spot, horizonDays, ctx.riskFree);
   out.best = pickBest({ rows: buy, maxP: ui.maxP });
-  out.anchors = pickAnchors(buy);
+  out.anchors = pickAnchors(buy, { measure: ui.measure, riskFree: inp.riskFree });
   out.frontier = frontierWithMargins(buy, ctx.riskFree);
   if (ui.mode === 'strategy') {
     out.strategy = computeStrategy({ rows: buy, history: inp.history, spot: inp.spot, horizonDays, riskFree: ctx.riskFree });

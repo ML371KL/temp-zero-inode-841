@@ -1027,7 +1027,7 @@ function renderAnchors(anchors) {
         }>${meta.negTitle && a.value < 0 ? meta.negTitle : meta.title}${d ? ' <span class="muted">(вне фронта Парето)</span>' : ''}</div>
         <div class="anchor-value">${
           meta.key === 'volEdge' || meta.key === 'edgeApr' ? fmtSigned(a.value, 2) : fmtPct(a.value, 1)
-        }</div>
+        }${a.belowAlt ? `<small>ниже альт. ставки ${fmtPct(a.riskFree, 2)}</small>` : ''}</div>
         <div class="anchor-line">
           ${r.duration}${r.isVip ? ' · VIP' : ''} · страйк <b>${fmtUsd(r.strike, 2)}</b> (${fmtSigned(r.moneyness, 2)})
         </div>

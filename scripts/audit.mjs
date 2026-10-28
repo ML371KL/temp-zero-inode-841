@@ -540,10 +540,15 @@ console.log('\n── 5. Фронт Парето: сверка с полным �
 
 console.log('\n── 6. Якоря: сверка с полным перебором');
 {
-  const anchors = pickAnchors(buy);
+  const anchors = pickAnchors(buy, { measure: opts.measure, riskFree });
   // Якорь не берёт оферту ниже альтернативной ставки: её доминирует «держать USDT».
+  // Матожидание к тому же не берётся по короткой исторической выборке (мера здесь
+  // «худшая из двух»): меньше MIN_INDEPENDENT_WINDOWS независимых окон.
+  const thinHist = (r) => r.histInfo != null && r.histInfo.independent < MIN_INDEPENDENT_WINDOWS;
   const maxBy = (key) =>
-    buy.filter((r) => Number.isFinite(r[key]) && !r.belowRiskFree).reduce((a, b) => (b[key] > a[key] ? b : a));
+    buy
+      .filter((r) => Number.isFinite(r[key]) && !r.belowRiskFree && !(key === 'expNet' && thinHist(r)))
+      .reduce((a, b) => (b[key] > a[key] ? b : a));
 
   for (const [id, key] of [
     ['market', 'volEdge'],
@@ -557,6 +562,14 @@ console.log('\n── 6. Якоря: сверка с полным перебор
       `якорь ${id} = максимум по ${key}`,
       got && Math.abs(got[key] - brute[key]) < 1e-12,
       `${got?.duration}/${got?.strike} ${pc(got?.[key])} против ${brute.duration}/${brute.strike} ${pc(brute[key])}`,
+    );
+  }
+
+  if (anchors.expected) {
+    ok(
+      'пометка «ниже альт. ставки» у матожидания соответствует сравнению',
+      Boolean(anchors.expected.belowAlt) === anchors.expected.value < riskFree,
+      `${pc(anchors.expected.value)} против ${pc(riskFree)}`,
     );
   }
 

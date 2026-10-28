@@ -379,6 +379,20 @@ section('σ оферты и справедливая ставка со стои�
   ]);
   ok('якорь «в деньгах» не берёт оферту ниже альт. ставки', anchors.money?.row.productId === 'b');
   ok('и якорь матожидания тоже', anchors.expected?.row.productId === 'b');
+
+  // Матожидание по короткой выборке (13 независимых окон) — не якорь, кроме
+  // меры «историческая, как есть». Ниже альт. ставки — пометка.
+  const exp = [
+    { productId: 'thin', duration: '149d', strike: 1, aprEff: 0.06, pConv: 0.12, expNet: 0.038, histInfo: { independent: 13 } },
+    { productId: 'thick', duration: '30d', strike: 2, aprEff: 0.05, pConv: 0.06, expNet: 0.025, histInfo: { independent: 64.7 } },
+  ];
+  const aMax = pickAnchors(exp, { measure: 'max', riskFree: 0.0422 });
+  ok('матожидание: короткая выборка не становится якорем', aMax.expected?.row.productId === 'thick', aMax.expected?.row.productId);
+  ok('матожидание ниже альт. ставки помечено', aMax.expected?.belowAlt === true && aMax.expected.riskFree === 0.0422);
+  ok('и при мере «к текущей волатильности» тоже', pickAnchors(exp, { measure: 'hist-scaled' }).expected?.row.productId === 'thick');
+  const aRaw = pickAnchors(exp, { measure: 'hist', riskFree: 0.02 });
+  ok('при мере «историческая, как есть» короткая выборка допускается', aRaw.expected?.row.productId === 'thin');
+  ok('выше альт. ставки — без пометки', !aRaw.expected.belowAlt);
 }
 
 // ────────────────────────────────────────────── 5b. Вероятность из улыбки
