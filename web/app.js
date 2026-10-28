@@ -58,6 +58,8 @@ const state = {
   scenarioInfo: null,
   stats: null,
   archive: null,
+  // Архив открывается в фоне с самого запуска; до готовности — «открывается».
+  archiveOpening: true,
   wsStatus: 'connecting',
   lastQuoteAt: 0,
   lastOptionsAt: 0,
@@ -293,6 +295,7 @@ function fmtQuoteAge(row) {
 async function loadProducts() {
   try {
     state.products = await fetchProducts();
+    clearError('продукты:');
     // Котировки прошедших продуктов больше не нужны.
     pruneQuotes(state.quotes, state.products);
     renderDurationChips();
@@ -339,24 +342,40 @@ async function loadOptions() {
     const tickers = await fetchOptionTickers();
     state.surface = buildSurface(tickers, Date.now());
     state.lastOptionsAt = Date.now();
+    clearError('опционы:');
   } catch (e) {
     pushError(`опционы: ${e.message}`);
   }
 }
 
+// Сбой загрузки истории повторяется через минуту, а не ждёт получасового
+// обновления: без истории нет ни стратегии, ни метрик выхода Sell High.
+let historyRetry = null;
 async function loadHistory() {
   try {
     // Три сетки разной глубины: часовая покрывает несколько месяцев,
     // четырёхчасовая — больше года, дневная — всю доступную историю пары.
     const [h1, h4, d1] = await Promise.all([fetchKlines('60', 4), fetchKlines('240', 3), fetchKlines('D', 3)]);
     state.history = new History({ 60: h1, 240: h4, D: d1 });
+    clearError('история цен:');
   } catch (e) {
     pushError(`история цен: ${e.message}`);
+    if (!historyRetry) {
+      historyRetry = setTimeout(() => {
+        historyRetry = null;
+        loadHistory().then(render);
+      }, 60_000);
+    }
   }
 }
 
 function pushError(msg) {
   state.errors = [msg, ...state.errors.filter((m) => m !== msg)].slice(0, 3);
+}
+
+/** Источник снова ответил — его прежняя ошибка больше не актуальна. */
+function clearError(prefix) {
+  state.errors = state.errors.filter((m) => !m.startsWith(prefix));
 }
 
 // ───────────────────────────────────────────────────────── расчёт
