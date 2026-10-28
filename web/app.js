@@ -1371,6 +1371,8 @@ function renderDiag() {
       `архив ставок ${where}: ${state.stats.spanDays.toFixed(1)} сут, ` +
         `${state.stats.snapshots} снимков, корзин ${nBuckets}${why}`,
     );
+  } else if (state.archiveOpening) {
+    parts.push('архив ставок: открывается');
   } else {
     parts.push(state.archive ? 'архив ставок: копится в браузере' : 'архив ставок: недоступен');
   }
@@ -1688,6 +1690,7 @@ async function main() {
   // со старой версией панели, открытие ждёт, пока её закроют, — раньше вместе
   // с ним ждали поток котировок, история и все таймеры, и вкладка замирала.
   const archive = new Archive();
+  state.archiveOpening = true;
   archive
     .init({
       onBlocked: () => {
@@ -1697,6 +1700,7 @@ async function main() {
     })
     .then(async (ok) => {
       state.archiveBlocked = false;
+      state.archiveOpening = false;
       if (!ok) return;
       state.archive = archive;
       const local = await archive.stats();
