@@ -16,7 +16,7 @@ import {
 } from './feeds.js';
 import { buildSurface, forwardVol } from './surface.js';
 import { computeFrame, createFrameState, runPathSlice } from './frame.js';
-import { Archive } from './archive.js';
+import { Archive, STATS_INTERVAL_MS, PRUNE_INTERVAL_MS } from './archive.js';
 import {
   History,
   pickAnchors,
@@ -1395,14 +1395,11 @@ function render() {
       step('блок Sell High', () => renderSell(frame));
     }
 
-    // Архив пополняется тем же срезом, который только что показан.
-    // Сама запись не чаще раза в минуту — интервал держит сам архив.
+    // Архив пополняется тем же срезом, который только что показан. Запись не
+    // чаще раза в 10 минут — интервал держит сам архив; сводка пересобирается
+    // по своему таймеру, а не здесь.
     step('архив', () => {
-      if (state.archive && (buy.length || sell.length)) {
-        state.archive.sample([...buy, ...sell]).then((written) => {
-          if (written) state.archive.stats().then((st) => st && !state.statsRemote && (state.stats = st));
-        });
-      }
+      if (state.archive && (buy.length || sell.length)) state.archive.sample([...buy, ...sell]);
     });
 
     // Диагностика рисуется последней и всегда: именно она показывает,
@@ -1661,6 +1658,13 @@ async function main() {
     state.archive = archive;
     const local = await archive.stats();
     if (local && !state.statsRemote) state.stats = local;
+    // Сводка — по таймеру раз в 15 минут, вне отрисовки; чистка старше 60
+    // дней — и пока вкладка открыта, раз в сутки.
+    setInterval(async () => {
+      const st = await archive.stats();
+      if (st && !state.statsRemote) state.stats = st;
+    }, STATS_INTERVAL_MS);
+    setInterval(() => archive.prune(), PRUNE_INTERVAL_MS);
   }
   render();
 

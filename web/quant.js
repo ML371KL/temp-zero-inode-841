@@ -833,6 +833,68 @@ export function summarizeBuckets(obs, { levels = QUANTILE_LEVELS, minN = 30, min
   return buckets;
 }
 
+/**
+ * Та же сводка, что summarizeBuckets, но из агрегатов «корзина, сутки».
+ *
+ * Архив в браузере больше не хранит сырые точки: за 60 дней круглосуточно
+ * открытой вкладки с VIP их были бы миллионы, и пересборка по ним занимала
+ * секунды и гигабайты. Агрегат — все значения одной корзины за одни сутки.
+ * Сводка из них та же: окно срока ±tol, пороги minN наблюдений и minDays
+ * разных суток, те же квантили по порядковым статистикам.
+ *
+ * aggs: [{ k: ключ корзины, day: сутки UTC, v: значения }], v — числа или
+ * целые в единицах 1/scale (ставка ×1e8 у архива: так значения хранятся точно).
+ * keys — для каких корзин считать; без него — для всех встреченных.
+ */
+export function summarizeAggregates(aggs, { levels = QUANTILE_LEVELS, minN = 30, minDays = 3, tol = TENOR_TOLERANCE, keys = null, scale = 1 } = {}) {
+  // По ключу: срок, сутки и куски значений.
+  const byKey = new Map();
+  for (const a of aggs) {
+    if (!a?.k || !a.v?.length) continue;
+    let e = byKey.get(a.k);
+    if (!e) {
+      const t = tenorFromKey(a.k);
+      if (t == null) continue;
+      byKey.set(a.k, (e = { t, rest: a.k.slice(a.k.indexOf('|')), days: new Set(), chunks: [], n: 0 }));
+    }
+    e.days.add(a.day);
+    e.chunks.push(a.v);
+    e.n += a.v.length;
+  }
+  // Внутри группы (всё, кроме срока) сроки соседствуют.
+  const groups = new Map();
+  for (const e of byKey.values()) {
+    let g = groups.get(e.rest);
+    if (!g) groups.set(e.rest, (g = []));
+    g.push(e);
+  }
+  const buckets = {};
+  let scratch = new Float64Array(1024);
+  for (const key of keys ?? byKey.keys()) {
+    const t0 = tenorFromKey(key);
+    if (t0 == null) continue;
+    const list = groups.get(key.slice(key.indexOf('|')));
+    if (!list) continue;
+    let n = 0;
+    const days = new Set();
+    const near = [];
+    for (const e of list) {
+      if (Math.abs(Math.log(e.t / t0)) > tol) continue;
+      near.push(e);
+      n += e.n;
+      for (const d of e.days) days.add(d);
+    }
+    if (n < minN || days.size < minDays) continue;
+    if (scratch.length < n) scratch = new Float64Array(n * 2);
+    let j = 0;
+    for (const e of near) for (const c of e.chunks) for (let i = 0; i < c.length; i++) scratch[j++] = c[i] / scale;
+    const values = scratch.subarray(0, n);
+    values.sort();
+    buckets[key] = { n, days: days.size, q: quantiles(values, levels) };
+  }
+  return buckets;
+}
+
 /** Номер суток UTC — единица счёта «разных дней» в пороге корзины. */
 export function utcDay(ts) {
   return Math.floor(ts / 86_400_000);

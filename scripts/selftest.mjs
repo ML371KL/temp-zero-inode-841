@@ -41,6 +41,8 @@ import {
   quantiles,
   bucketKey,
   summarizeBuckets,
+  summarizeAggregates,
+  tenorFromKey,
   QUANTILE_LEVELS,
   MS_DAY,
 } from '../web/quant.js';
@@ -48,6 +50,7 @@ import { History, annualize, computeStrategy, analyzeSellHigh, pickBest, pickAnc
 import { buildSurface, parseOptionSymbol, volAt, forwardAt, hasExactExpiry, atmVarianceCurve, totalVariance, forwardVol, surfaceAt, smileSlope, volSlopeAt } from '../web/surface.js';
 import { readFileSync } from 'node:fs';
 import { computeFrame, createFrameState, runPathSlice, PATH_REFRESH_MS } from '../web/frame.js';
+import { samplePoints, migrateSamples, wantedKeys, buildStats } from '../web/archive.js';
 import { gunzipSync } from 'node:zlib';
 import { fetchProducts, fetchQuote, fetchOptionTickers, fetchSpot } from '../web/feeds.js';
 
@@ -1881,6 +1884,94 @@ console.log('\nАрхив ставок и перцентиль');
     ok('ячейка удаления шириной полпроцента', bucketKey(20, false, 'BuyLow', -0.0505) === base);
     ok('нечисловой срок ключа не даёт', bucketKey(NaN, false, 'BuyLow', -0.05) === null);
   }
+}
+
+// ───────────────────────────────────────────── архив агрегатами «корзина, сутки»
+
+console.log('\nАрхив агрегатами');
+{
+  // Синтетические наблюдения: несколько корзин, у календарных срок сокращается
+  // посуточно, значения — целые ставки ×1e8, как их отдаёт биржа.
+  let seed = 31337;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const obs = [];
+  for (let day = 100; day < 112; day++) {
+    for (let s2 = 0; s2 < 20; s2++) {
+      for (const [tenor0, half] of [[1, -2], [1, -3], [30, -4], [30, -5], [58, 3]]) {
+        const tenor = tenor0 > 5 ? tenor0 - (day - 100) : tenor0;
+        const k = bucketKey(tenor, false, half < 0 ? 'BuyLow' : 'SellHigh', half / 200);
+        const e8 = Math.round(1e7 + rnd() * 3e7);
+        obs.push({ key: k, value: e8 / 1e8, day, e8 });
+      }
+    }
+  }
+  // Агрегаты так же, как их пишет архив: значения корзины за сутки вместе.
+  const byId = new Map();
+  for (const o of obs) {
+    const id = `${o.day}|${o.key}`;
+    if (!byId.has(id)) byId.set(id, { k: o.key, day: o.day, list: [] });
+    byId.get(id).list.push(o.e8);
+  }
+  const aggs = [...byId.values()].map((a) => ({ k: a.k, day: a.day, v: Int32Array.from(a.list) }));
+  const fromAggs = summarizeAggregates(aggs, { scale: 1e8 });
+  const fromObs = summarizeBuckets(obs);
+  const keysA = Object.keys(fromAggs).sort();
+  const keysO = Object.keys(fromObs).sort();
+  ok('агрегаты дают те же корзины, что сырые точки', JSON.stringify(keysA) === JSON.stringify(keysO), `${keysA.length} корзин`);
+  let worst = 0;
+  for (const k of keysO) {
+    const a = fromAggs[k];
+    const b = fromObs[k];
+    if (a.n !== b.n || a.days !== b.days) worst = Infinity;
+    for (let j = 0; j < b.q.length; j++) worst = Math.max(worst, Math.abs(a.q[j] - b.q[j]));
+  }
+  ok('и те же квантили, число наблюдений и суток', worst === 0, `максимум расхождения ${worst}`);
+
+  // Прямой подсчёт квантилей своим кодом: окно срока ±15%, порядковые статистики.
+  const key = keysO.find((k) => tenorFromKey(k) > 20);
+  const t0 = tenorFromKey(key);
+  const rest = key.slice(key.indexOf('|'));
+  const pool = obs.filter((o) => o.key.endsWith(rest) && Math.abs(Math.log(tenorFromKey(o.key) / t0)) <= 0.15).map((o) => o.value).sort((x, y) => x - y);
+  const qAt = (q) => {
+    const pos = (pool.length - 1) * q;
+    const lo = Math.floor(pos);
+    return pool[lo] + (pool[Math.min(lo + 1, pool.length - 1)] - pool[lo]) * (pos - lo);
+  };
+  ok(
+    'корзина календарного срока — прямой подсчёт по соседним срокам',
+    fromAggs[key].n === pool.length && QUANTILE_LEVELS.every((q, j) => Math.abs(fromAggs[key].q[j] - qAt(q)) < 1e-15),
+    `${key}: ${pool.length} наблюдений`,
+  );
+
+  // Ставка хранится целым ×1e8 без потерь.
+  const pts = samplePoints(
+    [
+      { apy: 2.45996626, moneyness: -0.0002, isVip: false, direction: 'BuyLow', timing: { yieldDays: 1 } },
+      { apy: 0.03658412, moneyness: -0.234, isVip: true, direction: 'BuyLow', timing: { yieldDays: 58 } },
+    ],
+    Date.UTC(2026, 9, 28, 4, 42),
+  );
+  ok('точка снимка хранит ставку точно', pts.length === 2 && pts[0].e8[0] / 1e8 === 2.45996626 && pts[1].e8[0] / 1e8 === 0.03658412);
+
+  // Перенос версии 2: прореживание до сетки снимков раз в 10 минут.
+  const t0ms = Date.UTC(2026, 9, 1, 0, 0);
+  const old = [];
+  for (let m = 0; m < 60; m++) {
+    for (const k of ['1.000|0|B|-2', '30.000|0|B|-4']) old.push({ ts: t0ms + m * 60_000, k, a: 0.1 + m * 1e-4 });
+  }
+  const moved = migrateSamples(old);
+  ok('перенос: снимки раз в 10 минут', moved.days.length === 1 && moved.days[0].samples === 6, `${moved.days[0]?.samples}`);
+  ok('перенос: по агрегату на корзину и сутки', moved.aggs.length === 2 && moved.aggs.every((a) => a.v.length === 6));
+  ok('перенос: значения сохранены точно', moved.aggs[0].v[1] === Math.round((0.1 + 10 * 1e-4) * 1e8));
+
+  // Сводка нужна текущим корзинам и тем же на сутки короче (перекат).
+  const wanted = wantedKeys(aggs, 111);
+  ok('нужные корзины — свежие и на сутки короче', wanted.has(bucketKey(19, false, 'BuyLow', -4 / 200)) && wanted.has(bucketKey(18, false, 'BuyLow', -4 / 200)) && !wanted.has(bucketKey(30, false, 'BuyLow', -4 / 200)));
+  const st = buildStats(aggs, [{ day: 100, samples: 20, first: Date.UTC(1970, 0, 101) }, { day: 111, samples: 20, first: Date.UTC(1970, 0, 112) }], Date.UTC(1970, 0, 112, 12));
+  ok('сводка в прежнем формате', st.source === 'local' && st.snapshots === 40 && st.days === 12 && Array.isArray(st.quantileLevels) && typeof st.buckets === 'object');
+  // 58-дневная серия: сегодня срок 47, завтра 46 — корзина 46 собирается из
+  // соседних сроков 47…53 за семь суток ещё до первого снимка с ним.
+  ok('и в ней есть корзина завтрашнего срока', st.buckets[bucketKey(46, false, 'SellHigh', 3 / 200)] != null);
 }
 
 console.log(`\nИтого: ${passed} успешно, ${failed} провалено`);
