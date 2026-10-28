@@ -155,9 +155,14 @@ const done = (req) =>
     req.onerror = () => reject(req.error);
   });
 
-function openDb() {
+function openDb(onBlocked) {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
+    // Вкладка со старой версией панели держит базу прежней версии и сама её не
+    // отпускает: обновление схемы ждёт, пока ту вкладку закроют или обновят.
+    // Запрос при этом не теряется и завершится сам; здесь только сообщаем,
+    // почему архива пока нет (панель работает и без него — main не ждёт init).
+    req.onblocked = () => onBlocked?.();
     req.onupgradeneeded = (ev) => {
       const db = req.result;
       const tx = req.transaction;
@@ -210,9 +215,9 @@ export class Archive {
     this.broken = false;
   }
 
-  async init() {
+  async init({ onBlocked } = {}) {
     try {
-      this.db = await openDb();
+      this.db = await openDb(onBlocked);
       await this.prune();
       return true;
     } catch {

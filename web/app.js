@@ -1359,7 +1359,9 @@ function renderDiag() {
     );
   }
   parts.push(`режим: ${ui.mode === 'strategy' ? `стратегия до ${ui.horizon} дней` : 'текущая подписка'}`);
-  if (state.stats) {
+  if (state.archiveBlocked) {
+    parts.push('архив ставок: ждёт, пока закроют вкладку со старой версией панели');
+  } else if (state.stats) {
     const where = state.stats.source === 'local' ? 'в браузере' : 'на ветке data';
     const nBuckets = Object.keys(state.stats.buckets).length;
     // Пустая сводка в первые дни — это не поломка, а порог в разных сутках.
@@ -1682,19 +1684,32 @@ async function main() {
     }),
   ]);
 
+  // Архив открывается в фоне и запуск не держит. Если базу занимает вкладка
+  // со старой версией панели, открытие ждёт, пока её закроют, — раньше вместе
+  // с ним ждали поток котировок, история и все таймеры, и вкладка замирала.
   const archive = new Archive();
-  if (await archive.init()) {
-    state.archive = archive;
-    const local = await archive.stats();
-    if (local && !state.statsRemote) state.stats = local;
-    // Сводка — по таймеру раз в 15 минут, вне отрисовки; чистка старше 60
-    // дней — и пока вкладка открыта, раз в сутки.
-    setInterval(async () => {
-      const st = await archive.stats();
-      if (st && !state.statsRemote) state.stats = st;
-    }, STATS_INTERVAL_MS);
-    setInterval(() => archive.prune(), PRUNE_INTERVAL_MS);
-  }
+  archive
+    .init({
+      onBlocked: () => {
+        state.archiveBlocked = true;
+        render();
+      },
+    })
+    .then(async (ok) => {
+      state.archiveBlocked = false;
+      if (!ok) return;
+      state.archive = archive;
+      const local = await archive.stats();
+      if (local && !state.statsRemote) state.stats = local;
+      // Сводка — по таймеру раз в 15 минут, вне отрисовки; чистка старше 60
+      // дней — и пока вкладка открыта, раз в сутки.
+      setInterval(async () => {
+        const st = await archive.stats();
+        if (st && !state.statsRemote) state.stats = st;
+      }, STATS_INTERVAL_MS);
+      setInterval(() => archive.prune(), PRUNE_INTERVAL_MS);
+      render();
+    });
   render();
 
   loadHistory().then(render);
