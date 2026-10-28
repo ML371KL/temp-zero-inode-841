@@ -267,19 +267,11 @@
           <input type="number" id="conv-apy" placeholder="напр. 40" step="0.01" min="0" />
         </label>
         <label class="ctl">
-          <span class="ctl-label">Срок той оферты</span>
-          <select id="conv-duration">
-            <option value="0.3333333333333333">8h</option>
-            <option value="1" selected>1d</option>
-            <option value="3">3d</option>
-            <option value="5">5d</option>
-            <option value="6">6d</option>
-            <option value="13">13d</option>
-            <option value="27">27d</option>
-            <option value="55">55d</option>
-            <option value="146">146d</option>
-            <option value="237">237d</option>
-          </select>
+          <span class="ctl-label" title="Метка срока той оферты в сутках: 1d → 1, 9d → 9, 8h → 0.3333">Срок той оферты, сут</span>
+          <!-- Число, а не список: набор сроков Bybit меняется, а подсказки берутся
+               из текущих продуктов. -->
+          <input type="number" id="conv-duration" list="conv-duration-list" placeholder="напр. 1" step="any" min="0" />
+          <datalist id="conv-duration-list"></datalist>
         </label>
       </div>
       <div class="basis-line" id="basis-line"></div>

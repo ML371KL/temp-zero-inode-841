@@ -413,6 +413,14 @@ function renderDurationChips() {
     (a, b) => durationDays(a) - durationDays(b),
   );
   box.innerHTML = '';
+  // Подсказки к полю «срок той оферты» — из тех же продуктов: зашитый список
+  // сроков устаревал вместе с расписанием биржи.
+  const hints = $('conv-duration-list');
+  if (hints) {
+    hints.innerHTML = list
+      .map((d) => `<option value="${Number(durationDays(d).toFixed(4))}">${d}</option>`)
+      .join('');
+  }
   for (const d of list) {
     const b = document.createElement('button');
     b.className = 'chip' + (ui.durations.includes(d) ? ' on' : '');
@@ -838,11 +846,17 @@ function renderStrategy(rows) {
   // Карточки: самый осторожный, самый доходный и лучший по цене риска.
   const byRisk = [...res.rows].sort((a, b) => a.stratRisk - b.stratRisk);
   const picks = [];
+  // Одна оферта может отвечать на два вопроса сразу — тогда карточка одна, а
+  // ярлыки склеиваются, как в pickBest: вторая причина не должна пропадать.
   const take = (r, tag) => {
-    if (r && !picks.includes(r)) {
-      r.bestTag = tag;
-      picks.push(r);
+    if (!r) return;
+    if (picks.includes(r)) {
+      if (tag && r.bestTag && !r.bestTag.includes(tag)) r.bestTag += ` · ${tag}`;
+      else if (tag && !r.bestTag) r.bestTag = tag;
+      return;
     }
+    r.bestTag = tag;
+    picks.push(r);
   };
   take(byRisk[0], 'минимум риска');
   take(
@@ -1020,7 +1034,7 @@ function renderFrontier(rows) {
   note.innerHTML =
     `Строк на фронте: <b>${steps.length}</b>, внутри вашего порога ${fmtPct(ui.maxP, 1)} — <b>${withinCount}</b> (подсвечены)` +
     (belowRf
-      ? `, из них <b>${belowRf}</b> платят меньше гибкого депозита ${fmtPct(state.riskFree ?? 0, 2)} и приглушены: риск там есть, а смысла нет. `
+      ? `, из них <b>${belowRf}</b> платят меньше альт. ставки ${fmtPct(state.riskFree ?? 0, 2)} и приглушены: риск там есть, а смысла нет. `
       : '. ') +
     (rising
       ? 'Фронт сейчас выпуклый: отдача на риск с ростом вероятности не падает, а растёт. ' +
@@ -1510,7 +1524,7 @@ function bindControls() {
   };
 
   $('conv-duration').value = ui.convDuration;
-  $('conv-duration').onchange = (e) => {
+  $('conv-duration').oninput = (e) => {
     ui.convDuration = e.target.value;
     savePrefs();
     render();
